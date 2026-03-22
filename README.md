@@ -53,12 +53,15 @@ simpleplug#End()
 | `:PlugStatus` | 查看所有插件状态（分支、commit、是否有修改） |
 | `:PlugHook {name}` | 对指定插件执行 post-install hook |
 
+默认情况下，Vim 启动时会自动检查已注册插件里是否有尚未安装的新插件；如果有，则自动触发一次 `:PlugInstall`。
+
 ## 选项
 
 ```vim
 g:simpleplug_dir          " 插件目录 (默认 ~/.vim/plugged)
 g:simpleplug_daemon_path  " 手动指定 daemon 路径
 g:simpleplug_debug        " 调试模式 (默认 0)
+g:simpleplug_auto_install " 启动时自动安装新增插件 (默认 1)
 g:simpleplug_window_height " 进度窗口高度 (默认 15)
 ```
 

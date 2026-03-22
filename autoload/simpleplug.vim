@@ -33,6 +33,7 @@ var s_ui_total: number = 0
 var s_ui_finished: number = 0
 var s_ui_spinner_idx: number = 0
 var s_ui_spinner_timer: number = 0
+var s_auto_install_checked: bool = false
 const s_spinners = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 
 # ─────────────────── 日志 ───────────────────
@@ -55,6 +56,7 @@ enddef
 export def Begin(dir: string = '')
   s_plugins = []
   s_loaded_plugins = {}
+  s_auto_install_checked = false
   if dir !=# ''
     g:simpleplug_dir = fnamemodify(dir, ':p')
     # 去掉末尾斜杠
@@ -131,10 +133,10 @@ def SetupLazyLoad(plug: dict<any>)
     var newparts: list<string> = []
     for p in parts
       if p !=# pdir && p !=# pdir .. '/after'
-        newparts->add(p)
+        add(newparts, p)
       endif
     endfor
-    &runtimepath = newparts->join(',')
+    &runtimepath = join(newparts, ',')
   endif
 enddef
 
@@ -227,7 +229,7 @@ export def Plug(repo: string, opts: dict<any> = {})
   var on_ft = get(opts, 'for', '')
   var on_cmd = get(opts, 'on', '')
 
-  s_plugins->add({
+  add(s_plugins, {
     name: name,
     repo: repo,
     url: url,
@@ -397,7 +399,7 @@ enddef
 def PluginSpecs(): list<dict<any>>
   var specs: list<dict<any>> = []
   for p in s_plugins
-    specs->add({
+    add(specs, {
       name: p.name,
       url: p.url,
       dir: p.dir,
@@ -407,6 +409,16 @@ def PluginSpecs(): list<dict<any>>
     })
   endfor
   return specs
+enddef
+
+def MissingPluginCount(): number
+  var missing = 0
+  for p in s_plugins
+    if !isdirectory(p.dir .. '/.git')
+      missing += 1
+    endif
+  endfor
+  return missing
 enddef
 
 export def Install()
@@ -433,6 +445,23 @@ export def Install()
     },
   }
   Send({type: 'install', id: id, plugins: PluginSpecs()})
+enddef
+
+export def AutoInstallMissing()
+  if s_auto_install_checked
+    return
+  endif
+  s_auto_install_checked = true
+
+  if !get(g:, 'simpleplug_auto_install', 1)
+    return
+  endif
+
+  if empty(s_plugins) || MissingPluginCount() == 0
+    return
+  endif
+
+  Install()
 enddef
 
 export def Update()
@@ -467,7 +496,7 @@ export def Clean()
   endif
   var keep: list<string> = []
   for p in s_plugins
-    keep->add(fnamemodify(p.dir, ':t'))
+    add(keep, fnamemodify(p.dir, ':t'))
   endfor
   s_ui_mode = 'clean'
   s_ui_total = 0
@@ -524,7 +553,7 @@ export def CompletePluginNames(arglead: string, cmdline: string, cursorpos: numb
   var names: list<string> = []
   for p in s_plugins
     if p.name =~? '^' .. arglead
-      names->add(p.name)
+      add(names, p.name)
     endif
   endfor
   return names
@@ -731,25 +760,25 @@ def UIBuildAndRender()
   endif
   var hdr_pad = repeat('─', pad_width)
 
-  lines->add('╭' .. repeat('─', 60) .. '╮')
-  lines->add('│' .. header_text .. hdr_pad .. right_info .. '│')
+  add(lines, '╭' .. repeat('─', 60) .. '╮')
+  add(lines, '│' .. header_text .. hdr_pad .. right_info .. '│')
 
   # ── 进度条 (install/update 模式) ──
   if s_ui_mode =~# 'install\|update'
     var bar = ProgressBar(s_ui_finished, s_ui_total, 50)
     var pct = s_ui_total > 0 ? (s_ui_finished * 100 / s_ui_total) : 0
     var bar_line = printf('│  %s %3d%%  │', bar, pct)
-    lines->add('├' .. repeat('─', 60) .. '┤')
-    lines->add(bar_line)
+    add(lines, '├' .. repeat('─', 60) .. '┤')
+    add(lines, bar_line)
   endif
 
-  lines->add('├' .. repeat('─', 60) .. '┤')
+  add(lines, '├' .. repeat('─', 60) .. '┤')
 
   # ── 插件列表 ──
   if s_ui_mode ==# 'status_done'
     # 状态模式：表头
-    lines->add(printf('│  %-2s %-25s %-12s %-8s %-7s │', '', 'Plugin', 'Branch', 'Commit', 'Status'))
-    lines->add('│  ' .. repeat('─', 56) .. '  │')
+    add(lines, printf('│  %-2s %-25s %-12s %-8s %-7s │', '', 'Plugin', 'Branch', 'Commit', 'Status'))
+    add(lines, '│  ' .. repeat('─', 56) .. '  │')
   endif
 
   var maxname = 0
@@ -783,7 +812,7 @@ def UIBuildAndRender()
         branch !=# '' ? branch[: 11] : '—',
         commit !=# '' ? commit[: 7] : '—',
         status_text, dirty_flag)
-      lines->add(line)
+      add(lines, line)
     else
       # install/update 模式的行
       var display_name = len(name) > maxname ? name[: maxname - 1] : name
@@ -795,7 +824,7 @@ def UIBuildAndRender()
         if pad < 0
           pad = 0
         endif
-        lines->add(line .. repeat(' ', pad) .. '│')
+        add(lines, line .. repeat(' ', pad) .. '│')
       elseif status ==# 'done'
         var short_msg = len(msg) > (52 - maxname) ? msg[: 51 - maxname] : msg
         var line = printf('│  %s %-' .. string(maxname) .. 's  %s', icon, display_name, short_msg)
@@ -803,7 +832,7 @@ def UIBuildAndRender()
         if pad < 0
           pad = 0
         endif
-        lines->add(line .. repeat(' ', pad) .. '│')
+        add(lines, line .. repeat(' ', pad) .. '│')
       elseif status ==# 'error'
         var short_msg = len(msg) > (52 - maxname) ? msg[: 51 - maxname] : msg
         var line = printf('│  %s %-' .. string(maxname) .. 's  %s', icon, display_name, short_msg)
@@ -811,21 +840,21 @@ def UIBuildAndRender()
         if pad < 0
           pad = 0
         endif
-        lines->add(line .. repeat(' ', pad) .. '│')
+        add(lines, line .. repeat(' ', pad) .. '│')
       elseif status ==# 'skipped'
         var line = printf('│  %s %-' .. string(maxname) .. 's  frozen', icon, display_name)
         var pad = 58 - strdisplaywidth(line)
         if pad < 0
           pad = 0
         endif
-        lines->add(line .. repeat(' ', pad) .. '│')
+        add(lines, line .. repeat(' ', pad) .. '│')
       elseif status ==# 'removed'
         var line = printf('│  %s %-' .. string(maxname) .. 's  removed', icon, display_name)
         var pad = 58 - strdisplaywidth(line)
         if pad < 0
           pad = 0
         endif
-        lines->add(line .. repeat(' ', pad) .. '│')
+        add(lines, line .. repeat(' ', pad) .. '│')
       endif
     endif
   endfor
@@ -833,7 +862,7 @@ def UIBuildAndRender()
   # Clean 模式没有注册的插件列表
   if s_ui_mode =~# 'clean'
     if empty(s_ui_plug_state)
-      lines->add('│  Nothing to clean.' .. repeat(' ', 39) .. '│')
+      add(lines, '│  Nothing to clean.' .. repeat(' ', 39) .. '│')
     else
       for [name, st] in items(s_ui_plug_state)
         var icon = get(st, 'icon', '')
@@ -842,33 +871,33 @@ def UIBuildAndRender()
         if pad < 0
           pad = 0
         endif
-        lines->add(line .. repeat(' ', pad) .. '│')
+        add(lines, line .. repeat(' ', pad) .. '│')
       endfor
     endif
   endif
 
   # ── 统计摘要 ──
-  lines->add('├' .. repeat('─', 60) .. '┤')
+  add(lines, '├' .. repeat('─', 60) .. '┤')
   if is_done
     var summary = SummaryLine()
     var spad = 58 - strdisplaywidth(summary)
     if spad < 0
       spad = 0
     endif
-    lines->add('│ ' .. summary .. repeat(' ', spad) .. ' │')
+    add(lines, '│ ' .. summary .. repeat(' ', spad) .. ' │')
   else
     var progress_text = printf(' %s  %d / %d plugins', spinner, s_ui_finished, s_ui_total)
     var ppad = 58 - strdisplaywidth(progress_text)
     if ppad < 0
       ppad = 0
     endif
-    lines->add('│' .. progress_text .. repeat(' ', ppad) .. ' │')
+    add(lines, '│' .. progress_text .. repeat(' ', ppad) .. ' │')
   endif
-  lines->add('╰' .. repeat('─', 60) .. '╯')
+  add(lines, '╰' .. repeat('─', 60) .. '╯')
 
   if is_done
-    lines->add('')
-    lines->add('  Press q to close, R to retry, S for status')
+    add(lines, '')
+    add(lines, '  Press q to close, R to retry, S for status')
   endif
 
   s_ui_lines = lines
@@ -902,19 +931,19 @@ def SummaryLine(): string
 
   var parts: list<string> = []
   if n_new > 0
-    parts->add(printf(' %d installed', n_new))
+    add(parts, printf(' %d installed', n_new))
   endif
   if n_up > 0
-    parts->add(printf(' %d updated', n_up))
+    add(parts, printf(' %d updated', n_up))
   endif
   if n_ok > 0
-    parts->add(printf(' %d ok', n_ok))
+    add(parts, printf(' %d ok', n_ok))
   endif
   if n_skip > 0
-    parts->add(printf(' %d frozen', n_skip))
+    add(parts, printf(' %d frozen', n_skip))
   endif
   if n_err > 0
-    parts->add(printf(' %d errors', n_err))
+    add(parts, printf(' %d errors', n_err))
   endif
   if empty(parts)
     return ' All done  (' .. Elapsed() .. ')'
