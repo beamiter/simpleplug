@@ -104,6 +104,8 @@ struct PluginStatus {
     branch: String,
     commit: String,
     dirty: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size_kb: Option<u64>,
 }
 
 // ─────────────────── stdout writer ───────────────────
@@ -468,7 +470,18 @@ async fn handle_update(id: u64, plugins: Vec<PluginSpec>, tx: &EventTx, locks: &
                     let changed = old_commit != new_commit;
                     let status = if changed { "updated" } else { "already" };
                     let msg = if changed {
-                        format!("{old_commit} → {new_commit}")
+                        // 获取 diff 统计
+                        let diff_stat = run_git(
+                            &p.dir,
+                            &["diff", "--shortstat", &old_commit, &new_commit],
+                        )
+                        .await
+                        .unwrap_or_default();
+                        if diff_stat.is_empty() {
+                            format!("{old_commit} → {new_commit}")
+                        } else {
+                            format!("{old_commit} → {new_commit} | {diff_stat}")
+                        }
                     } else {
                         "already up-to-date".into()
                     };
@@ -589,6 +602,20 @@ async fn handle_clean(id: u64, plugdir: &str, keep: &[String], tx: &EventTx) {
 
 // ─────────────────── status ───────────────────
 
+async fn dir_size_kb(path: &std::path::Path) -> Option<u64> {
+    let output = Command::new("du")
+        .args(["-sk"])
+        .arg(path)
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&output.stdout);
+    s.split_whitespace().next()?.parse::<u64>().ok()
+}
+
 async fn handle_status(id: u64, plugins: Vec<PluginSpec>, tx: &EventTx) {
     let mut items = Vec::new();
     let mut handles = Vec::new();
@@ -604,17 +631,20 @@ async fn handle_status(id: u64, plugins: Vec<PluginSpec>, tx: &EventTx) {
                     branch: String::new(),
                     commit: String::new(),
                     dirty: false,
+                    size_kb: None,
                 };
             }
             let branch = git_current_branch(&p.dir).await;
             let commit = git_current_commit(&p.dir).await;
             let dirty = git_is_dirty(&p.dir).await;
+            let size_kb = dir_size_kb(&dir_path).await;
             PluginStatus {
                 name: p.name,
                 installed,
                 branch,
                 commit,
                 dirty,
+                size_kb,
             }
         }));
     }

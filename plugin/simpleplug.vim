@@ -11,6 +11,7 @@ g:simpleplug_daemon_path = get(g:, 'simpleplug_daemon_path', '')
 g:simpleplug_debug = get(g:, 'simpleplug_debug', 0)
 g:simpleplug_window_height = get(g:, 'simpleplug_window_height', 35)
 g:simpleplug_auto_install = get(g:, 'simpleplug_auto_install', 1)
+g:simpleplug_popup = get(g:, 'simpleplug_popup', 1)
 # 并行数量（Rust daemon 端 tokio 自动管理，此处仅供将来扩展）
 g:simpleplug_jobs = get(g:, 'simpleplug_jobs', 8)
 
