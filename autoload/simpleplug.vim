@@ -48,6 +48,7 @@ var s_ui_plug_timings: dict<float> = {}
 var s_ui_plug_start_times: dict<list<any>> = {}
 var s_ui_sorted_names: list<string> = []
 var s_ui_help_popup_id: number = 0
+var s_ui_cursor_buf_line: number = 0  # 光标对应的缓冲区行号(1-based)
 
 # ─────────────────── 日志 ───────────────────
 
@@ -851,6 +852,7 @@ def UIBuildAndRender()
 
   # 更新排序名列表
   s_ui_sorted_names = SortedPluginNames()
+  s_ui_cursor_buf_line = 0
   var display_plugins = GetDisplayPlugins()
 
   # ── 标题头 ──
@@ -940,8 +942,12 @@ def UIBuildAndRender()
     var msg = get(st, 'msg', '')
     var status = get(st, 'status', 'waiting')
 
-    # 光标指示
-    var cursor_mark = (plug_line_idx == s_ui_cursor_line && is_done) ? '▸' : ' '
+    # 光标指示 (始终显示，方便导航)
+    var is_cursor = (plug_line_idx == s_ui_cursor_line)
+    var cursor_mark = is_cursor ? '▸' : ' '
+    if is_cursor
+      s_ui_cursor_buf_line = len(lines) + 1  # 下一行即将 add 的行号 (1-based)
+    endif
 
     if s_ui_mode ==# 'status_done'
       var branch = get(st, 'branch', '')
@@ -1166,6 +1172,7 @@ def UIOpenPopup()
     zindex: 200,
   })
 
+  win_execute(s_ui_popup_id, 'setlocal cursorline')
   SetupSyntax()
   StartSpinner()
 enddef
@@ -1255,6 +1262,10 @@ def UIRender()
       deletebufline(s_ui_bufnr, 1, '$')
       setbufline(s_ui_bufnr, 1, s_ui_lines)
       setbufvar(s_ui_bufnr, '&modifiable', 0)
+      # 将 popup 内光标移动到选中行
+      if s_ui_cursor_buf_line > 0
+        win_execute(s_ui_popup_id, 'normal! ' .. s_ui_cursor_buf_line .. 'G')
+      endif
     endif
     return
   endif
@@ -1280,6 +1291,10 @@ def UIRender()
     desired_h = 5
   endif
   win_execute(wins[0], ':resize ' .. desired_h)
+  # 将光标移动到选中行
+  if s_ui_cursor_buf_line > 0
+    win_execute(wins[0], 'normal! ' .. s_ui_cursor_buf_line .. 'G')
+  endif
 enddef
 
 # ─────────────────── Popup 事件处理 ───────────────────
