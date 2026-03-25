@@ -239,8 +239,20 @@ async fn git_clone(url: &str, dir: &str, branch: &str) -> Result<String, String>
 }
 
 async fn git_pull(dir: &str) -> Result<String, String> {
-    // fetch + merge with ff-only
-    run_git(dir, &["pull", "--ff-only", "--depth", "1"]).await
+    // Try fast-forward first; if branches have diverged, force-sync to remote
+    let result = run_git(dir, &["pull", "--ff-only", "--depth", "1"]).await;
+    if result.is_ok() {
+        return result;
+    }
+    // Diverged: fetch and reset to remote tracking branch
+    let branch = git_current_branch(dir).await;
+    let remote_ref = if branch.is_empty() {
+        "origin/HEAD".to_string()
+    } else {
+        format!("origin/{branch}")
+    };
+    run_git(dir, &["fetch", "origin", "--depth", "1"]).await?;
+    run_git(dir, &["reset", "--hard", &remote_ref]).await
 }
 
 async fn git_current_branch(dir: &str) -> String {
