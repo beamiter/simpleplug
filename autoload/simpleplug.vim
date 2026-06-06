@@ -587,7 +587,7 @@ def InitPlugStates(status: string, icon: string)
   s_ui_filter_text = ''
   s_ui_filter_active = false
   for p in s_plugins
-    s_ui_plug_state[p.name] = {status: status, msg: '', icon: icon, branch: '', commit: '', dirty: false}
+    s_ui_plug_state[p.name] = {status: status, msg: '', icon: icon, action: '', branch: '', commit: '', dirty: false}
   endfor
 enddef
 
@@ -597,7 +597,7 @@ def OnProgress(ev: dict<any>)
   var msg = get(ev, 'message', '')
 
   if !has_key(s_ui_plug_state, name)
-    s_ui_plug_state[name] = {status: '', msg: '', icon: '', branch: '', commit: '', dirty: false}
+    s_ui_plug_state[name] = {status: '', msg: '', icon: '', action: '', branch: '', commit: '', dirty: false}
   endif
   var st = s_ui_plug_state[name]
 
@@ -608,37 +608,43 @@ def OnProgress(ev: dict<any>)
 
   if status ==# 'installed'
     st.status = 'done'
-    st.icon = ''
+    st.icon = '+'
+    st.action = 'installed'
     st.msg = msg
     if has_key(s_ui_plug_start_times, name)
       s_ui_plug_timings[name] = reltimefloat(reltime(s_ui_plug_start_times[name]))
     endif
   elseif status ==# 'updated'
     st.status = 'done'
-    st.icon = ''
+    st.icon = '*'
+    st.action = 'updated'
     st.msg = msg
     if has_key(s_ui_plug_start_times, name)
       s_ui_plug_timings[name] = reltimefloat(reltime(s_ui_plug_start_times[name]))
     endif
   elseif status ==# 'already'
     st.status = 'done'
-    st.icon = ''
+    st.icon = '●'
+    st.action = 'ok'
     st.msg = msg
     if has_key(s_ui_plug_start_times, name)
       s_ui_plug_timings[name] = reltimefloat(reltime(s_ui_plug_start_times[name]))
     endif
   elseif status ==# 'skipped'
     st.status = 'skipped'
-    st.icon = ''
+    st.icon = '○'
+    st.action = 'frozen'
     st.msg = msg
     if has_key(s_ui_plug_start_times, name)
       s_ui_plug_timings[name] = reltimefloat(reltime(s_ui_plug_start_times[name]))
     endif
   elseif status ==# 'hook'
+    st.action = 'hook'
     st.msg = st.msg .. ' | ' .. msg
   elseif status ==# 'error'
     st.status = 'error'
-    st.icon = ''
+    st.icon = '✘'
+    st.action = 'error'
     st.msg = msg
     if has_key(s_ui_plug_start_times, name)
       s_ui_plug_timings[name] = reltimefloat(reltime(s_ui_plug_start_times[name]))
@@ -666,12 +672,13 @@ def OnStatusResult(ev: dict<any>)
   for item in items
     var name = item.name
     if !has_key(s_ui_plug_state, name)
-      s_ui_plug_state[name] = {status: '', msg: '', icon: '', branch: '', commit: '', dirty: false, size_kb: 0}
+      s_ui_plug_state[name] = {status: '', msg: '', icon: '', action: '', branch: '', commit: '', dirty: false, size_kb: 0}
     endif
     var st = s_ui_plug_state[name]
     if item.installed
       st.status = 'done'
-      st.icon = ''
+      st.icon = '●'
+      st.action = 'ok'
       st.branch = item.branch
       st.commit = item.commit
       st.dirty = item.dirty
@@ -679,7 +686,8 @@ def OnStatusResult(ev: dict<any>)
       st.msg = ''
     else
       st.status = 'error'
-      st.icon = ''
+      st.icon = '✘'
+      st.action = 'missing'
       st.msg = 'not installed'
     endif
     s_ui_plug_state[name] = st
@@ -695,11 +703,12 @@ def OnHookDone(ev: dict<any>)
   var ok = get(ev, 'ok', false)
   var output = get(ev, 'output', '')
   if !has_key(s_ui_plug_state, name)
-    s_ui_plug_state[name] = {status: '', msg: '', icon: '', branch: '', commit: '', dirty: false}
+    s_ui_plug_state[name] = {status: '', msg: '', icon: '', action: '', branch: '', commit: '', dirty: false}
   endif
   var st = s_ui_plug_state[name]
   st.status = ok ? 'done' : 'error'
-  st.icon = ok ? '' : ''
+  st.icon = ok ? '●' : '✘'
+  st.action = ok ? 'hook' : 'error'
   st.msg = output
   s_ui_plug_state[name] = st
   s_ui_mode = 'hook_done'
@@ -710,7 +719,7 @@ def OnCleanDone(ev: dict<any>)
   StopSpinner()
   var removed = get(ev, 'removed', [])
   for r in removed
-    s_ui_plug_state[r] = {status: 'removed', msg: 'removed', icon: '󰩺', branch: '', commit: '', dirty: false}
+    s_ui_plug_state[r] = {status: 'removed', msg: 'removed', icon: '-', action: 'removed', branch: '', commit: '', dirty: false}
   endfor
   s_ui_finished = len(removed)
   s_ui_mode = 'clean_done'
@@ -855,7 +864,7 @@ enddef
 
 # ─────────────────── 内容构建 (popup/split 通用) ───────────────────
 
-const s_inner_width = 58  # 内容区宽度 (不含左右边框各1字符)
+const s_inner_width = 74  # 内容区宽度 (不含左右边框各1字符)
 
 def PadLine(content: string, width: number): string
   var text = content
@@ -867,6 +876,103 @@ def PadLine(content: string, width: number): string
     pad = 0
   endif
   return text .. repeat(' ', pad)
+enddef
+
+def ShortLine(content: string, width: number): string
+  var text = content
+  if width <= 0
+    return ''
+  endif
+  while strdisplaywidth(text) > width && strchars(text) > 0
+    text = strcharpart(text, 0, strchars(text) - 1)
+  endwhile
+  return text
+enddef
+
+def AlignLine(left: string, right: string, width: number): string
+  var gap = width - strdisplaywidth(left) - strdisplaywidth(right)
+  if gap < 1
+    return ShortLine(left .. ' ' .. right, width)
+  endif
+  return left .. repeat(' ', gap) .. right
+enddef
+
+def AddUiLine(lines: list<string>, content: string, use_popup: bool, width: number)
+  if use_popup
+    add(lines, PadLine(content, width))
+  else
+    add(lines, '│' .. PadLine(content, width) .. '│')
+  endif
+enddef
+
+def DividerLine(use_popup: bool, width: number): string
+  if use_popup
+    return repeat('─', width)
+  endif
+  return '├' .. repeat('─', width) .. '┤'
+enddef
+
+def UiAction(st: dict<any>): string
+  var action = get(st, 'action', '')
+  if action !=# ''
+    return action
+  endif
+  var status = get(st, 'status', 'waiting')
+  if status ==# 'done'
+    return 'ok'
+  elseif status ==# 'error'
+    return 'error'
+  elseif status ==# 'skipped'
+    return 'frozen'
+  elseif status ==# 'removed'
+    return 'removed'
+  endif
+  return 'waiting'
+enddef
+
+def UiIcon(st: dict<any>, is_done: bool): string
+  var icon = get(st, 'icon', '')
+  if icon !=# '' && icon !=# '·'
+    return icon
+  endif
+  var action = UiAction(st)
+  if action ==# 'installed'
+    return '+'
+  elseif action ==# 'updated'
+    return '*'
+  elseif action ==# 'ok' || action ==# 'hook'
+    return '●'
+  elseif action ==# 'error' || action ==# 'missing'
+    return '✘'
+  elseif action ==# 'frozen'
+    return '○'
+  elseif action ==# 'removed'
+    return '-'
+  endif
+  return is_done ? '○' : s_spinners[s_ui_spinner_idx]
+enddef
+
+def SummaryCounts(): dict<number>
+  var counts = {installed: 0, updated: 0, ok: 0, frozen: 0, errors: 0, removed: 0, missing: 0}
+  for [_, st] in items(s_ui_plug_state)
+    var action = UiAction(st)
+    if action ==# 'installed'
+      counts.installed += 1
+    elseif action ==# 'updated'
+      counts.updated += 1
+    elseif action ==# 'ok' || action ==# 'hook'
+      counts.ok += 1
+    elseif action ==# 'frozen'
+      counts.frozen += 1
+    elseif action ==# 'removed'
+      counts.removed += 1
+    elseif action ==# 'missing'
+      counts.missing += 1
+    elseif action ==# 'error'
+      counts.errors += 1
+    endif
+  endfor
+  return counts
 enddef
 
 def SetUiBufferLines()
@@ -897,85 +1003,50 @@ def UIBuildAndRender()
   var use_popup = s_ui_use_popup
   var W = s_inner_width
 
-  # 更新排序名列表
   s_ui_sorted_names = SortedPluginNames()
   s_ui_cursor_buf_line = 0
   var display_plugins = GetDisplayPlugins()
 
-  # ── 标题头 ──
-  var count_text = ''
-  if IsInstallUpdateRunning()
-    count_text = printf(' (%d/%d)', s_ui_finished, s_ui_total)
-  endif
-  var header_text = ' ' .. spinner .. '   ' .. title .. count_text .. '  '
-  var elapsed = Elapsed()
-  var right_info = ' ' .. elapsed .. ' '
-  var hdr_content_width = strdisplaywidth(header_text) + strdisplaywidth(right_info)
-  var pad_width = W - hdr_content_width
-  if pad_width < 1
-    pad_width = 1
-  endif
-  var hdr_pad = repeat(' ', pad_width)
-
   if !use_popup
-    add(lines, '╭' .. repeat('─', W + 2) .. '╮')
+    add(lines, '╭' .. repeat('─', W) .. '╮')
   endif
 
-  if use_popup
-    add(lines, PadLine(header_text .. hdr_pad .. right_info, W + 2))
-  else
-    add(lines, '│' .. header_text .. hdr_pad .. right_info .. '│')
-  endif
+  var shown_finished = s_ui_finished > s_ui_total ? s_ui_total : s_ui_finished
+  var pct = s_ui_total > 0 ? (shown_finished * 100 / s_ui_total) : 0
+  var header_left = '  ' .. spinner .. '  SimplePlug'
+  var header_right = title .. '  ' .. Elapsed()
+  AddUiLine(lines, AlignLine(header_left, header_right, W), use_popup, W)
 
-  # ── 进度条 (install/update 模式) ──
+  var counts = SummaryCounts()
+  var stats = printf('  Total %d  Installed %d  Updated %d  Ok %d  Frozen %d  Errors %d',
+    s_ui_total, counts.installed, counts.updated, counts.ok, counts.frozen, counts.errors + counts.missing)
+  if counts.removed > 0
+    stats ..= printf('  Removed %d', counts.removed)
+  endif
+  AddUiLine(lines, stats, use_popup, W)
+
   if IsInstallUpdateMode()
-    var shown_finished = s_ui_finished > s_ui_total ? s_ui_total : s_ui_finished
-    var bar_width = W - 10
-    var bar = ProgressBar(shown_finished, s_ui_total, bar_width)
-    var pct = s_ui_total > 0 ? (shown_finished * 100 / s_ui_total) : 0
-    var bar_content = printf('  %s %3d%%  ', bar, pct)
-    if use_popup
-      add(lines, repeat('─', W + 2))
-      add(lines, PadLine(bar_content, W + 2))
-    else
-      add(lines, '├' .. repeat('─', W + 2) .. '┤')
-      add(lines, '│' .. bar_content .. '│')
-    endif
+    var bar = ProgressBar(shown_finished, s_ui_total, W - 18)
+    AddUiLine(lines, printf('  %s  %3d%%  %d/%d', bar, pct, shown_finished, s_ui_total), use_popup, W)
   endif
 
-  if use_popup
-    add(lines, repeat('─', W + 2))
-  else
-    add(lines, '├' .. repeat('─', W + 2) .. '┤')
-  endif
+  add(lines, DividerLine(use_popup, W))
 
-  # ── 插件列表 ──
-  if s_ui_mode ==# 'status_done'
-    var th = printf('  %-2s %-22s %-10s %-8s %-5s %-6s', '', 'Plugin', 'Branch', 'Commit', 'Stat', 'Size')
-    if use_popup
-      add(lines, PadLine(th, W + 2))
-      add(lines, '  ' .. repeat('─', W - 2) .. '  ')
-    else
-      add(lines, '│' .. PadLine(th, W + 2) .. '│')
-      add(lines, '│  ' .. repeat('─', W - 2) .. '  │')
-    endif
-  endif
+  AddUiLine(lines, printf('  %-2s %-28s %-11s %-10s %s', '', 'Plugin', 'State', 'Version', 'Details'), use_popup, W)
+  add(lines, DividerLine(use_popup, W))
 
-  var maxname = 0
-  for p in display_plugins
-    if len(p.name) > maxname
-      maxname = len(p.name)
-    endif
-  endfor
-  if maxname > 25
-    maxname = 25
-  endif
-
-  # 获取排序后的显示顺序
   var sorted = s_ui_sorted_names
   if s_ui_filter_text !=# ''
     var filter_names = mapnew(display_plugins, (_, p) => p.name)
     sorted = filter(copy(sorted), (_, n) => index(filter_names, n) >= 0)
+  endif
+  if s_ui_mode =~# 'clean'
+    sorted = []
+  endif
+  if empty(sorted)
+    s_ui_cursor_line = 0
+  elseif s_ui_cursor_line >= len(sorted)
+    s_ui_cursor_line = len(sorted) - 1
   endif
 
   var plug_line_idx = 0
@@ -985,138 +1056,64 @@ def UIBuildAndRender()
       continue
     endif
     var name = p.name
-    var st = get(s_ui_plug_state, name, {status: 'waiting', msg: '', icon: '·', branch: '', commit: '', dirty: false})
-    var icon = get(st, 'icon', '·')
+    var st = get(s_ui_plug_state, name, {status: 'waiting', msg: '', icon: '·', action: '', branch: '', commit: '', dirty: false})
+    var icon = UiIcon(st, is_done)
     var msg = get(st, 'msg', '')
-    var status = get(st, 'status', 'waiting')
+    var action = UiAction(st)
 
-    # 光标指示 (始终显示，方便导航)
     var is_cursor = (plug_line_idx == s_ui_cursor_line)
     var cursor_mark = is_cursor ? '▸' : ' '
     if is_cursor
-      s_ui_cursor_buf_line = len(lines) + 1  # 下一行即将 add 的行号 (1-based)
+      s_ui_cursor_buf_line = len(lines) + 1
     endif
 
+    var display_name = ShortLine(name, 28)
+    var version = ''
     if s_ui_mode ==# 'status_done'
       var branch = get(st, 'branch', '')
       var commit = get(st, 'commit', '')
       var dirty = get(st, 'dirty', false)
-      var dirty_flag = dirty ? '*' : ' '
-      var status_text = status ==# 'done' ? 'ok' : 'missing'
-      var display_name = len(name) > 22 ? name[: 21] : name
-      var size_kb = get(st, 'size_kb', 0)
-      var size_str = FormatSize(size_kb)
-      var content = printf('%s %s %-22s %-10s %-8s %-4s%s %-5s',
-        cursor_mark, icon, display_name,
-        branch !=# '' ? branch[: 9] : '—',
-        commit !=# '' ? commit[: 7] : '—',
-        status_text, dirty_flag, size_str)
-      if use_popup
-        add(lines, PadLine(content, W + 2))
-      else
-        add(lines, '│' .. PadLine(content, W + 2) .. '│')
-      endif
+      var size_str = FormatSize(get(st, 'size_kb', 0))
+      version = branch !=# '' ? ShortLine(branch, 10) : '—'
+      msg = (commit !=# '' ? commit[: 7] : '—') .. (dirty ? ' dirty' : '') .. '  ' .. size_str
     else
-      var display_name = len(name) > maxname ? name[: maxname - 1] : name
-      # 耗时
-      var timing_str = ''
-      if has_key(s_ui_plug_timings, name)
-        timing_str = printf(' %.1fs', s_ui_plug_timings[name])
-      endif
-
-      var content = ''
-      if status ==# 'waiting' && !is_done
-        content = printf('%s · %-' .. string(maxname) .. 's  waiting...', cursor_mark, display_name)
-      elseif status ==# 'done'
-        var avail = W - maxname - strdisplaywidth(timing_str) - 8
-        var short_msg = len(msg) > avail ? msg[: avail - 1] : msg
-        content = printf('%s %s %-' .. string(maxname) .. 's  %s%s', cursor_mark, icon, display_name, short_msg, timing_str)
-      elseif status ==# 'error'
-        var avail = W - maxname - strdisplaywidth(timing_str) - 8
-        var short_msg = len(msg) > avail ? msg[: avail - 1] : msg
-        content = printf('%s %s %-' .. string(maxname) .. 's  %s%s', cursor_mark, icon, display_name, short_msg, timing_str)
-      elseif status ==# 'skipped'
-        content = printf('%s %s %-' .. string(maxname) .. 's  frozen%s', cursor_mark, icon, display_name, timing_str)
-      elseif status ==# 'removed'
-        content = printf('%s %s %-' .. string(maxname) .. 's  removed', cursor_mark, icon, display_name)
-      endif
-
-      if content !=# ''
-        if use_popup
-          add(lines, PadLine(content, W + 2))
-        else
-          add(lines, '│' .. PadLine(content, W + 2) .. '│')
-        endif
+      version = has_key(s_ui_plug_timings, name) ? printf('%.1fs', s_ui_plug_timings[name]) : '—'
+      if action ==# 'waiting' && !is_done
+        msg = 'waiting'
+      elseif action ==# 'frozen'
+        msg = 'locked'
       endif
     endif
+    var details_width = W - 59
+    var content = printf('%s %s %-28s %-11s %-10s %s',
+      cursor_mark, icon, display_name, action, version, ShortLine(msg, details_width))
+    AddUiLine(lines, content, use_popup, W)
     plug_line_idx += 1
   endfor
 
-  # Clean 模式
   if s_ui_mode =~# 'clean'
     if empty(s_ui_plug_state)
-      var c = '  Nothing to clean.'
-      if use_popup
-        add(lines, PadLine(c, W + 2))
-      else
-        add(lines, '│' .. PadLine(c, W + 2) .. '│')
-      endif
+      AddUiLine(lines, '  Nothing to clean.', use_popup, W)
     else
       for [cname, cst] in items(s_ui_plug_state)
-        var cicon = get(cst, 'icon', '')
-        var c = printf('  %s %-30s removed', cicon, cname)
-        if use_popup
-          add(lines, PadLine(c, W + 2))
-        else
-          add(lines, '│' .. PadLine(c, W + 2) .. '│')
-        endif
+        var c = printf('  %s %-28s removed     —          removed', UiIcon(cst, true), ShortLine(cname, 28))
+        AddUiLine(lines, c, use_popup, W)
       endfor
     endif
   endif
 
-  # ── 搜索栏 ──
   if s_ui_filter_active
     var filter_line = '  / ' .. s_ui_filter_text .. '▏'
-    if use_popup
-      add(lines, repeat('─', W + 2))
-      add(lines, PadLine(filter_line, W + 2))
-    else
-      add(lines, '├' .. repeat('─', W + 2) .. '┤')
-      add(lines, '│' .. PadLine(filter_line, W + 2) .. '│')
-    endif
+    add(lines, DividerLine(use_popup, W))
+    AddUiLine(lines, filter_line, use_popup, W)
   endif
 
-  # ── 统计摘要 ──
-  if use_popup
-    add(lines, repeat('─', W + 2))
-  else
-    add(lines, '├' .. repeat('─', W + 2) .. '┤')
-  endif
-
-  if is_done
-    var summary = SummaryLine()
-    if use_popup
-      add(lines, PadLine(' ' .. summary, W + 2))
-    else
-      add(lines, '│ ' .. PadLine(summary, W) .. ' │')
-    endif
-  else
-    var shown_finished = s_ui_finished > s_ui_total ? s_ui_total : s_ui_finished
-    var progress_text = printf(' %s  %d / %d plugins', spinner, shown_finished, s_ui_total)
-    if use_popup
-      add(lines, PadLine(progress_text, W + 2))
-    else
-      add(lines, '│' .. PadLine(progress_text, W + 2) .. '│')
-    endif
-  endif
+  add(lines, DividerLine(use_popup, W))
+  AddUiLine(lines, '  ' .. SummaryLine(), use_popup, W)
+  AddUiLine(lines, '  q close  j/k move  <CR> open  d log  / filter  ? help  R retry  S status', use_popup, W)
 
   if !use_popup
-    add(lines, '╰' .. repeat('─', W + 2) .. '╯')
-  endif
-
-  if is_done
-    add(lines, '')
-    add(lines, '  q close  j/k scroll  ⏎ open  d log  / filter  ? help  R retry  S status')
+    add(lines, '╰' .. repeat('─', W) .. '╯')
   endif
 
   s_ui_lines = lines
@@ -1124,47 +1121,29 @@ def UIBuildAndRender()
 enddef
 
 def SummaryLine(): string
-  var n_ok = 0
-  var n_err = 0
-  var n_skip = 0
-  var n_new = 0
-  var n_up = 0
-  for [name, st] in items(s_ui_plug_state)
-    var s = get(st, 'status', '')
-    if s ==# 'done'
-      var icon = get(st, 'icon', '')
-      if icon ==# ''
-        n_new += 1
-      elseif icon ==# ''
-        n_up += 1
-      else
-        n_ok += 1
-      endif
-    elseif s ==# 'error'
-      n_err += 1
-    elseif s ==# 'skipped'
-      n_skip += 1
-    endif
-  endfor
-
+  var counts = SummaryCounts()
   var parts: list<string> = []
-  if n_new > 0
-    add(parts, printf(' %d installed', n_new))
+  if counts.installed > 0
+    add(parts, printf('%d installed', counts.installed))
   endif
-  if n_up > 0
-    add(parts, printf(' %d updated', n_up))
+  if counts.updated > 0
+    add(parts, printf('%d updated', counts.updated))
   endif
-  if n_ok > 0
-    add(parts, printf(' %d ok', n_ok))
+  if counts.ok > 0
+    add(parts, printf('%d ok', counts.ok))
   endif
-  if n_skip > 0
-    add(parts, printf(' %d frozen', n_skip))
+  if counts.frozen > 0
+    add(parts, printf('%d frozen', counts.frozen))
   endif
-  if n_err > 0
-    add(parts, printf(' %d errors', n_err))
+  if counts.removed > 0
+    add(parts, printf('%d removed', counts.removed))
+  endif
+  var errors = counts.errors + counts.missing
+  if errors > 0
+    add(parts, printf('%d errors', errors))
   endif
   if empty(parts)
-    return ' All done  (' .. Elapsed() .. ')'
+    return 'Waiting for plugins  (' .. Elapsed() .. ')'
   endif
   return join(parts, '  ') .. '  (' .. Elapsed() .. ')'
 enddef
@@ -1205,8 +1184,8 @@ def UIOpenPopup()
   var max_h = get(g:, 'simpleplug_window_height', 35)
   s_ui_popup_id = popup_create(s_ui_bufnr, {
     pos: 'center',
-    minwidth: 62,
-    maxwidth: 62,
+    minwidth: s_inner_width,
+    maxwidth: s_inner_width,
     minheight: 10,
     maxheight: max_h,
     border: [],
@@ -1258,6 +1237,7 @@ def UIOpenSplit()
   nnoremap <buffer><silent> S <Cmd>call simpleplug#Status()<CR>
   nnoremap <buffer><silent> <CR> <Cmd>call simpleplug#OpenPluginDir()<CR>
   nnoremap <buffer><silent> d <Cmd>call simpleplug#ViewPluginDiff()<CR>
+  nnoremap <buffer><silent> h <Cmd>call simpleplug#ToggleHelp()<CR>
   nnoremap <buffer><silent> ? <Cmd>call simpleplug#ToggleHelp()<CR>
   nnoremap <buffer><silent> / <Cmd>call simpleplug#StartFilterSplit()<CR>
 
@@ -1390,7 +1370,7 @@ def PopupFilter(winid: number, key: string): bool
   elseif key ==# 'd'
     DoViewPluginDiff()
     return true
-  elseif key ==# '?'
+  elseif key ==# '?' || key ==# 'h'
     DoToggleHelp()
     return true
   elseif key ==# '/'
@@ -1477,7 +1457,7 @@ def LogPopupFilter(wid: number, k: string): bool
 enddef
 
 def HelpPopupFilter(wid: number, k: string): bool
-  if k ==# '?' || k ==# 'q' || k ==# "\<Esc>"
+  if k ==# '?' || k ==# 'h' || k ==# 'q' || k ==# "\<Esc>"
     popup_close(wid)
     s_ui_help_popup_id = 0
     return true
@@ -1548,7 +1528,7 @@ def DoToggleHelp()
     '    R           重试操作',
     '    S           查看状态',
     '    q / Esc     关闭窗口',
-    '    ?           切换帮助',
+    '    ? / h       切换帮助',
     '',
   ]
 
@@ -1651,13 +1631,13 @@ def SetupSyntax()
   win_execute(w, 'syntax match SPlugBarEmpty /░/')
   win_execute(w, 'syntax match SPlugPct /\d\+%/')
   # 状态图标
-  win_execute(w, 'syntax match SPlugIconOk / /')
-  win_execute(w, 'syntax match SPlugIconNew / /')
-  win_execute(w, 'syntax match SPlugIconUp / /')
-  win_execute(w, 'syntax match SPlugIconErr / /')
-  win_execute(w, 'syntax match SPlugIconSkip / /')
-  win_execute(w, 'syntax match SPlugIconWait /· /')
-  win_execute(w, 'syntax match SPlugIconRemove /󰩺/')
+  win_execute(w, 'syntax match SPlugIconOk /●/')
+  win_execute(w, 'syntax match SPlugIconNew /+/')
+  win_execute(w, 'syntax match SPlugIconUp /\*/')
+  win_execute(w, 'syntax match SPlugIconErr /✘/')
+  win_execute(w, 'syntax match SPlugIconSkip /○/')
+  win_execute(w, 'syntax match SPlugIconWait /·/')
+  win_execute(w, 'syntax match SPlugIconRemove /-/')
   # 时间
   win_execute(w, 'syntax match SPlugTime /\d\+\.\d\+s/')
   # spinner
@@ -1669,9 +1649,15 @@ def SetupSyntax()
   # 帮助文本
   win_execute(w, 'syntax match SPlugHelp /q close.*$/')
   # 表头
-  win_execute(w, 'syntax match SPlugTableHeader /Plugin\s\+Branch\s\+Commit\s\+Stat\s\+Size/')
+  win_execute(w, 'syntax match SPlugTableHeader /Plugin\s\+State\s\+Version\s\+Details/')
+  # 状态文本
+  win_execute(w, 'syntax match SPlugStateNew /installed/')
+  win_execute(w, 'syntax match SPlugStateUp /updated/')
+  win_execute(w, 'syntax match SPlugStateOk /\<ok\>/')
+  win_execute(w, 'syntax match SPlugStateErr /\(error\|missing\)/')
+  win_execute(w, 'syntax match SPlugStateHook /hook/')
   # waiting
-  win_execute(w, 'syntax match SPlugWaiting /waiting\.\.\./')
+  win_execute(w, 'syntax match SPlugWaiting /waiting/')
   # frozen
   win_execute(w, 'syntax match SPlugFrozen /frozen/')
   # removed
@@ -1683,6 +1669,7 @@ def SetupSyntax()
   win_execute(w, 'syntax match SPlugSumUpdated / \d\+ updated/')
   win_execute(w, 'syntax match SPlugSumOk / \d\+ ok/')
   win_execute(w, 'syntax match SPlugSumFrozen / \d\+ frozen/')
+  win_execute(w, 'syntax match SPlugSumRemoved / \d\+ removed/')
   win_execute(w, 'syntax match SPlugSumErrors / \d\+ errors/')
   # diff stats
   win_execute(w, 'syntax match SPlugDiffAdd /\d\+ insertion\(s\)\=/')
@@ -1727,7 +1714,13 @@ def SetupSyntax()
   win_execute(w, 'highlight default SPlugSumUpdated ctermfg=180 guifg=#d7af87 cterm=bold gui=bold')
   win_execute(w, 'highlight default SPlugSumOk ctermfg=114 guifg=#87d787')
   win_execute(w, 'highlight default SPlugSumFrozen ctermfg=245 guifg=#8a8a8a')
+  win_execute(w, 'highlight default SPlugSumRemoved ctermfg=204 guifg=#ff5f87')
   win_execute(w, 'highlight default SPlugSumErrors ctermfg=204 guifg=#ff5f87 cterm=bold gui=bold')
+  win_execute(w, 'highlight default SPlugStateNew ctermfg=114 guifg=#87d787 cterm=bold gui=bold')
+  win_execute(w, 'highlight default SPlugStateUp ctermfg=180 guifg=#d7af87 cterm=bold gui=bold')
+  win_execute(w, 'highlight default SPlugStateOk ctermfg=114 guifg=#87d787')
+  win_execute(w, 'highlight default SPlugStateErr ctermfg=204 guifg=#ff5f87 cterm=bold gui=bold')
+  win_execute(w, 'highlight default SPlugStateHook ctermfg=75 guifg=#5fafff')
   win_execute(w, 'highlight default SPlugDiffAdd ctermfg=114 guifg=#87d787')
   win_execute(w, 'highlight default SPlugDiffDel ctermfg=204 guifg=#ff5f87')
   win_execute(w, 'highlight default SPlugSize ctermfg=245 guifg=#8a8a8a')
