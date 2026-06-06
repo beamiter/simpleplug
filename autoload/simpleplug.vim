@@ -451,6 +451,7 @@ export def Install()
       StopSpinner()
       var s = ev.summary
       s_ui_mode = 'install_done'
+      RecountFinished()
       UIBuildAndRender()
     },
     OnError: (ev) => {
@@ -494,6 +495,7 @@ export def Update()
       StopSpinner()
       var s = ev.summary
       s_ui_mode = 'update_done'
+      RecountFinished()
       UIBuildAndRender()
     },
     OnError: (ev) => {
@@ -608,7 +610,6 @@ def OnProgress(ev: dict<any>)
     st.status = 'done'
     st.icon = ''
     st.msg = msg
-    s_ui_finished += 1
     if has_key(s_ui_plug_start_times, name)
       s_ui_plug_timings[name] = reltimefloat(reltime(s_ui_plug_start_times[name]))
     endif
@@ -616,7 +617,6 @@ def OnProgress(ev: dict<any>)
     st.status = 'done'
     st.icon = ''
     st.msg = msg
-    s_ui_finished += 1
     if has_key(s_ui_plug_start_times, name)
       s_ui_plug_timings[name] = reltimefloat(reltime(s_ui_plug_start_times[name]))
     endif
@@ -624,7 +624,6 @@ def OnProgress(ev: dict<any>)
     st.status = 'done'
     st.icon = ''
     st.msg = msg
-    s_ui_finished += 1
     if has_key(s_ui_plug_start_times, name)
       s_ui_plug_timings[name] = reltimefloat(reltime(s_ui_plug_start_times[name]))
     endif
@@ -632,7 +631,6 @@ def OnProgress(ev: dict<any>)
     st.status = 'skipped'
     st.icon = ''
     st.msg = msg
-    s_ui_finished += 1
     if has_key(s_ui_plug_start_times, name)
       s_ui_plug_timings[name] = reltimefloat(reltime(s_ui_plug_start_times[name]))
     endif
@@ -642,13 +640,13 @@ def OnProgress(ev: dict<any>)
     st.status = 'error'
     st.icon = ''
     st.msg = msg
-    s_ui_finished += 1
     if has_key(s_ui_plug_start_times, name)
       s_ui_plug_timings[name] = reltimefloat(reltime(s_ui_plug_start_times[name]))
     endif
   endif
 
   s_ui_plug_state[name] = st
+  RecountFinished()
   UIBuildAndRender()
 enddef
 
@@ -787,6 +785,31 @@ def IsDone(): bool
   return s_ui_mode =~# '_done$'
 enddef
 
+def IsInstallUpdateRunning(): bool
+  return s_ui_mode ==# 'install' || s_ui_mode ==# 'update'
+enddef
+
+def IsInstallUpdateMode(): bool
+  return s_ui_mode ==# 'install'
+    || s_ui_mode ==# 'update'
+    || s_ui_mode ==# 'install_done'
+    || s_ui_mode ==# 'update_done'
+enddef
+
+def IsFinishedStatus(status: string): bool
+  return status ==# 'done' || status ==# 'error' || status ==# 'skipped'
+enddef
+
+def RecountFinished()
+  var finished = 0
+  for [_, st] in items(s_ui_plug_state)
+    if IsFinishedStatus(get(st, 'status', ''))
+      finished += 1
+    endif
+  endfor
+  s_ui_finished = finished > s_ui_total ? s_ui_total : finished
+enddef
+
 # ─────────────────── 排序插件列表 ───────────────────
 
 def FormatSize(kb: number): string
@@ -801,7 +824,7 @@ enddef
 
 def SortedPluginNames(): list<string>
   # install/update 进行中: working > done/error > waiting
-  if s_ui_mode =~# 'install\|update' && !IsDone()
+  if IsInstallUpdateRunning()
     var working: list<string> = []
     var finished: list<string> = []
     var waiting: list<string> = []
@@ -835,11 +858,35 @@ enddef
 const s_inner_width = 58  # 内容区宽度 (不含左右边框各1字符)
 
 def PadLine(content: string, width: number): string
-  var pad = width - strdisplaywidth(content)
+  var text = content
+  while strdisplaywidth(text) > width && strchars(text) > 0
+    text = strcharpart(text, 0, strchars(text) - 1)
+  endwhile
+  var pad = width - strdisplaywidth(text)
   if pad < 0
     pad = 0
   endif
-  return content .. repeat(' ', pad)
+  return text .. repeat(' ', pad)
+enddef
+
+def SetUiBufferLines()
+  if s_ui_bufnr < 0 || !bufexists(s_ui_bufnr)
+    return
+  endif
+
+  var old_last = 1
+  var info = getbufinfo(s_ui_bufnr)
+  if !empty(info)
+    old_last = info[0].linecount
+  endif
+
+  var new_lines = empty(s_ui_lines) ? [''] : s_ui_lines
+  setbufvar(s_ui_bufnr, '&modifiable', 1)
+  setbufline(s_ui_bufnr, 1, new_lines)
+  if old_last > len(new_lines)
+    deletebufline(s_ui_bufnr, len(new_lines) + 1, old_last)
+  endif
+  setbufvar(s_ui_bufnr, '&modifiable', 0)
 enddef
 
 def UIBuildAndRender()
@@ -857,7 +904,7 @@ def UIBuildAndRender()
 
   # ── 标题头 ──
   var count_text = ''
-  if s_ui_mode =~# 'install\|update' && !is_done
+  if IsInstallUpdateRunning()
     count_text = printf(' (%d/%d)', s_ui_finished, s_ui_total)
   endif
   var header_text = ' ' .. spinner .. '   ' .. title .. count_text .. '  '
@@ -875,20 +922,21 @@ def UIBuildAndRender()
   endif
 
   if use_popup
-    add(lines, header_text .. hdr_pad .. right_info)
+    add(lines, PadLine(header_text .. hdr_pad .. right_info, W + 2))
   else
     add(lines, '│' .. header_text .. hdr_pad .. right_info .. '│')
   endif
 
   # ── 进度条 (install/update 模式) ──
-  if s_ui_mode =~# 'install\|update'
+  if IsInstallUpdateMode()
+    var shown_finished = s_ui_finished > s_ui_total ? s_ui_total : s_ui_finished
     var bar_width = W - 10
-    var bar = ProgressBar(s_ui_finished, s_ui_total, bar_width)
-    var pct = s_ui_total > 0 ? (s_ui_finished * 100 / s_ui_total) : 0
+    var bar = ProgressBar(shown_finished, s_ui_total, bar_width)
+    var pct = s_ui_total > 0 ? (shown_finished * 100 / s_ui_total) : 0
     var bar_content = printf('  %s %3d%%  ', bar, pct)
     if use_popup
       add(lines, repeat('─', W + 2))
-      add(lines, bar_content)
+      add(lines, PadLine(bar_content, W + 2))
     else
       add(lines, '├' .. repeat('─', W + 2) .. '┤')
       add(lines, '│' .. bar_content .. '│')
@@ -1053,7 +1101,8 @@ def UIBuildAndRender()
       add(lines, '│ ' .. PadLine(summary, W) .. ' │')
     endif
   else
-    var progress_text = printf(' %s  %d / %d plugins', spinner, s_ui_finished, s_ui_total)
+    var shown_finished = s_ui_finished > s_ui_total ? s_ui_total : s_ui_finished
+    var progress_text = printf(' %s  %d / %d plugins', spinner, shown_finished, s_ui_total)
     if use_popup
       add(lines, PadLine(progress_text, W + 2))
     else
@@ -1172,7 +1221,7 @@ def UIOpenPopup()
     zindex: 200,
   })
 
-  win_execute(s_ui_popup_id, 'setlocal cursorline')
+  win_execute(s_ui_popup_id, 'setlocal cursorline nowrap')
   SetupSyntax()
   StartSpinner()
 enddef
@@ -1257,11 +1306,16 @@ enddef
 
 def UIRender()
   if s_ui_use_popup
-    if s_ui_popup_id > 0 && s_ui_bufnr > 0 && bufexists(s_ui_bufnr)
-      setbufvar(s_ui_bufnr, '&modifiable', 1)
-      deletebufline(s_ui_bufnr, 1, '$')
-      setbufline(s_ui_bufnr, 1, s_ui_lines)
-      setbufvar(s_ui_bufnr, '&modifiable', 0)
+    if s_ui_popup_id > 0
+      try
+        popup_settext(s_ui_popup_id, s_ui_lines)
+      catch
+        SetUiBufferLines()
+      endtry
+    elseif s_ui_bufnr > 0 && bufexists(s_ui_bufnr)
+      SetUiBufferLines()
+    endif
+    if s_ui_popup_id > 0
       # 将 popup 内光标移动到选中行
       if s_ui_cursor_buf_line > 0
         win_execute(s_ui_popup_id, 'normal! ' .. s_ui_cursor_buf_line .. 'G')
@@ -1278,10 +1332,7 @@ def UIRender()
   if empty(wins)
     return
   endif
-  win_execute(wins[0], 'setlocal modifiable')
-  deletebufline(s_ui_bufnr, 1, '$')
-  setbufline(s_ui_bufnr, 1, s_ui_lines)
-  win_execute(wins[0], 'setlocal nomodifiable')
+  SetUiBufferLines()
   var desired_h = len(s_ui_lines) + 1
   var max_h = get(g:, 'simpleplug_window_height', 15)
   if desired_h > max_h
