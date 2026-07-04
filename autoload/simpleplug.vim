@@ -36,10 +36,8 @@ var s_ui_spinner_timer: number = 0
 var s_auto_install_checked: bool = false
 const s_spinners = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 
-# ─────────────────── Popup / 交互状态 ───────────────────
+# ─────────────────── UI 交互状态 ───────────────────
 
-var s_ui_use_popup: bool = false
-var s_ui_popup_id: number = 0
 var s_ui_cursor_line: number = 0
 var s_ui_show_help: bool = false
 var s_ui_filter_text: string = ''
@@ -47,7 +45,6 @@ var s_ui_filter_active: bool = false
 var s_ui_plug_timings: dict<float> = {}
 var s_ui_plug_start_times: dict<list<any>> = {}
 var s_ui_sorted_names: list<string> = []
-var s_ui_help_popup_id: number = 0
 var s_ui_cursor_buf_line: number = 0  # 光标对应的缓冲区行号(1-based)
 
 # ─────────────────── 日志 ───────────────────
@@ -727,12 +724,8 @@ def OnCleanDone(ev: dict<any>)
 enddef
 
 # =============================================================
-# UI — 插件状态面板 (增强版: popup + 交互 + 视觉)
+# UI — 插件状态面板 (右侧 split + 交互 + 视觉)
 # =============================================================
-
-def CanUsePopup(): bool
-  return has('popupwin') && get(g:, 'simpleplug_popup', 1)
-enddef
 
 def Elapsed(): string
   if empty(s_ui_start_time)
@@ -761,7 +754,8 @@ enddef
 
 def StartSpinner()
   StopSpinner()
-  s_ui_spinner_timer = timer_start(80, function('SpinnerTick'), {repeat: -1})
+  var interval = get(g:, 'simpleplug_spinner_interval', 200)
+  s_ui_spinner_timer = timer_start(interval, function('SpinnerTick'), {repeat: -1})
 enddef
 
 def StopSpinner()
@@ -862,9 +856,13 @@ def GetDisplayPlugins(): list<dict<any>>
   return s_plugins
 enddef
 
-# ─────────────────── 内容构建 (popup/split 通用) ───────────────────
+# ─────────────────── 内容构建 ───────────────────
 
-const s_inner_width = 74  # 内容区宽度 (不含左右边框各1字符)
+const s_default_width = 88
+
+def UiWidth(): number
+  return get(g:, 'simpleplug_window_width', s_default_width)
+enddef
 
 def PadLine(content: string, width: number): string
   var text = content
@@ -897,19 +895,12 @@ def AlignLine(left: string, right: string, width: number): string
   return left .. repeat(' ', gap) .. right
 enddef
 
-def AddUiLine(lines: list<string>, content: string, use_popup: bool, width: number)
-  if use_popup
-    add(lines, PadLine(content, width))
-  else
-    add(lines, '│' .. PadLine(content, width) .. '│')
-  endif
+def AddUiLine(lines: list<string>, content: string, width: number)
+  add(lines, PadLine(content, width))
 enddef
 
-def DividerLine(use_popup: bool, width: number): string
-  if use_popup
-    return repeat('─', width)
-  endif
-  return '├' .. repeat('─', width) .. '┤'
+def DividerLine(width: number): string
+  return repeat('─', width)
 enddef
 
 def UiAction(st: dict<any>): string
@@ -1000,40 +991,35 @@ def UIBuildAndRender()
   var title = ModeTitle()
   var is_done = IsDone()
   var spinner = is_done ? '✓' : s_spinners[s_ui_spinner_idx]
-  var use_popup = s_ui_use_popup
-  var W = s_inner_width
+  var W = UiWidth()
 
   s_ui_sorted_names = SortedPluginNames()
   s_ui_cursor_buf_line = 0
   var display_plugins = GetDisplayPlugins()
 
-  if !use_popup
-    add(lines, '╭' .. repeat('─', W) .. '╮')
-  endif
-
   var shown_finished = s_ui_finished > s_ui_total ? s_ui_total : s_ui_finished
   var pct = s_ui_total > 0 ? (shown_finished * 100 / s_ui_total) : 0
-  var header_left = '  ' .. spinner .. '  SimplePlug'
-  var header_right = title .. '  ' .. Elapsed()
-  AddUiLine(lines, AlignLine(header_left, header_right, W), use_popup, W)
+  var header_left = '  SimplePlug'
+  var header_right = spinner .. '  ' .. title .. '  ' .. Elapsed()
+  AddUiLine(lines, AlignLine(header_left, header_right, W), W)
 
   var counts = SummaryCounts()
-  var stats = printf('  Total %d  Installed %d  Updated %d  Ok %d  Frozen %d  Errors %d',
+  var stats = printf('  total %d  installed %d  updated %d  ok %d  frozen %d  errors %d',
     s_ui_total, counts.installed, counts.updated, counts.ok, counts.frozen, counts.errors + counts.missing)
   if counts.removed > 0
-    stats ..= printf('  Removed %d', counts.removed)
+    stats ..= printf('  removed %d', counts.removed)
   endif
-  AddUiLine(lines, stats, use_popup, W)
+  AddUiLine(lines, stats, W)
 
   if IsInstallUpdateMode()
-    var bar = ProgressBar(shown_finished, s_ui_total, W - 18)
-    AddUiLine(lines, printf('  %s  %3d%%  %d/%d', bar, pct, shown_finished, s_ui_total), use_popup, W)
+    var bar = ProgressBar(shown_finished, s_ui_total, W - 22)
+    AddUiLine(lines, printf('  %s  %3d%%  %d/%d', bar, pct, shown_finished, s_ui_total), W)
   endif
 
-  add(lines, DividerLine(use_popup, W))
+  add(lines, DividerLine(W))
 
-  AddUiLine(lines, printf('  %-2s %-28s %-11s %-10s %s', '', 'Plugin', 'State', 'Version', 'Details'), use_popup, W)
-  add(lines, DividerLine(use_popup, W))
+  AddUiLine(lines, printf('  %-2s %-30s %-12s %-10s %s', '', 'Plugin', 'State', 'Time', 'Details'), W)
+  add(lines, DividerLine(W))
 
   var sorted = s_ui_sorted_names
   if s_ui_filter_text !=# ''
@@ -1067,7 +1053,7 @@ def UIBuildAndRender()
       s_ui_cursor_buf_line = len(lines) + 1
     endif
 
-    var display_name = ShortLine(name, 28)
+    var display_name = ShortLine(name, 30)
     var version = ''
     if s_ui_mode ==# 'status_done'
       var branch = get(st, 'branch', '')
@@ -1084,37 +1070,33 @@ def UIBuildAndRender()
         msg = 'locked'
       endif
     endif
-    var details_width = W - 59
-    var content = printf('%s %s %-28s %-11s %-10s %s',
+    var details_width = W - 62
+    var content = printf('%s %s %-30s %-12s %-10s %s',
       cursor_mark, icon, display_name, action, version, ShortLine(msg, details_width))
-    AddUiLine(lines, content, use_popup, W)
+    AddUiLine(lines, content, W)
     plug_line_idx += 1
   endfor
 
   if s_ui_mode =~# 'clean'
     if empty(s_ui_plug_state)
-      AddUiLine(lines, '  Nothing to clean.', use_popup, W)
+      AddUiLine(lines, '  Nothing to clean.', W)
     else
       for [cname, cst] in items(s_ui_plug_state)
-        var c = printf('  %s %-28s removed     —          removed', UiIcon(cst, true), ShortLine(cname, 28))
-        AddUiLine(lines, c, use_popup, W)
+        var c = printf('  %s %-30s removed      —          removed', UiIcon(cst, true), ShortLine(cname, 30))
+        AddUiLine(lines, c, W)
       endfor
     endif
   endif
 
   if s_ui_filter_active
     var filter_line = '  / ' .. s_ui_filter_text .. '▏'
-    add(lines, DividerLine(use_popup, W))
-    AddUiLine(lines, filter_line, use_popup, W)
+    add(lines, DividerLine(W))
+    AddUiLine(lines, filter_line, W)
   endif
 
-  add(lines, DividerLine(use_popup, W))
-  AddUiLine(lines, '  ' .. SummaryLine(), use_popup, W)
-  AddUiLine(lines, '  q close  j/k move  <CR> open  d log  / filter  ? help  R retry  S status', use_popup, W)
-
-  if !use_popup
-    add(lines, '╰' .. repeat('─', W) .. '╯')
-  endif
+  add(lines, DividerLine(W))
+  AddUiLine(lines, '  ' .. SummaryLine(), W)
+  AddUiLine(lines, '  q close   j/k move   <CR> open   d log   / filter   ? help   R retry   S status', W)
 
   s_ui_lines = lines
   UIRender()
@@ -1148,81 +1130,24 @@ def SummaryLine(): string
   return join(parts, '  ') .. '  (' .. Elapsed() .. ')'
 enddef
 
-# ─────────────────── 窗口管理 (popup / split 双模式) ───────────────────
+# ─────────────────── 窗口管理 ───────────────────
 
 def UIOpen()
-  if CanUsePopup()
-    UIOpenPopup()
-  else
-    UIOpenSplit()
-  endif
-enddef
-
-def UIOpenPopup()
-  # 复用已有 popup
-  if s_ui_popup_id > 0
-    try
-      popup_close(s_ui_popup_id)
-    catch
-    endtry
-    s_ui_popup_id = 0
-  endif
-
-  # 创建后备缓冲区
-  if s_ui_bufnr < 0 || !bufexists(s_ui_bufnr)
-    s_ui_bufnr = bufadd('')
-    bufload(s_ui_bufnr)
-    setbufvar(s_ui_bufnr, '&buftype', 'nofile')
-    setbufvar(s_ui_bufnr, '&bufhidden', 'hide')
-    setbufvar(s_ui_bufnr, '&swapfile', 0)
-    setbufvar(s_ui_bufnr, '&buflisted', 0)
-  endif
-
-  s_ui_use_popup = true
-  UIBuildAndRender()
-
-  var max_h = get(g:, 'simpleplug_window_height', 35)
-  s_ui_popup_id = popup_create(s_ui_bufnr, {
-    pos: 'center',
-    minwidth: s_inner_width,
-    maxwidth: s_inner_width,
-    minheight: 10,
-    maxheight: max_h,
-    border: [],
-    borderchars: ['─', '│', '─', '│', '╭', '╮', '╰', '╯'],
-    borderhighlight: ['SPlugPopupBorder'],
-    highlight: 'SPlugNormal',
-    padding: [0, 0, 0, 0],
-    scrollbar: 0,
-    filter: function('PopupFilter'),
-    callback: function('PopupOnClose'),
-    mapping: 0,
-    zindex: 200,
-  })
-
-  win_execute(s_ui_popup_id, 'setlocal cursorline nowrap')
-  SetupSyntax()
-  StartSpinner()
-enddef
-
-def UIOpenSplit()
   # 如果已有窗口，复用
   if s_ui_bufnr > 0 && bufexists(s_ui_bufnr)
     var wins = win_findbuf(s_ui_bufnr)
     if !empty(wins)
       win_gotoid(wins[0])
       s_ui_winid = wins[0]
-      s_ui_use_popup = false
       UIBuildAndRender()
       StartSpinner()
       return
     endif
   endif
 
-  # 新建分屏
-  s_ui_use_popup = false
-  botright new
-  execute ':resize ' .. g:simpleplug_window_height
+  # 新建右侧分屏
+  botright vertical new
+  execute ':vertical resize ' .. UiWidth()
   s_ui_winid = win_getid()
   s_ui_bufnr = bufnr()
   setlocal buftype=nofile bufhidden=wipe noswapfile nobuflisted
@@ -1248,30 +1173,11 @@ enddef
 
 export def UIClose()
   StopSpinner()
-  if s_ui_use_popup
-    if s_ui_popup_id > 0
-      try
-        popup_close(s_ui_popup_id)
-      catch
-      endtry
-      s_ui_popup_id = 0
-    endif
-    # 清理缓冲区
-    if s_ui_bufnr > 0 && bufexists(s_ui_bufnr)
-      try
-        execute 'bwipeout! ' .. s_ui_bufnr
-      catch
-      endtry
-    endif
-  else
-    if s_ui_bufnr > 0 && bufexists(s_ui_bufnr)
-      execute 'bwipeout ' .. s_ui_bufnr
-    endif
+  if s_ui_bufnr > 0 && bufexists(s_ui_bufnr)
+    execute 'bwipeout ' .. s_ui_bufnr
   endif
   s_ui_bufnr = -1
   s_ui_winid = 0
-  s_ui_popup_id = 0
-  s_ui_use_popup = false
   s_ui_filter_active = false
   s_ui_filter_text = ''
 enddef
@@ -1285,26 +1191,6 @@ export def UIRetry()
 enddef
 
 def UIRender()
-  if s_ui_use_popup
-    if s_ui_popup_id > 0
-      try
-        popup_settext(s_ui_popup_id, s_ui_lines)
-      catch
-        SetUiBufferLines()
-      endtry
-    elseif s_ui_bufnr > 0 && bufexists(s_ui_bufnr)
-      SetUiBufferLines()
-    endif
-    if s_ui_popup_id > 0
-      # 将 popup 内光标移动到选中行
-      if s_ui_cursor_buf_line > 0
-        win_execute(s_ui_popup_id, 'normal! ' .. s_ui_cursor_buf_line .. 'G')
-      endif
-    endif
-    return
-  endif
-
-  # Split 模式
   if s_ui_bufnr < 0 || !bufexists(s_ui_bufnr)
     return
   endif
@@ -1313,95 +1199,11 @@ def UIRender()
     return
   endif
   SetUiBufferLines()
-  var desired_h = len(s_ui_lines) + 1
-  var max_h = get(g:, 'simpleplug_window_height', 15)
-  if desired_h > max_h
-    desired_h = max_h
-  endif
-  if desired_h < 5
-    desired_h = 5
-  endif
-  win_execute(wins[0], ':resize ' .. desired_h)
+  win_execute(wins[0], ':vertical resize ' .. UiWidth())
   # 将光标移动到选中行
   if s_ui_cursor_buf_line > 0
     win_execute(wins[0], 'normal! ' .. s_ui_cursor_buf_line .. 'G')
   endif
-enddef
-
-# ─────────────────── Popup 事件处理 ───────────────────
-
-def PopupFilter(winid: number, key: string): bool
-  # 搜索模式的按键处理
-  if s_ui_filter_active
-    if key ==# "\<CR>" || key ==# "\<Esc>"
-      s_ui_filter_active = false
-      if key ==# "\<Esc>"
-        s_ui_filter_text = ''
-      endif
-      UIBuildAndRender()
-      return true
-    elseif key ==# "\<BS>"
-      if len(s_ui_filter_text) > 0
-        s_ui_filter_text = s_ui_filter_text[: -2]
-      endif
-      UIBuildAndRender()
-      return true
-    elseif len(key) == 1 && key =~# '[[:print:]]'
-      s_ui_filter_text ..= key
-      UIBuildAndRender()
-      return true
-    endif
-    return true
-  endif
-
-  # 普通模式按键
-  if key ==# 'q' || key ==# "\<Esc>"
-    popup_close(winid)
-    return true
-  elseif key ==# 'j'
-    ScrollDown()
-    return true
-  elseif key ==# 'k'
-    ScrollUp()
-    return true
-  elseif key ==# "\<CR>"
-    DoOpenPluginDir()
-    return true
-  elseif key ==# 'd'
-    DoViewPluginDiff()
-    return true
-  elseif key ==# '?' || key ==# 'h'
-    DoToggleHelp()
-    return true
-  elseif key ==# '/'
-    s_ui_filter_active = true
-    s_ui_filter_text = ''
-    UIBuildAndRender()
-    return true
-  elseif key ==# 'R'
-    UIRetry()
-    return true
-  elseif key ==# 'S'
-    Status()
-    return true
-  endif
-  return false
-enddef
-
-def PopupOnClose(winid: number, result: any)
-  StopSpinner()
-  s_ui_popup_id = 0
-  s_ui_use_popup = false
-  s_ui_filter_active = false
-  s_ui_filter_text = ''
-  # 清理缓冲区
-  if s_ui_bufnr > 0 && bufexists(s_ui_bufnr)
-    try
-      execute 'bwipeout! ' .. s_ui_bufnr
-    catch
-    endtry
-  endif
-  s_ui_bufnr = -1
 enddef
 
 # ─────────────────── 交互功能 ───────────────────
@@ -1442,29 +1244,6 @@ def DoOpenPluginDir()
   execute 'edit ' .. fnameescape(dir)
 enddef
 
-def LogPopupFilter(wid: number, k: string): bool
-  if k ==# 'q' || k ==# "\<Esc>"
-    popup_close(wid)
-    return true
-  elseif k ==# 'j'
-    win_execute(wid, 'normal! j')
-    return true
-  elseif k ==# 'k'
-    win_execute(wid, 'normal! k')
-    return true
-  endif
-  return false
-enddef
-
-def HelpPopupFilter(wid: number, k: string): bool
-  if k ==# '?' || k ==# 'h' || k ==# 'q' || k ==# "\<Esc>"
-    popup_close(wid)
-    s_ui_help_popup_id = 0
-    return true
-  endif
-  return false
-enddef
-
 def DoViewPluginDiff()
   var name = GetCurrentPluginName()
   if name ==# ''
@@ -1480,43 +1259,15 @@ def DoViewPluginDiff()
   endif
   var log_lines = split(log_output, "\n")
 
-  if CanUsePopup()
-    popup_create(log_lines, {
-      pos: 'center',
-      minwidth: 72,
-      maxwidth: 72,
-      minheight: 5,
-      maxheight: 25,
-      border: [],
-      borderchars: ['─', '│', '─', '│', '╭', '╮', '╰', '╯'],
-      borderhighlight: ['SPlugPopupBorder'],
-      highlight: 'SPlugNormal',
-      title: ' ' .. name .. ' git log ',
-      scrollbar: 1,
-      zindex: 250,
-      filter: function('LogPopupFilter'),
-      mapping: 0,
-    })
-  else
-    botright new
-    setlocal buftype=nofile bufhidden=wipe noswapfile
-    setlocal nowrap nonumber norelativenumber
-    setline(1, ['  ' .. name .. ' git log', repeat('─', 60)] + log_lines)
-    setlocal nomodifiable
-    nnoremap <buffer><silent> q <Cmd>bwipeout<CR>
-  endif
+  botright new
+  setlocal buftype=nofile bufhidden=wipe noswapfile
+  setlocal nowrap nonumber norelativenumber signcolumn=no
+  setline(1, ['  ' .. name .. ' git log', repeat('─', 60)] + log_lines)
+  setlocal nomodifiable
+  nnoremap <buffer><silent> q <Cmd>bwipeout<CR>
 enddef
 
 def DoToggleHelp()
-  if s_ui_help_popup_id > 0
-    try
-      popup_close(s_ui_help_popup_id)
-    catch
-    endtry
-    s_ui_help_popup_id = 0
-    return
-  endif
-
   var help_lines = [
     '',
     '     SimplePlug 快捷键',
@@ -1532,24 +1283,12 @@ def DoToggleHelp()
     '',
   ]
 
-  if CanUsePopup()
-    s_ui_help_popup_id = popup_create(help_lines, {
-      pos: 'center',
-      minwidth: 36,
-      maxwidth: 36,
-      border: [],
-      borderchars: ['─', '│', '─', '│', '╭', '╮', '╰', '╯'],
-      borderhighlight: ['SPlugPopupBorder'],
-      highlight: 'SPlugNormal',
-      zindex: 300,
-      filter: function('HelpPopupFilter'),
-      mapping: 0,
-    })
-  else
-    for l in help_lines
-      echo l
-    endfor
-  endif
+  botright new
+  setlocal buftype=nofile bufhidden=wipe noswapfile
+  setlocal nowrap nonumber norelativenumber signcolumn=no
+  setline(1, help_lines)
+  setlocal nomodifiable
+  nnoremap <buffer><silent> q <Cmd>bwipeout<CR>
 enddef
 
 # Split 模式下的交互导出 (从光标行解析插件名)
@@ -1605,19 +1344,14 @@ enddef
 # ─────────────────── 语法高亮 ───────────────────
 
 def SetupSyntax()
-  var w: number
-  if s_ui_use_popup && s_ui_popup_id > 0
-    w = s_ui_popup_id
-  else
-    if s_ui_bufnr < 0 || !bufexists(s_ui_bufnr)
-      return
-    endif
-    var wins = win_findbuf(s_ui_bufnr)
-    if empty(wins)
-      return
-    endif
-    w = wins[0]
+  if s_ui_bufnr < 0 || !bufexists(s_ui_bufnr)
+    return
   endif
+  var wins = win_findbuf(s_ui_bufnr)
+  if empty(wins)
+    return
+  endif
+  var w = wins[0]
 
   win_execute(w, 'syntax clear')
   # 边框
@@ -1649,7 +1383,7 @@ def SetupSyntax()
   # 帮助文本
   win_execute(w, 'syntax match SPlugHelp /q close.*$/')
   # 表头
-  win_execute(w, 'syntax match SPlugTableHeader /Plugin\s\+State\s\+Version\s\+Details/')
+  win_execute(w, 'syntax match SPlugTableHeader /Plugin\s\+State\s\+Time\s\+Details/')
   # 状态文本
   win_execute(w, 'syntax match SPlugStateNew /installed/')
   win_execute(w, 'syntax match SPlugStateUp /updated/')
@@ -1683,7 +1417,6 @@ def SetupSyntax()
   # 基础
   win_execute(w, 'highlight default SPlugNormal ctermbg=235 guibg=#1e1e2e')
   win_execute(w, 'highlight default SPlugBorder ctermfg=240 guifg=#585858')
-  win_execute(w, 'highlight default SPlugPopupBorder ctermfg=75 guifg=#5fafff')
   # 标题
   win_execute(w, 'highlight default SPlugTitle ctermfg=75 guifg=#5fafff cterm=bold gui=bold')
   win_execute(w, 'highlight default SPlugCount ctermfg=252 guifg=#d0d0d0')

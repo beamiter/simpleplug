@@ -62,7 +62,7 @@ g:simpleplug_dir          " 插件目录 (默认 ~/.vim/plugged)
 g:simpleplug_daemon_path  " 手动指定 daemon 路径
 g:simpleplug_debug        " 调试模式 (默认 0)
 g:simpleplug_auto_install " 启动时自动安装新增插件 (默认 1)
-g:simpleplug_window_height " 进度窗口高度 (默认 15)
+g:simpleplug_window_width  " 右侧 UI 窗口宽度 (默认 88)
 ```
 
 ## Plug() 选项
