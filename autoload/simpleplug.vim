@@ -4,12 +4,15 @@ vim9script
 # SimplePlug — Vim9 包管理器 (Rust 后端)
 # =============================================================
 
+const s_plugin_root = fnamemodify(expand('<sfile>'), ':p:h:h')
+
 # ─────────────────── 插件注册表 ───────────────────
 
 var s_plugins: list<dict<any>> = []
 # {name, repo, url, dir, branch, do, frozen, on_ft, on_cmd}
 
 var s_loaded_plugins: dict<bool> = {}
+var s_lazy_commands: list<string> = []
 
 # ─────────────────── 后端状态 ───────────────────
 
@@ -17,6 +20,7 @@ var s_job: any = v:null
 var s_running: bool = false
 var s_next_id: number = 0
 var s_cbs: dict<any> = {}   # id -> callback dict
+var s_active_id: number = 0
 
 # ─────────────────── UI 状态 ───────────────────
 
@@ -65,6 +69,15 @@ enddef
 # ----------- simpleplug#begin / simpleplug#end ----------
 
 export def Begin(dir: string = '')
+  for cmd in s_lazy_commands
+    if exists(':' .. cmd) == 2
+      execute 'silent! delcommand ' .. cmd
+    endif
+  endfor
+  s_lazy_commands = []
+  augroup SimplePlugLazy
+    autocmd!
+  augroup END
   s_plugins = []
   s_loaded_plugins = {}
   s_auto_install_checked = false
@@ -81,11 +94,11 @@ export def End()
   # 将所有已注册插件加入 runtimepath
   for plug in s_plugins
     if isdirectory(plug.dir)
-      if stridx(&runtimepath, plug.dir) < 0
+      if index(split(&runtimepath, ','), plug.dir) < 0
         &runtimepath = plug.dir .. ',' .. &runtimepath
         # after 目录
         var afterdir = plug.dir .. '/after'
-        if isdirectory(afterdir) && stridx(&runtimepath, afterdir) < 0
+        if isdirectory(afterdir) && index(split(&runtimepath, ','), afterdir) < 0
           &runtimepath = &runtimepath .. ',' .. afterdir
         endif
       endif
@@ -101,13 +114,16 @@ def LoadPlugin(plug: dict<any>)
   if has_key(s_loaded_plugins, plug.name)
     return
   endif
-  s_loaded_plugins[plug.name] = true
-
-  # 执行 plugin/ 下的脚本 — Vim 会通过 runtimepath 自动加载
-  # 但如果是延迟加载，先不载入
+  # 延迟插件必须保持未加载状态，直到对应事件真正触发。
   if !empty(get(plug, 'on_ft', '')) || !empty(get(plug, 'on_cmd', ''))
+    s_loaded_plugins[plug.name] = false
     SetupLazyLoad(plug)
     return
+  endif
+  s_loaded_plugins[plug.name] = true
+  # End() 也可能由用户在 VimEnter 之后调用，此时 Vim 不会再自动扫描 plugin/。
+  if v:vim_did_enter
+    SourcePluginScripts(plug.dir)
   endif
 enddef
 
@@ -118,28 +134,29 @@ def SetupLazyLoad(plug: dict<any>)
   # on_ft 延迟加载
   var ft = get(plug, 'on_ft', '')
   if type(ft) == v:t_string && ft !=# ''
-    execute printf('autocmd FileType %s ++once call simpleplug#LazyLoad("%s")', ft, pname)
+    execute printf('autocmd SimplePlugLazy FileType %s ++once call simpleplug#LazyLoad("%s")', ft, pname)
   elseif type(ft) == v:t_list
     for f in ft
-      execute printf('autocmd FileType %s ++once call simpleplug#LazyLoad("%s")', f, pname)
+      execute printf('autocmd SimplePlugLazy FileType %s ++once call simpleplug#LazyLoad("%s")', f, pname)
     endfor
   endif
 
   # on_cmd 延迟加载
   var cmd = get(plug, 'on_cmd', '')
   if type(cmd) == v:t_string && cmd !=# ''
+    add(s_lazy_commands, cmd)
     execute printf('command! -nargs=* -range -bang %s delcommand %s | call simpleplug#LazyLoad("%s") | %s<bang> <args>',
       cmd, cmd, pname, cmd)
   elseif type(cmd) == v:t_list
     for c in cmd
+      add(s_lazy_commands, c)
       execute printf('command! -nargs=* -range -bang %s delcommand %s | call simpleplug#LazyLoad("%s") | %s<bang> <args>',
         c, c, pname, c)
     endfor
   endif
 
   # 从 rtp 里暂时移除
-  var idx = stridx(&runtimepath, pdir)
-  if idx >= 0
+  if index(split(&runtimepath, ','), pdir) >= 0
     var parts = split(&runtimepath, ',')
     var newparts: list<string> = []
     for p in parts
@@ -156,7 +173,7 @@ export def LazyLoad(name: string)
   if plug == {}
     return
   endif
-  if has_key(s_loaded_plugins, name) && s_loaded_plugins[name]
+  if get(s_loaded_plugins, name, false)
     return
   endif
   s_loaded_plugins[name] = true
@@ -167,7 +184,7 @@ export def LazyLoad(name: string)
   endif
 
   # 重新加入 runtimepath
-  if stridx(&runtimepath, dir) < 0
+  if index(split(&runtimepath, ','), dir) < 0
     &runtimepath = dir .. ',' .. &runtimepath
     var afterdir = dir .. '/after'
     if isdirectory(afterdir)
@@ -175,7 +192,10 @@ export def LazyLoad(name: string)
     endif
   endif
 
-  # 手动 source 插件脚本
+  SourcePluginScripts(dir)
+enddef
+
+def SourcePluginScripts(dir: string)
   for f in globpath(dir, 'plugin/**/*.vim', 0, 1)
     try
       execute 'source ' .. fnameescape(f)
@@ -209,12 +229,29 @@ export def Plug(repo: string, opts: dict<any> = {})
   var url: string
 
   # 支持 'user/repo' 格式或完整 URL
-  if repo =~# '^\(https\?://\|git@\)'
+  if repo =~# '^\(\a\+://\|[^/]\+@[^:]\+:\|[/~.]\)'
     url = repo
     name = fnamemodify(substitute(repo, '\.git$', '', ''), ':t')
   else
     url = 'https://github.com/' .. repo .. '.git'
     name = fnamemodify(repo, ':t')
+  endif
+
+  var alias = get(opts, 'as', '')
+  if type(alias) == v:t_string && alias !=# ''
+    name = alias
+  endif
+  if name !~# '^[A-Za-z0-9._-]\+$'
+    echohl ErrorMsg
+    echom '[SimplePlug] invalid plugin name: ' .. name
+    echohl None
+    return
+  endif
+  if FindPlugin(name) != {}
+    echohl ErrorMsg
+    echom '[SimplePlug] duplicate plugin name: ' .. name .. ' (use {as: ...} to disambiguate)'
+    echohl None
+    return
   endif
 
   var dir_override = get(opts, 'dir', '')
@@ -267,6 +304,10 @@ def FindBackend(): string
   if type(override) == v:t_string && override !=# '' && executable(override)
     return override
   endif
+  var bundled = s_plugin_root .. '/lib/simpleplug-daemon'
+  if executable(bundled)
+    return bundled
+  endif
   for d in split(&runtimepath, ',')
     var p = d .. '/lib/simpleplug-daemon'
     if executable(p)
@@ -307,6 +348,21 @@ def EnsureBackend(): bool
         s_running = false
         s_job = v:null
         s_cbs = {}
+        if s_active_id > 0
+          s_active_id = 0
+          StopSpinner()
+          for [name, st] in items(s_ui_plug_state)
+            if !IsFinishedStatus(get(st, 'status', ''))
+              st.status = 'error'
+              st.action = 'error'
+              st.icon = '✘'
+              st.msg = 'daemon exited unexpectedly (' .. code .. ')'
+              s_ui_plug_state[name] = st
+            endif
+          endfor
+          s_ui_mode ..= s_ui_mode =~# '_done$' ? '' : '_done'
+          UIBuildAndRender()
+        endif
       },
       stoponexit: 'term'
     })
@@ -333,10 +389,12 @@ export def Stop()
   s_running = false
   s_job = v:null
   s_cbs = {}
+  s_active_id = 0
 enddef
 
 def Send(req: dict<any>)
   if !IsRunning()
+    s_active_id = 0
     return
   endif
   try
@@ -344,6 +402,8 @@ def Send(req: dict<any>)
     ch_sendraw(s_job, json)
   catch
     Log('Send error: ' .. v:exception, 'ErrorMsg')
+    s_active_id = 0
+    OnError({message: 'failed to send request: ' .. v:exception})
   endtry
 enddef
 
@@ -364,6 +424,11 @@ def OnDaemonEvent(line: string)
   endif
 
   var id = get(ev, 'id', 0)
+
+  if id != 0 && s_active_id != 0 && id != s_active_id
+    Log('Ignoring stale event for request ' .. id)
+    return
+  endif
 
   if ev.type ==# 'progress'
     OnProgress(ev)
@@ -401,6 +466,11 @@ def OnDaemonEvent(line: string)
       remove(s_cbs, id)
     endif
   endif
+
+  if ev.type ==# 'done' || ev.type ==# 'error' || ev.type ==# 'status_result'
+      || ev.type ==# 'hook_done' || ev.type ==# 'clean_done'
+    s_active_id = 0
+  endif
 enddef
 
 # =============================================================
@@ -425,24 +495,48 @@ enddef
 def MissingPluginCount(): number
   var missing = 0
   for p in s_plugins
-    if !isdirectory(p.dir .. '/.git')
+    if getftype(p.dir .. '/.git') ==# ''
       missing += 1
     endif
   endfor
   return missing
 enddef
 
+def StartRequest(mode: string): number
+  if s_active_id > 0
+    echohl WarningMsg
+    echom '[SimplePlug] another operation is still running; use :PlugStop to cancel it.'
+    echohl None
+    return 0
+  endif
+  var id = NextId()
+  s_active_id = id
+  s_ui_mode = mode
+  return id
+enddef
+
+def JobCount(): number
+  var jobs = get(g:, 'simpleplug_jobs', 8)
+  return type(jobs) == v:t_number ? max([1, min([jobs, 64])]) : 8
+enddef
+
+def NormalDir(path: string): string
+  return substitute(fnamemodify(path, ':p'), '/\+$', '', '')
+enddef
+
 export def Install()
   if !EnsureBackend()
     return
   endif
-  s_ui_mode = 'install'
+  var id = StartRequest('install')
+  if id == 0
+    return
+  endif
   s_ui_total = len(s_plugins)
   s_ui_finished = 0
   s_ui_start_time = reltime()
   InitPlugStates('waiting', '·')
   UIOpen()
-  var id = NextId()
   s_cbs[id] = {
     OnDone: (ev) => {
       StopSpinner()
@@ -456,7 +550,7 @@ export def Install()
       UIBuildAndRender()
     },
   }
-  Send({type: 'install', id: id, plugins: PluginSpecs()})
+  Send({type: 'install', id: id, plugins: PluginSpecs(), jobs: JobCount()})
 enddef
 
 export def AutoInstallMissing()
@@ -480,13 +574,15 @@ export def Update()
   if !EnsureBackend()
     return
   endif
-  s_ui_mode = 'update'
+  var id = StartRequest('update')
+  if id == 0
+    return
+  endif
   s_ui_total = len(s_plugins)
   s_ui_finished = 0
   s_ui_start_time = reltime()
   InitPlugStates('waiting', '·')
   UIOpen()
-  var id = NextId()
   s_cbs[id] = {
     OnDone: (ev) => {
       StopSpinner()
@@ -500,24 +596,36 @@ export def Update()
       UIBuildAndRender()
     },
   }
-  Send({type: 'update', id: id, plugins: PluginSpecs()})
+  Send({type: 'update', id: id, plugins: PluginSpecs(), jobs: JobCount()})
 enddef
 
-export def Clean()
+export def Clean(force: bool = false)
   if !EnsureBackend()
+    return
+  endif
+  if !force && confirm('[SimplePlug] Remove unregistered Git plugin directories?', "&Yes\n&No", 2) != 1
+    return
+  endif
+  var id = StartRequest('clean')
+  if id == 0
     return
   endif
   var keep: list<string> = []
   for p in s_plugins
-    add(keep, fnamemodify(p.dir, ':t'))
+    if NormalDir(fnamemodify(p.dir, ':h')) ==# NormalDir(g:simpleplug_dir)
+      add(keep, fnamemodify(p.dir, ':t'))
+    endif
   endfor
-  s_ui_mode = 'clean'
+  # Never let SimplePlug clean its own checkout when it lives in plugdir.
+  var manager_dir = s_plugin_root
+  if NormalDir(fnamemodify(manager_dir, ':h')) ==# NormalDir(g:simpleplug_dir)
+    add(keep, fnamemodify(manager_dir, ':t'))
+  endif
   s_ui_total = 0
   s_ui_finished = 0
   s_ui_start_time = reltime()
   s_ui_plug_state = {}
   UIOpen()
-  var id = NextId()
   Send({type: 'clean', id: id, plugdir: g:simpleplug_dir, keep: keep})
 enddef
 
@@ -525,14 +633,16 @@ export def Status()
   if !EnsureBackend()
     return
   endif
-  s_ui_mode = 'status'
+  var id = StartRequest('status')
+  if id == 0
+    return
+  endif
   s_ui_total = len(s_plugins)
   s_ui_finished = 0
   s_ui_start_time = reltime()
   InitPlugStates('waiting', '·')
   UIOpen()
-  var id = NextId()
-  Send({type: 'status', id: id, plugins: PluginSpecs()})
+  Send({type: 'status', id: id, plugins: PluginSpecs(), jobs: JobCount()})
 enddef
 
 export def RunHook(name: string)
@@ -551,21 +661,23 @@ export def RunHook(name: string)
     echom '[SimplePlug] no hook for: ' .. name
     return
   endif
-  s_ui_mode = 'hook'
+  var id = StartRequest('hook')
+  if id == 0
+    return
+  endif
   s_ui_total = 1
   s_ui_finished = 0
   s_ui_start_time = reltime()
   s_ui_plug_state = {}
   s_ui_plug_state[name] = {status: 'waiting', msg: '', icon: '·', branch: '', commit: '', dirty: false}
   UIOpen()
-  var id = NextId()
   Send({type: 'post_hook', id: id, name: name, dir: plug.dir, cmd: do_cmd})
 enddef
 
 export def CompletePluginNames(arglead: string, cmdline: string, cursorpos: number): list<string>
   var names: list<string> = []
   for p in s_plugins
-    if p.name =~? '^' .. arglead
+    if stridx(tolower(p.name), tolower(arglead)) == 0
       add(names, p.name)
     endif
   endfor
@@ -603,7 +715,12 @@ def OnProgress(ev: dict<any>)
     s_ui_plug_start_times[name] = reltime()
   endif
 
-  if status ==# 'installed'
+  if status ==# 'working'
+    st.status = 'working'
+    st.icon = '·'
+    st.action = 'working'
+    st.msg = msg
+  elseif status ==# 'installed'
     st.status = 'done'
     st.icon = '+'
     st.action = 'installed'
@@ -635,9 +752,19 @@ def OnProgress(ev: dict<any>)
     if has_key(s_ui_plug_start_times, name)
       s_ui_plug_timings[name] = reltimefloat(reltime(s_ui_plug_start_times[name]))
     endif
+  elseif status ==# 'dirty'
+    st.status = 'error'
+    st.icon = '!'
+    st.action = 'dirty'
+    st.msg = msg
+    if has_key(s_ui_plug_start_times, name)
+      s_ui_plug_timings[name] = reltimefloat(reltime(s_ui_plug_start_times[name]))
+    endif
   elseif status ==# 'hook'
-    st.action = 'hook'
-    st.msg = st.msg .. ' | ' .. msg
+    if get(st, 'action', '') ==# '' || st.action ==# 'waiting' || st.action ==# 'working'
+      st.action = 'hook'
+    endif
+    st.msg ..= (st.msg ==# '' ? '' : ' | ') .. msg
   elseif status ==# 'error'
     st.status = 'error'
     st.icon = '✘'
@@ -660,6 +787,24 @@ enddef
 def OnError(ev: dict<any>)
   var msg = get(ev, 'message', '')
   Log('Error: ' .. msg, 'ErrorMsg')
+  StopSpinner()
+  var marked = false
+  for [name, st] in items(s_ui_plug_state)
+    if !IsFinishedStatus(get(st, 'status', ''))
+      st.status = 'error'
+      st.action = 'error'
+      st.icon = '✘'
+      st.msg = msg
+      s_ui_plug_state[name] = st
+      marked = true
+    endif
+  endfor
+  if !marked && empty(s_ui_plug_state)
+    s_ui_plug_state['SimplePlug'] = {status: 'error', msg: msg, icon: '✘', action: 'error', branch: '', commit: '', dirty: false}
+    s_ui_total = 1
+  endif
+  RecountFinished()
+  s_ui_mode ..= s_ui_mode =~# '_done$' ? '' : '_done'
   UIBuildAndRender()
 enddef
 
@@ -851,7 +996,8 @@ enddef
 def GetDisplayPlugins(): list<dict<any>>
   # 应用过滤
   if s_ui_filter_text !=# ''
-    return filter(copy(s_plugins), (_, p) => p.name =~? s_ui_filter_text)
+    var needle = tolower(s_ui_filter_text)
+    return filter(copy(s_plugins), (_, p) => stridx(tolower(p.name), needle) >= 0)
   endif
   return s_plugins
 enddef
@@ -917,6 +1063,8 @@ def UiAction(st: dict<any>): string
     return 'frozen'
   elseif status ==# 'removed'
     return 'removed'
+  elseif status ==# 'working'
+    return 'working'
   endif
   return 'waiting'
 enddef
@@ -937,6 +1085,8 @@ def UiIcon(st: dict<any>, is_done: bool): string
     return '✘'
   elseif action ==# 'frozen'
     return '○'
+  elseif action ==# 'dirty'
+    return '!'
   elseif action ==# 'removed'
     return '-'
   endif
@@ -944,7 +1094,7 @@ def UiIcon(st: dict<any>, is_done: bool): string
 enddef
 
 def SummaryCounts(): dict<number>
-  var counts = {installed: 0, updated: 0, ok: 0, frozen: 0, errors: 0, removed: 0, missing: 0}
+  var counts = {installed: 0, updated: 0, ok: 0, frozen: 0, dirty: 0, errors: 0, removed: 0, missing: 0}
   for [_, st] in items(s_ui_plug_state)
     var action = UiAction(st)
     if action ==# 'installed'
@@ -955,6 +1105,8 @@ def SummaryCounts(): dict<number>
       counts.ok += 1
     elseif action ==# 'frozen'
       counts.frozen += 1
+    elseif action ==# 'dirty'
+      counts.dirty += 1
     elseif action ==# 'removed'
       counts.removed += 1
     elseif action ==# 'missing'
@@ -1005,7 +1157,7 @@ def UIBuildAndRender()
 
   var counts = SummaryCounts()
   var stats = printf('  total %d  installed %d  updated %d  ok %d  frozen %d  errors %d',
-    s_ui_total, counts.installed, counts.updated, counts.ok, counts.frozen, counts.errors + counts.missing)
+    s_ui_total, counts.installed, counts.updated, counts.ok, counts.frozen, counts.errors + counts.missing + counts.dirty)
   if counts.removed > 0
     stats ..= printf('  removed %d', counts.removed)
   endif
@@ -1116,6 +1268,9 @@ def SummaryLine(): string
   endif
   if counts.frozen > 0
     add(parts, printf('%d frozen', counts.frozen))
+  endif
+  if counts.dirty > 0
+    add(parts, printf('%d dirty', counts.dirty))
   endif
   if counts.removed > 0
     add(parts, printf('%d removed', counts.removed))
@@ -1369,6 +1524,7 @@ def SetupSyntax()
   win_execute(w, 'syntax match SPlugIconNew /+/')
   win_execute(w, 'syntax match SPlugIconUp /\*/')
   win_execute(w, 'syntax match SPlugIconErr /✘/')
+  win_execute(w, 'syntax match SPlugIconDirty /!/')
   win_execute(w, 'syntax match SPlugIconSkip /○/')
   win_execute(w, 'syntax match SPlugIconWait /·/')
   win_execute(w, 'syntax match SPlugIconRemove /-/')
@@ -1389,6 +1545,7 @@ def SetupSyntax()
   win_execute(w, 'syntax match SPlugStateUp /updated/')
   win_execute(w, 'syntax match SPlugStateOk /\<ok\>/')
   win_execute(w, 'syntax match SPlugStateErr /\(error\|missing\)/')
+  win_execute(w, 'syntax match SPlugStateDirty /dirty/')
   win_execute(w, 'syntax match SPlugStateHook /hook/')
   # waiting
   win_execute(w, 'syntax match SPlugWaiting /waiting/')
@@ -1429,6 +1586,7 @@ def SetupSyntax()
   win_execute(w, 'highlight default SPlugIconNew ctermfg=114 guifg=#87d787 cterm=bold gui=bold')
   win_execute(w, 'highlight default SPlugIconUp ctermfg=180 guifg=#d7af87')
   win_execute(w, 'highlight default SPlugIconErr ctermfg=204 guifg=#ff5f87 cterm=bold gui=bold')
+  win_execute(w, 'highlight default SPlugIconDirty ctermfg=214 guifg=#ffaf00 cterm=bold gui=bold')
   win_execute(w, 'highlight default SPlugIconSkip ctermfg=245 guifg=#8a8a8a')
   win_execute(w, 'highlight default SPlugIconWait ctermfg=240 guifg=#585858')
   win_execute(w, 'highlight default SPlugIconRemove ctermfg=204 guifg=#ff5f87')
@@ -1453,6 +1611,7 @@ def SetupSyntax()
   win_execute(w, 'highlight default SPlugStateUp ctermfg=180 guifg=#d7af87 cterm=bold gui=bold')
   win_execute(w, 'highlight default SPlugStateOk ctermfg=114 guifg=#87d787')
   win_execute(w, 'highlight default SPlugStateErr ctermfg=204 guifg=#ff5f87 cterm=bold gui=bold')
+  win_execute(w, 'highlight default SPlugStateDirty ctermfg=214 guifg=#ffaf00 cterm=bold gui=bold')
   win_execute(w, 'highlight default SPlugStateHook ctermfg=75 guifg=#5fafff')
   win_execute(w, 'highlight default SPlugDiffAdd ctermfg=114 guifg=#87d787')
   win_execute(w, 'highlight default SPlugDiffDel ctermfg=204 guifg=#ff5f87')

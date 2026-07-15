@@ -11,14 +11,15 @@ g:simpleplug_daemon_path = get(g:, 'simpleplug_daemon_path', '')
 g:simpleplug_debug = get(g:, 'simpleplug_debug', 0)
 g:simpleplug_window_width = get(g:, 'simpleplug_window_width', 88)
 g:simpleplug_auto_install = get(g:, 'simpleplug_auto_install', 1)
-# 并行数量（Rust daemon 端 tokio 自动管理，此处仅供将来扩展）
+# Rust daemon 的最大并行任务数（1..64）
 g:simpleplug_jobs = get(g:, 'simpleplug_jobs', 8)
 
 # =============== 命令 ===============
 command! PlugInstall   simpleplug#Install()
 command! PlugUpdate    simpleplug#Update()
-command! PlugClean     simpleplug#Clean()
+command! -bang PlugClean simpleplug#Clean(<bang>0)
 command! PlugStatus    simpleplug#Status()
+command! PlugStop      simpleplug#Stop()
 command! -nargs=1 -complete=customlist,simpleplug#CompletePluginNames PlugHook simpleplug#RunHook(<q-args>)
 
 # =============== 自动命令 ===============
