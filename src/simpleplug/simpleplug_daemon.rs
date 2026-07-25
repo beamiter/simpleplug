@@ -429,16 +429,14 @@ async fn git_pin_commit(dir: &str, commit: &str) -> Result<bool, String> {
     if run_git(dir, &["cat-file", "-e", &format!("{commit}^{{commit}}")])
         .await
         .is_err()
-    {
-        if run_git(dir, &["fetch", "--depth", "1", "origin", commit])
+        && run_git(dir, &["fetch", "--depth", "1", "origin", commit])
             .await
             .is_err()
-        {
-            if let Err(unshallow_err) = run_git(dir, &["fetch", "--unshallow", "origin"]).await {
-                run_git(dir, &["fetch", "origin"])
-                    .await
-                    .map_err(|e| format!("{unshallow_err}; {e}"))?;
-            }
+    {
+        if let Err(unshallow_err) = run_git(dir, &["fetch", "--unshallow", "origin"]).await {
+            run_git(dir, &["fetch", "origin"])
+                .await
+                .map_err(|e| format!("{unshallow_err}; {e}"))?;
         }
     }
     run_git(dir, &["checkout", "--detach", commit]).await?;
