@@ -9,10 +9,11 @@ const s_plugin_root = fnamemodify(expand('<sfile>'), ':p:h:h')
 # ─────────────────── 插件注册表 ───────────────────
 
 var s_plugins: list<dict<any>> = []
-# {name, repo, url, dir, branch, do, frozen, on_ft, on_cmd}
+# {name, repo, url, dir, branch, tag, commit, do, frozen, on_ft, on_cmd}
 
 var s_loaded_plugins: dict<bool> = {}
 var s_lazy_commands: list<string> = []
+var s_lazy_maps: list<string> = []
 
 # ─────────────────── 后端状态 ───────────────────
 
@@ -50,6 +51,7 @@ var s_ui_plug_timings: dict<float> = {}
 var s_ui_plug_start_times: dict<list<any>> = {}
 var s_ui_sorted_names: list<string> = []
 var s_ui_cursor_buf_line: number = 0  # 光标对应的缓冲区行号(1-based)
+var s_ui_targets: list<string> = []   # 本次操作涉及的插件名(注册顺序)
 
 # ─────────────────── 日志 ───────────────────
 
@@ -75,6 +77,12 @@ export def Begin(dir: string = '')
     endif
   endfor
   s_lazy_commands = []
+  for keys in s_lazy_maps
+    for md in ['n', 'x', 'o']
+      execute 'silent! ' .. md .. 'unmap ' .. keys
+    endfor
+  endfor
+  s_lazy_maps = []
   augroup SimplePlugLazy
     autocmd!
   augroup END
@@ -141,19 +149,35 @@ def SetupLazyLoad(plug: dict<any>)
     endfor
   endif
 
-  # on_cmd 延迟加载
+  # on_cmd 延迟加载：普通命令走 command stub，<Plug>/按键序列走 mapping stub
   var cmd = get(plug, 'on_cmd', '')
+  var triggers: list<string> = []
   if type(cmd) == v:t_string && cmd !=# ''
-    add(s_lazy_commands, cmd)
-    execute printf('command! -nargs=* -range -bang %s delcommand %s | call simpleplug#LazyLoad("%s") | %s<bang> <args>',
-      cmd, cmd, pname, cmd)
+    triggers = [cmd]
   elseif type(cmd) == v:t_list
-    for c in cmd
+    triggers = cmd
+  endif
+  for c in triggers
+    if c =~# '^<'
+      SetupLazyMap(pname, c)
+    else
       add(s_lazy_commands, c)
       execute printf('command! -nargs=* -range -bang %s delcommand %s | call simpleplug#LazyLoad("%s") | %s<bang> <args>',
         c, c, pname, c)
-    endfor
-  endif
+    endif
+  endfor
+
+  # ftdetect 必须立即生效，否则插件自带的文件类型永远不会被识别，
+  # for 延迟加载也就永远不会触发。
+  augroup filetypedetect
+  for f in globpath(pdir, 'ftdetect/*.vim', 0, 1)
+    try
+      execute 'source ' .. fnameescape(f)
+    catch
+      Log('ftdetect source error: ' .. v:exception, 'ErrorMsg')
+    endtry
+  endfor
+  augroup END
 
   # 从 rtp 里暂时移除
   if index(split(&runtimepath, ','), pdir) >= 0
@@ -166,6 +190,28 @@ def SetupLazyLoad(plug: dict<any>)
     endfor
     &runtimepath = join(newparts, ',')
   endif
+enddef
+
+# <Plug> 映射延迟加载：先注册 stub，触发时卸载 stub、加载插件、重放按键。
+def SetupLazyMap(pname: string, keys: string)
+  add(s_lazy_maps, keys)
+  # <lt> 转义参数里的 '<'，避免映射定义时被翻译成键码。
+  var keys_arg = substitute(string(keys), '<', '<lt>', 'g')
+  for md in ['n', 'x', 'o']
+    execute printf('%snoremap <silent> %s <Cmd>call simpleplug#LazyLoadMap(%s, %s, "%s")<CR>',
+      md, keys, string(pname), keys_arg, md)
+  endfor
+enddef
+
+export def LazyLoadMap(name: string, keys: string, mode: string)
+  for md in ['n', 'x', 'o']
+    execute 'silent! ' .. md .. 'unmap ' .. keys
+  endfor
+  LazyLoad(name)
+  if mode ==# 'x'
+    feedkeys('gv', 'n')
+  endif
+  feedkeys(substitute(keys, '\c^<Plug>', "\<Plug>", ''))
 enddef
 
 export def LazyLoad(name: string)
@@ -266,6 +312,8 @@ export def Plug(repo: string, opts: dict<any> = {})
   endif
 
   var branch = get(opts, 'branch', '')
+  var tag = get(opts, 'tag', '')
+  var commit = get(opts, 'commit', '')
   var do_cmd = get(opts, 'do', '')
   var frozen_val = get(opts, 'frozen', 0)
   var frozen: bool = false
@@ -283,6 +331,8 @@ export def Plug(repo: string, opts: dict<any> = {})
     url: url,
     dir: dir,
     branch: branch,
+    tag: tag,
+    commit: commit,
     do: do_cmd,
     frozen: frozen,
     on_ft: on_ft,
@@ -335,6 +385,10 @@ def EnsureBackend(): bool
 
   try
     s_job = job_start([exe], {
+      env: {
+        SIMPLEPLUG_GIT_TIMEOUT: string(get(g:, 'simpleplug_git_timeout', 300)),
+        SIMPLEPLUG_HOOK_TIMEOUT: string(get(g:, 'simpleplug_hook_timeout', 600)),
+      },
       in_io: 'pipe',
       out_mode: 'nl',
       out_cb: (ch, line) => {
@@ -477,19 +531,40 @@ enddef
 # Install / Update / Clean / Status
 # =============================================================
 
-def PluginSpecs(): list<dict<any>>
+def PluginSpecs(plugs: list<dict<any>>): list<dict<any>>
   var specs: list<dict<any>> = []
-  for p in s_plugins
+  for p in plugs
     add(specs, {
       name: p.name,
       url: p.url,
       dir: p.dir,
       branch: p.branch,
+      tag: get(p, 'tag', ''),
+      commit: get(p, 'commit', ''),
       do_cmd: p.do,
       frozen: p.frozen,
     })
   endfor
   return specs
+enddef
+
+# 支持 :PlugInstall/:PlugUpdate 后接插件名，只操作指定插件。
+def SelectPlugins(names: list<string>): list<dict<any>>
+  if empty(names)
+    return copy(s_plugins)
+  endif
+  var out: list<dict<any>> = []
+  for n in names
+    var p = FindPlugin(n)
+    if p == {}
+      echohl WarningMsg
+      echom '[SimplePlug] unknown plugin: ' .. n
+      echohl None
+    else
+      add(out, p)
+    endif
+  endfor
+  return out
 enddef
 
 def MissingPluginCount(): number
@@ -524,25 +599,23 @@ def NormalDir(path: string): string
   return substitute(fnamemodify(path, ':p'), '/\+$', '', '')
 enddef
 
-export def Install()
-  if !EnsureBackend()
-    return
-  endif
-  var id = StartRequest('install')
+# install/update 共用的批处理入口。specs 允许与 plugs 不同（如 Restore 注入 commit）。
+def RunBatch(mode: string, plugs: list<dict<any>>, specs: list<dict<any>>)
+  var id = StartRequest(mode)
   if id == 0
     return
   endif
-  s_ui_total = len(s_plugins)
+  s_ui_total = len(plugs)
   s_ui_finished = 0
   s_ui_start_time = reltime()
-  InitPlugStates('waiting', '·')
+  InitPlugStates(plugs, 'waiting', '·')
   UIOpen()
   s_cbs[id] = {
     OnDone: (ev) => {
       StopSpinner()
-      var s = ev.summary
-      s_ui_mode = 'install_done'
+      s_ui_mode = mode .. '_done'
       RecountFinished()
+      GenerateHelptags()
       UIBuildAndRender()
     },
     OnError: (ev) => {
@@ -550,7 +623,27 @@ export def Install()
       UIBuildAndRender()
     },
   }
-  Send({type: 'install', id: id, plugins: PluginSpecs(), jobs: JobCount()})
+  Send({type: mode, id: id, plugins: specs, jobs: JobCount()})
+enddef
+
+def GenerateHelptags()
+  for p in s_plugins
+    var doc = p.dir .. '/doc'
+    if isdirectory(doc)
+      execute 'silent! helptags ' .. fnameescape(doc)
+    endif
+  endfor
+enddef
+
+export def Install(names: list<string> = [])
+  if !EnsureBackend()
+    return
+  endif
+  var plugs = SelectPlugins(names)
+  if empty(plugs)
+    return
+  endif
+  RunBatch('install', plugs, PluginSpecs(plugs))
 enddef
 
 export def AutoInstallMissing()
@@ -570,33 +663,81 @@ export def AutoInstallMissing()
   Install()
 enddef
 
-export def Update()
+export def Update(names: list<string> = [])
   if !EnsureBackend()
     return
   endif
-  var id = StartRequest('update')
-  if id == 0
+  var plugs = SelectPlugins(names)
+  if empty(plugs)
     return
   endif
-  s_ui_total = len(s_plugins)
-  s_ui_finished = 0
-  s_ui_start_time = reltime()
-  InitPlugStates('waiting', '·')
-  UIOpen()
-  s_cbs[id] = {
-    OnDone: (ev) => {
-      StopSpinner()
-      var s = ev.summary
-      s_ui_mode = 'update_done'
-      RecountFinished()
-      UIBuildAndRender()
-    },
-    OnError: (ev) => {
-      StopSpinner()
-      UIBuildAndRender()
-    },
-  }
-  Send({type: 'update', id: id, plugins: PluginSpecs(), jobs: JobCount()})
+  RunBatch('update', plugs, PluginSpecs(plugs))
+enddef
+
+# =============================================================
+# Snapshot / Restore — 记录并恢复所有插件的精确 commit
+# =============================================================
+
+def SnapshotPath(file: string): string
+  return file ==# '' ? g:simpleplug_dir .. '/simpleplug.snapshot.json' : fnamemodify(file, ':p')
+enddef
+
+export def Snapshot(file: string = '')
+  var path = SnapshotPath(file)
+  var snap: dict<string> = {}
+  for p in s_plugins
+    if getftype(p.dir .. '/.git') ==# ''
+      continue
+    endif
+    var commit = trim(system('git -C ' .. shellescape(p.dir) .. ' rev-parse HEAD'))
+    if v:shell_error == 0 && commit =~# '^\x\+$'
+      snap[p.name] = commit
+    endif
+  endfor
+  if writefile([json_encode(snap)], path) != 0
+    echohl ErrorMsg
+    echom '[SimplePlug] failed to write snapshot: ' .. path
+    echohl None
+    return
+  endif
+  echom printf('[SimplePlug] snapshot of %d plugins written to %s', len(snap), path)
+enddef
+
+export def Restore(file: string = '')
+  if !EnsureBackend()
+    return
+  endif
+  var path = SnapshotPath(file)
+  if !filereadable(path)
+    echohl ErrorMsg
+    echom '[SimplePlug] snapshot not found: ' .. path
+    echohl None
+    return
+  endif
+  var snap: dict<any>
+  try
+    snap = json_decode(join(readfile(path), "\n"))
+  catch
+    echohl ErrorMsg
+    echom '[SimplePlug] invalid snapshot file: ' .. path
+    echohl None
+    return
+  endtry
+  var plugs: list<dict<any>> = []
+  for p in s_plugins
+    if has_key(snap, p.name)
+      add(plugs, p)
+    endif
+  endfor
+  if empty(plugs)
+    echom '[SimplePlug] snapshot matches no registered plugins'
+    return
+  endif
+  var specs = PluginSpecs(plugs)
+  for spec in specs
+    spec.commit = snap[spec.name]
+  endfor
+  RunBatch('update', plugs, specs)
 enddef
 
 export def Clean(force: bool = false)
@@ -625,6 +766,7 @@ export def Clean(force: bool = false)
   s_ui_finished = 0
   s_ui_start_time = reltime()
   s_ui_plug_state = {}
+  s_ui_targets = []
   UIOpen()
   Send({type: 'clean', id: id, plugdir: g:simpleplug_dir, keep: keep})
 enddef
@@ -640,9 +782,9 @@ export def Status()
   s_ui_total = len(s_plugins)
   s_ui_finished = 0
   s_ui_start_time = reltime()
-  InitPlugStates('waiting', '·')
+  InitPlugStates(s_plugins, 'waiting', '·')
   UIOpen()
-  Send({type: 'status', id: id, plugins: PluginSpecs(), jobs: JobCount()})
+  Send({type: 'status', id: id, plugins: PluginSpecs(s_plugins), jobs: JobCount()})
 enddef
 
 export def RunHook(name: string)
@@ -670,6 +812,7 @@ export def RunHook(name: string)
   s_ui_start_time = reltime()
   s_ui_plug_state = {}
   s_ui_plug_state[name] = {status: 'waiting', msg: '', icon: '·', branch: '', commit: '', dirty: false}
+  s_ui_targets = [name]
   UIOpen()
   Send({type: 'post_hook', id: id, name: name, dir: plug.dir, cmd: do_cmd})
 enddef
@@ -688,14 +831,15 @@ enddef
 # 事件处理
 # =============================================================
 
-def InitPlugStates(status: string, icon: string)
+def InitPlugStates(plugs: list<dict<any>>, status: string, icon: string)
   s_ui_plug_state = {}
   s_ui_plug_timings = {}
   s_ui_plug_start_times = {}
   s_ui_cursor_line = 0
   s_ui_filter_text = ''
   s_ui_filter_active = false
-  for p in s_plugins
+  s_ui_targets = mapnew(plugs, (_, p) => p.name)
+  for p in plugs
     s_ui_plug_state[p.name] = {status: status, msg: '', icon: icon, action: '', branch: '', commit: '', dirty: false}
   endfor
 enddef
@@ -821,10 +965,16 @@ def OnStatusResult(ev: dict<any>)
       st.status = 'done'
       st.icon = '●'
       st.action = 'ok'
+      var plug = FindPlugin(name)
+      if plug != {} && (get(plug, 'tag', '') !=# '' || get(plug, 'commit', '') !=# '')
+        st.action = 'pinned'
+        st.icon = '◆'
+      endif
       st.branch = item.branch
       st.commit = item.commit
       st.dirty = item.dirty
       st.size_kb = get(item, 'size_kb', 0)
+      st.last_commit = get(item, 'last_commit', '')
       st.msg = ''
     else
       st.status = 'error'
@@ -976,30 +1126,37 @@ def SortedPluginNames(): list<string>
     var working: list<string> = []
     var finished: list<string> = []
     var waiting: list<string> = []
-    for p in s_plugins
-      var st = get(s_ui_plug_state, p.name, {})
+    for name in s_ui_targets
+      var st = get(s_ui_plug_state, name, {})
       var status = get(st, 'status', 'waiting')
       if status ==# 'waiting'
-        add(waiting, p.name)
+        add(waiting, name)
       elseif status ==# 'done' || status ==# 'error' || status ==# 'skipped'
-        add(finished, p.name)
+        add(finished, name)
       else
-        add(working, p.name)
+        add(working, name)
       endif
     endfor
     return working + finished + waiting
   endif
   # 其他模式保持注册顺序
-  return mapnew(s_plugins, (_, p) => p.name)
+  return copy(s_ui_targets)
 enddef
 
 def GetDisplayPlugins(): list<dict<any>>
+  var plugs: list<dict<any>> = []
+  for n in s_ui_targets
+    var p = FindPlugin(n)
+    if p != {}
+      add(plugs, p)
+    endif
+  endfor
   # 应用过滤
   if s_ui_filter_text !=# ''
     var needle = tolower(s_ui_filter_text)
-    return filter(copy(s_plugins), (_, p) => stridx(tolower(p.name), needle) >= 0)
+    return filter(plugs, (_, p) => stridx(tolower(p.name), needle) >= 0)
   endif
-  return s_plugins
+  return plugs
 enddef
 
 # ─────────────────── 内容构建 ───────────────────
@@ -1081,6 +1238,8 @@ def UiIcon(st: dict<any>, is_done: bool): string
     return '*'
   elseif action ==# 'ok' || action ==# 'hook'
     return '●'
+  elseif action ==# 'pinned'
+    return '◆'
   elseif action ==# 'error' || action ==# 'missing'
     return '✘'
   elseif action ==# 'frozen'
@@ -1101,7 +1260,7 @@ def SummaryCounts(): dict<number>
       counts.installed += 1
     elseif action ==# 'updated'
       counts.updated += 1
-    elseif action ==# 'ok' || action ==# 'hook'
+    elseif action ==# 'ok' || action ==# 'hook' || action ==# 'pinned'
       counts.ok += 1
     elseif action ==# 'frozen'
       counts.frozen += 1
@@ -1214,6 +1373,10 @@ def UIBuildAndRender()
       var size_str = FormatSize(get(st, 'size_kb', 0))
       version = branch !=# '' ? ShortLine(branch, 10) : '—'
       msg = (commit !=# '' ? commit[: 7] : '—') .. (dirty ? ' dirty' : '') .. '  ' .. size_str
+      var last_commit = get(st, 'last_commit', '')
+      if last_commit !=# ''
+        msg ..= '  ' .. last_commit
+      endif
     else
       version = has_key(s_ui_plug_timings, name) ? printf('%.1fs', s_ui_plug_timings[name]) : '—'
       if action ==# 'waiting' && !is_done
@@ -1521,6 +1684,8 @@ def SetupSyntax()
   win_execute(w, 'syntax match SPlugPct /\d\+%/')
   # 状态图标
   win_execute(w, 'syntax match SPlugIconOk /●/')
+  win_execute(w, 'syntax match SPlugIconPin /◆/')
+  win_execute(w, 'syntax match SPlugStatePin /pinned/')
   win_execute(w, 'syntax match SPlugIconNew /+/')
   win_execute(w, 'syntax match SPlugIconUp /\*/')
   win_execute(w, 'syntax match SPlugIconErr /✘/')
@@ -1583,6 +1748,8 @@ def SetupSyntax()
   win_execute(w, 'highlight default SPlugPct ctermfg=252 guifg=#d0d0d0 cterm=bold gui=bold')
   # 状态图标
   win_execute(w, 'highlight default SPlugIconOk ctermfg=114 guifg=#87d787')
+  win_execute(w, 'highlight default SPlugIconPin ctermfg=141 guifg=#af87ff')
+  win_execute(w, 'highlight default SPlugStatePin ctermfg=141 guifg=#af87ff')
   win_execute(w, 'highlight default SPlugIconNew ctermfg=114 guifg=#87d787 cterm=bold gui=bold')
   win_execute(w, 'highlight default SPlugIconUp ctermfg=180 guifg=#d7af87')
   win_execute(w, 'highlight default SPlugIconErr ctermfg=204 guifg=#ff5f87 cterm=bold gui=bold')

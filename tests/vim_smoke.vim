@@ -17,6 +17,7 @@ simpleplug#Plug('local/lazy-plugin', {
 simpleplug#End()
 
 assert_false(exists('g:simpleplug_lazy_fixture_loaded'), 'lazy plugin loaded eagerly')
+assert_true(get(g:, 'simpleplug_lazy_fixture_ftdetect', 0) >= 1, 'lazy plugin ftdetect was not sourced eagerly')
 doautocmd FileType rust
 assert_equal(1, get(g:, 'simpleplug_lazy_fixture_loaded', 0), 'lazy plugin did not load')
 assert_true(index(split(&runtimepath, ','), fixture) >= 0, 'lazy plugin missing from runtimepath')
@@ -35,6 +36,26 @@ assert_false(exists('g:simpleplug_lazy_fixture_loaded'), 'command-lazy plugin lo
 LazyFixtureCommand hello
 assert_equal(1, get(g:, 'simpleplug_lazy_fixture_loaded', 0), 'command-lazy plugin did not load')
 assert_equal('hello', get(g:, 'simpleplug_lazy_fixture_args', ''), 'lazy command arguments were not replayed')
+
+# <Plug> mappings listed in `on` must lazy-load the plugin, then replay the keys.
+unlet g:simpleplug_lazy_fixture_loaded
+simpleplug#Begin('/tmp/simpleplug-vim-smoke')
+simpleplug#Plug('local/lazy-plugin', {
+  as: 'lazy-fixture',
+  dir: fixture,
+  on: '<Plug>(LazyFixture)',
+})
+simpleplug#End()
+assert_false(exists('g:simpleplug_lazy_fixture_loaded'), 'map-lazy plugin loaded eagerly')
+feedkeys("\<Plug>(LazyFixture)", 'x')
+assert_equal(1, get(g:, 'simpleplug_lazy_fixture_loaded', 0), 'map-lazy plugin did not load')
+assert_equal(1, get(g:, 'simpleplug_lazy_fixture_mapped', 0), 'lazy mapping was not replayed')
+
+# Registering tag/commit pins must be accepted and round-trip through specs.
+simpleplug#Begin('/tmp/simpleplug-vim-smoke')
+simpleplug#Plug('owner/pinned-tag', {tag: 'v1.0'})
+simpleplug#Plug('owner/pinned-commit', {commit: 'abc1234'})
+simpleplug#End()
 
 # Reinitializing must clear generated lazy-load state without errors.
 simpleplug#Begin('/tmp/simpleplug-vim-smoke')

@@ -71,6 +71,10 @@ struct PluginSpec {
     #[serde(default)]
     branch: String,
     #[serde(default)]
+    tag: String,
+    #[serde(default)]
+    commit: String,
+    #[serde(default)]
     do_cmd: String,
     #[serde(default)]
     frozen: bool,
@@ -124,6 +128,8 @@ struct PluginStatus {
     branch: String,
     commit: String,
     dirty: bool,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    last_commit: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     size_kb: Option<u64>,
 }
@@ -159,11 +165,13 @@ async fn main() -> std::io::Result<()> {
     let mut lines = stdin.lines();
 
     let (out_tx, out_rx) = tokio::sync::mpsc::channel::<String>(4096);
-    tokio::spawn(stdout_writer(out_rx));
+    let writer = tokio::spawn(stdout_writer(out_rx));
 
     // 简单的全局锁：防止并发写同一个插件目录
     let locks: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
         Arc::new(RwLock::new(HashMap::new()));
+
+    let mut tasks = tokio::task::JoinSet::new();
 
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
@@ -187,7 +195,7 @@ async fn main() -> std::io::Result<()> {
         let tx = out_tx.clone();
         let locks = locks.clone();
 
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             match req {
                 Request::Install { id, plugins, jobs } => {
                     handle_install(id, plugins, jobs, &tx, &locks).await;
@@ -207,18 +215,54 @@ async fn main() -> std::io::Result<()> {
             }
         });
     }
+
+    // stdin EOF：等所有进行中的请求收尾，再让 writer 把事件全部刷出。
+    while tasks.join_next().await.is_some() {}
+    drop(out_tx);
+    let _ = writer.await;
     Ok(())
 }
 
 // ─────────────────── git helpers ───────────────────
 
+const DEFAULT_GIT_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 600;
+
+fn timeout_from_env(var: &str, default_secs: u64) -> std::time::Duration {
+    let secs = std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default_secs);
+    std::time::Duration::from_secs(secs)
+}
+
+fn git_timeout() -> std::time::Duration {
+    timeout_from_env("SIMPLEPLUG_GIT_TIMEOUT", DEFAULT_GIT_TIMEOUT_SECS)
+}
+
+fn hook_timeout() -> std::time::Duration {
+    timeout_from_env("SIMPLEPLUG_HOOK_TIMEOUT", DEFAULT_HOOK_TIMEOUT_SECS)
+}
+
+async fn run_with_timeout(
+    mut cmd: Command,
+    label: &str,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, String> {
+    // A daemon must never sit on an interactive credential prompt.
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    cmd.kill_on_drop(true);
+    match tokio::time::timeout(timeout, cmd.output()).await {
+        Ok(result) => result.map_err(|e| format!("exec {label}: {e}")),
+        Err(_) => Err(format!("{label} timed out after {}s", timeout.as_secs())),
+    }
+}
+
 async fn run_git(dir: &str, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .await
-        .map_err(|e| format!("exec git: {e}"))?;
+    let mut cmd = Command::new("git");
+    cmd.args(args).current_dir(dir);
+    let output = run_with_timeout(cmd, "git", git_timeout()).await?;
 
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
@@ -228,25 +272,89 @@ async fn run_git(dir: &str, args: &[&str]) -> Result<String, String> {
     }
 }
 
-async fn git_clone(url: &str, dir: &str, branch: &str) -> Result<String, String> {
-    let mut args = vec!["clone", "--depth", "1"];
-    if !branch.is_empty() {
-        args.extend_from_slice(&["--branch", branch]);
+async fn git_clone(url: &str, dir: &str, refname: &str) -> Result<(), String> {
+    let mut args = vec![
+        "clone",
+        "--depth",
+        "1",
+        "--recurse-submodules",
+        "--shallow-submodules",
+    ];
+    // --branch accepts both branch names and tags.
+    if !refname.is_empty() {
+        args.extend_from_slice(&["--branch", refname]);
     }
     args.push(url);
     args.push(dir);
 
-    let output = Command::new("git")
-        .args(&args)
-        .output()
-        .await
-        .map_err(|e| format!("exec git clone: {e}"))?;
+    let mut cmd = Command::new("git");
+    cmd.args(&args);
+    let output = run_with_timeout(cmd, "git clone", git_timeout()).await?;
 
     if output.status.success() {
-        Ok("cloned".to_string())
+        Ok(())
     } else {
         Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
     }
+}
+
+fn short_commit(commit: &str) -> &str {
+    if commit.len() > 10 {
+        &commit[..10]
+    } else {
+        commit
+    }
+}
+
+/// Clone a plugin, retrying once on failure (transient network errors are
+/// common), then apply an exact commit pin when one is requested.
+/// Returns a human-readable success message.
+async fn clone_plugin(
+    p: &PluginSpec,
+    dir_existed: bool,
+    id: u64,
+    tx: &EventTx,
+) -> Result<String, String> {
+    let refname = if !p.commit.is_empty() {
+        // Pinned commits are checked out after a default-branch clone.
+        ""
+    } else if !p.tag.is_empty() {
+        p.tag.as_str()
+    } else {
+        p.branch.as_str()
+    };
+
+    if let Err(first) = git_clone(&p.url, &p.dir, refname).await {
+        if !dir_existed {
+            let _ = tokio::fs::remove_dir_all(&p.dir).await;
+        }
+        send_event(
+            tx,
+            &Event::Progress {
+                id,
+                name: p.name.clone(),
+                status: "working".into(),
+                message: format!("clone failed, retrying: {first}"),
+            },
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        git_clone(&p.url, &p.dir, refname)
+            .await
+            .map_err(|e| format!("{e} (after retry)"))?;
+    }
+
+    if !p.commit.is_empty() {
+        git_pin_commit(&p.dir, &p.commit)
+            .await
+            .map_err(|e| format!("pin commit: {e}"))?;
+        git_sync_submodules(&p.dir).await?;
+        return Ok(format!("cloned (pinned at {})", short_commit(&p.commit)));
+    }
+    if !p.tag.is_empty() {
+        return Ok(format!("cloned (tag {})", p.tag));
+    }
+    Ok("cloned".to_string())
 }
 
 async fn git_pull(dir: &str) -> Result<String, String> {
@@ -274,7 +382,7 @@ async fn git_is_dirty(dir: &str) -> bool {
         .unwrap_or(false)
 }
 
-async fn git_checkout_branch(dir: &str, branch: &str) -> Result<(), String> {
+async fn git_switch_branch(dir: &str, branch: &str) -> Result<(), String> {
     if branch.is_empty() {
         return Ok(());
     }
@@ -282,10 +390,104 @@ async fn git_checkout_branch(dir: &str, branch: &str) -> Result<(), String> {
     if current == branch {
         return Ok(());
     }
-    // fetch the branch first
-    let _ = run_git(dir, &["fetch", "origin", branch, "--depth", "1"]).await;
-    run_git(dir, &["checkout", branch]).await?;
+    // Shallow clones only track the branch they were cloned from; widen the
+    // fetch refspec so origin/<branch> exists and tracking can be set up.
+    run_git(dir, &["remote", "set-branches", "--add", "origin", branch]).await?;
+    run_git(dir, &["fetch", "--depth", "1", "origin", branch]).await?;
+    if run_git(
+        dir,
+        &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
+    )
+    .await
+    .is_ok()
+    {
+        run_git(dir, &["checkout", branch]).await?;
+    } else {
+        run_git(
+            dir,
+            &[
+                "checkout",
+                "-b",
+                branch,
+                "--track",
+                &format!("origin/{branch}"),
+            ],
+        )
+        .await?;
+    }
     Ok(())
+}
+
+/// Detach HEAD at an exact commit. Returns whether HEAD moved.
+async fn git_pin_commit(dir: &str, commit: &str) -> Result<bool, String> {
+    let head = run_git(dir, &["rev-parse", "HEAD"]).await?;
+    if head == commit || (commit.len() >= 7 && head.starts_with(commit)) {
+        return Ok(false);
+    }
+    // Shallow clones usually lack older commits; try a targeted fetch first
+    // (supported by GitHub and most servers), then fall back to full history.
+    if run_git(dir, &["cat-file", "-e", &format!("{commit}^{{commit}}")])
+        .await
+        .is_err()
+    {
+        if run_git(dir, &["fetch", "--depth", "1", "origin", commit])
+            .await
+            .is_err()
+        {
+            if let Err(unshallow_err) = run_git(dir, &["fetch", "--unshallow", "origin"]).await {
+                run_git(dir, &["fetch", "origin"])
+                    .await
+                    .map_err(|e| format!("{unshallow_err}; {e}"))?;
+            }
+        }
+    }
+    run_git(dir, &["checkout", "--detach", commit]).await?;
+    Ok(true)
+}
+
+/// Detach HEAD at a tag. Returns whether HEAD moved.
+async fn git_pin_tag(dir: &str, tag: &str) -> Result<bool, String> {
+    // Tolerate fetch failures (offline) as long as the tag exists locally.
+    let _ = run_git(
+        dir,
+        &[
+            "fetch",
+            "--depth",
+            "1",
+            "origin",
+            &format!("+refs/tags/{tag}:refs/tags/{tag}"),
+        ],
+    )
+    .await;
+    let target = run_git(dir, &["rev-parse", &format!("refs/tags/{tag}^{{commit}}")])
+        .await
+        .map_err(|e| format!("tag {tag}: {e}"))?;
+    let head = run_git(dir, &["rev-parse", "HEAD"]).await?;
+    if head == target {
+        return Ok(false);
+    }
+    run_git(dir, &["checkout", "--detach", &target]).await?;
+    Ok(true)
+}
+
+async fn git_sync_submodules(dir: &str) -> Result<(), String> {
+    if !Path::new(dir).join(".gitmodules").exists() {
+        return Ok(());
+    }
+    run_git(
+        dir,
+        &[
+            "submodule",
+            "update",
+            "--init",
+            "--recursive",
+            "--depth",
+            "1",
+        ],
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| format!("submodules: {e}"))
 }
 
 // ─────────────────── per-plugin lock ───────────────────
@@ -362,15 +564,15 @@ async fn handle_install(
 
             // 克隆
             let existed_before = dir_path.exists();
-            match git_clone(&p.url, &p.dir, &p.branch).await {
-                Ok(_) => {
+            match clone_plugin(&p, existed_before, id, &tx).await {
+                Ok(cloned_msg) => {
                     send_event(
                         &tx,
                         &Event::Progress {
                             id,
                             name: p.name.clone(),
                             status: "installed".into(),
-                            message: "cloned".into(),
+                            message: cloned_msg,
                         },
                     )
                     .await;
@@ -470,15 +672,17 @@ async fn handle_update(
             let dir_path = PathBuf::from(&p.dir);
             if !dir_path.join(".git").exists() {
                 let existed_before = dir_path.exists();
-                return match git_clone(&p.url, &p.dir, &p.branch).await {
-                    Ok(_) => {
+                return match clone_plugin(&p, existed_before, id, &tx).await {
+                    Ok(cloned_msg) => {
                         send_event(
                             &tx,
                             &Event::Progress {
                                 id,
                                 name: p.name.clone(),
                                 status: "installed".into(),
-                                message: "missing plugin cloned during update".into(),
+                                message: format!(
+                                    "missing plugin cloned during update ({cloned_msg})"
+                                ),
                             },
                         )
                         .await;
@@ -560,51 +764,79 @@ async fn handle_update(
                 return OperationResult::Error;
             }
 
-            // 切换分支
-            if !p.branch.is_empty() {
-                if let Err(e) = git_checkout_branch(&p.dir, &p.branch).await {
-                    send_event(
-                        &tx,
-                        &Event::Progress {
-                            id,
-                            name: p.name.clone(),
-                            status: "error".into(),
-                            message: format!("checkout: {e}"),
-                        },
-                    )
-                    .await;
-                    return OperationResult::Error;
-                }
-            }
-
             let old_commit = git_current_commit(&p.dir).await;
 
-            match git_pull(&p.dir).await {
-                Ok(_out) => {
-                    let new_commit = git_current_commit(&p.dir).await;
-                    let changed = old_commit != new_commit;
-                    let status = if changed { "updated" } else { "already" };
-                    let msg = if changed {
-                        // 获取 diff 统计
-                        let diff_stat =
-                            run_git(&p.dir, &["diff", "--shortstat", &old_commit, &new_commit])
+            // commit > tag > branch 优先级：固定版本的插件不做 pull。
+            let outcome: Result<(bool, String), String> = if !p.commit.is_empty() {
+                git_pin_commit(&p.dir, &p.commit).await.map(|changed| {
+                    let pin = short_commit(&p.commit);
+                    if changed {
+                        (true, format!("{old_commit} → {pin} (pinned)"))
+                    } else {
+                        (false, format!("pinned at {pin}"))
+                    }
+                })
+            } else if !p.tag.is_empty() {
+                git_pin_tag(&p.dir, &p.tag).await.map(|changed| {
+                    if changed {
+                        (true, format!("{old_commit} → tag {}", p.tag))
+                    } else {
+                        (false, format!("pinned at tag {}", p.tag))
+                    }
+                })
+            } else {
+                match git_switch_branch(&p.dir, &p.branch).await {
+                    Err(e) => Err(format!("checkout: {e}")),
+                    Ok(()) => match git_pull(&p.dir).await {
+                        Err(e) => Err(e),
+                        Ok(_out) => {
+                            let new_commit = git_current_commit(&p.dir).await;
+                            let changed = old_commit != new_commit;
+                            let msg = if changed {
+                                // 获取 diff 统计
+                                let diff_stat = run_git(
+                                    &p.dir,
+                                    &["diff", "--shortstat", &old_commit, &new_commit],
+                                )
                                 .await
                                 .unwrap_or_default();
-                        if diff_stat.is_empty() {
-                            format!("{old_commit} → {new_commit}")
+                                if diff_stat.is_empty() {
+                                    format!("{old_commit} → {new_commit}")
+                                } else {
+                                    format!("{old_commit} → {new_commit} | {diff_stat}")
+                                }
+                            } else {
+                                "already up-to-date".into()
+                            };
+                            Ok((changed, msg))
+                        }
+                    },
+                }
+            };
+
+            let outcome = match outcome {
+                Ok((changed, msg)) => {
+                    if changed {
+                        if let Err(e) = git_sync_submodules(&p.dir).await {
+                            Err(e)
                         } else {
-                            format!("{old_commit} → {new_commit} | {diff_stat}")
+                            Ok((changed, msg))
                         }
                     } else {
-                        "already up-to-date".into()
-                    };
+                        Ok((changed, msg))
+                    }
+                }
+                err => err,
+            };
 
+            match outcome {
+                Ok((changed, msg)) => {
                     send_event(
                         &tx,
                         &Event::Progress {
                             id,
                             name: p.name.clone(),
-                            status: status.into(),
+                            status: if changed { "updated" } else { "already" }.into(),
                             message: msg,
                         },
                     )
@@ -784,12 +1016,16 @@ async fn handle_status(id: u64, plugins: Vec<PluginSpec>, jobs: usize, tx: &Even
                     branch: String::new(),
                     commit: String::new(),
                     dirty: false,
+                    last_commit: String::new(),
                     size_kb: None,
                 };
             }
             let branch = git_current_branch(&p.dir).await;
             let commit = git_current_commit(&p.dir).await;
             let dirty = git_is_dirty(&p.dir).await;
+            let last_commit = run_git(&p.dir, &["log", "-1", "--format=%cs %s"])
+                .await
+                .unwrap_or_default();
             let size_kb = dir_size_kb(&dir_path).await;
             PluginStatus {
                 name: p.name,
@@ -797,6 +1033,7 @@ async fn handle_status(id: u64, plugins: Vec<PluginSpec>, jobs: usize, tx: &Even
                 branch,
                 commit,
                 dirty,
+                last_commit,
                 size_kb,
             }
         }));
@@ -834,12 +1071,9 @@ async fn handle_post_hook(id: u64, name: &str, dir: &str, cmd: &str, tx: &EventT
 // ─────────────────── shell helper ───────────────────
 
 async fn run_shell_cmd(dir: &str, cmd: &str) -> Result<String, String> {
-    let output = Command::new("sh")
-        .args(["-c", cmd])
-        .current_dir(dir)
-        .output()
-        .await
-        .map_err(|e| format!("exec: {e}"))?;
+    let mut command = Command::new("sh");
+    command.args(["-c", cmd]).current_dir(dir);
+    let output = run_with_timeout(command, "hook", hook_timeout()).await?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -887,6 +1121,52 @@ mod tests {
         assert!(status.success(), "git {args:?} failed");
     }
 
+    fn git_out(dir: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?} failed");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn make_origin(label: &str) -> TestDir {
+        let origin = TestDir::new(label);
+        git(&origin.0, &["init", "-q", "-b", "main"]);
+        git(&origin.0, &["config", "user.name", "SimplePlug Test"]);
+        git(
+            &origin.0,
+            &["config", "user.email", "simpleplug@example.invalid"],
+        );
+        std::fs::write(origin.0.join("plugin.txt"), "one\n").unwrap();
+        git(&origin.0, &["add", "plugin.txt"]);
+        git(&origin.0, &["commit", "-qm", "one"]);
+        origin
+    }
+
+    fn spec(name: &str, url: &str, dir: &str) -> PluginSpec {
+        PluginSpec {
+            name: name.into(),
+            url: url.into(),
+            dir: dir.into(),
+            branch: String::new(),
+            tag: String::new(),
+            commit: String::new(),
+            do_cmd: String::new(),
+            frozen: false,
+        }
+    }
+
+    async fn drain_events(rx: &mut tokio::sync::mpsc::Receiver<String>) -> Vec<serde_json::Value> {
+        let mut events = Vec::new();
+        while let Ok(line) = rx.try_recv() {
+            events.push(serde_json::from_str(&line).unwrap());
+        }
+        events
+    }
+
     #[test]
     fn clamps_parallelism_to_safe_range() {
         assert_eq!(job_limit(0), 1);
@@ -902,6 +1182,122 @@ mod tests {
             Request::Status { jobs, .. } => assert_eq!(jobs, DEFAULT_JOBS),
             _ => panic!("wrong request variant"),
         }
+    }
+
+    #[test]
+    fn spec_defaults_new_fields_to_empty() {
+        let request: Request = serde_json::from_str(
+            r#"{"type":"install","id":1,"plugins":[{"name":"x","url":"u","dir":"d"}]}"#,
+        )
+        .unwrap();
+        match request {
+            Request::Install { plugins, .. } => {
+                assert_eq!(plugins[0].tag, "");
+                assert_eq!(plugins[0].commit, "");
+                assert!(!plugins[0].frozen);
+            }
+            _ => panic!("wrong request variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn install_pins_tag() {
+        let origin = make_origin("tag-origin");
+        git(&origin.0, &["tag", "v1"]);
+        std::fs::write(origin.0.join("plugin.txt"), "two\n").unwrap();
+        git(&origin.0, &["commit", "-aqm", "two"]);
+        let tagged = git_out(&origin.0, &["rev-parse", "v1^{commit}"]);
+
+        let workdir = TestDir::new("tag-dest");
+        let dest = workdir.0.join("plugin");
+        let mut plugin = spec(
+            "tag-plugin",
+            origin.0.to_str().unwrap(),
+            dest.to_str().unwrap(),
+        );
+        plugin.tag = "v1".into();
+
+        let locks = Arc::new(RwLock::new(HashMap::new()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        handle_install(11, vec![plugin], 1, &tx, &locks).await;
+
+        let events = drain_events(&mut rx).await;
+        assert!(events.iter().any(|e| e["status"] == "installed"));
+        assert_eq!(git_out(&dest, &["rev-parse", "HEAD"]), tagged);
+    }
+
+    #[tokio::test]
+    async fn update_pins_and_unpins_commit() {
+        let origin = make_origin("pin-origin");
+        let first = git_out(&origin.0, &["rev-parse", "HEAD"]);
+        std::fs::write(origin.0.join("plugin.txt"), "two\n").unwrap();
+        git(&origin.0, &["commit", "-aqm", "two"]);
+        let second = git_out(&origin.0, &["rev-parse", "HEAD"]);
+
+        let workdir = TestDir::new("pin-dest");
+        let dest = workdir.0.join("plugin");
+        let base = spec(
+            "pin-plugin",
+            origin.0.to_str().unwrap(),
+            dest.to_str().unwrap(),
+        );
+
+        let locks = Arc::new(RwLock::new(HashMap::new()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        handle_install(12, vec![base.clone()], 1, &tx, &locks).await;
+        drain_events(&mut rx).await;
+        assert_eq!(git_out(&dest, &["rev-parse", "HEAD"]), second);
+
+        // Pin back to the first commit.
+        let mut pinned = base.clone();
+        pinned.commit = first.clone();
+        handle_update(13, vec![pinned.clone()], 1, &tx, &locks).await;
+        let events = drain_events(&mut rx).await;
+        assert!(events.iter().any(|e| e["status"] == "updated"));
+        assert_eq!(git_out(&dest, &["rev-parse", "HEAD"]), first);
+
+        // A second run with the same pin is a no-op.
+        handle_update(14, vec![pinned], 1, &tx, &locks).await;
+        let events = drain_events(&mut rx).await;
+        assert!(events.iter().any(|e| e["status"] == "already"));
+        assert_eq!(git_out(&dest, &["rev-parse", "HEAD"]), first);
+    }
+
+    #[tokio::test]
+    async fn update_switches_branch_in_shallow_clone() {
+        let origin = make_origin("branch-origin");
+        git(&origin.0, &["checkout", "-qb", "dev"]);
+        std::fs::write(origin.0.join("plugin.txt"), "dev\n").unwrap();
+        git(&origin.0, &["commit", "-aqm", "dev work"]);
+        let dev_head = git_out(&origin.0, &["rev-parse", "HEAD"]);
+        git(&origin.0, &["checkout", "-q", "main"]);
+
+        let workdir = TestDir::new("branch-dest");
+        let dest = workdir.0.join("plugin");
+        let base = spec(
+            "branch-plugin",
+            origin.0.to_str().unwrap(),
+            dest.to_str().unwrap(),
+        );
+
+        let locks = Arc::new(RwLock::new(HashMap::new()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        handle_install(15, vec![base.clone()], 1, &tx, &locks).await;
+        drain_events(&mut rx).await;
+
+        let mut on_dev = base;
+        on_dev.branch = "dev".into();
+        handle_update(16, vec![on_dev], 1, &tx, &locks).await;
+        let events = drain_events(&mut rx).await;
+        assert!(
+            events.iter().all(|e| e["status"] != "error"),
+            "unexpected error event: {events:?}"
+        );
+        assert_eq!(
+            git_out(&dest, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "dev"
+        );
+        assert_eq!(git_out(&dest, &["rev-parse", "HEAD"]), dev_head);
     }
 
     #[test]
@@ -947,6 +1343,8 @@ mod tests {
             url: "unused".into(),
             dir: temp.0.to_string_lossy().into_owned(),
             branch: String::new(),
+            tag: String::new(),
+            commit: String::new(),
             do_cmd: String::new(),
             frozen: false,
         };
