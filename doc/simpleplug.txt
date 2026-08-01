@@ -1,0 +1,193 @@
+*simpleplug.txt*  A Vim 9 plugin manager with an asynchronous Rust backend
+
+Author: beamiter
+License: same terms as Vim
+
+==============================================================================
+CONTENTS                                                  *simpleplug-contents*
+
+  1. Introduction ................ |simpleplug-intro|
+  2. Declaring plugins ........... |simpleplug-declare|
+  3. Plugin options .............. |simpleplug-options|
+  4. Commands .................... |simpleplug-commands|
+  5. UI keys ..................... |simpleplug-ui|
+  6. Configuration ............... |simpleplug-config|
+  7. Daemon supervision .......... |simpleplug-daemon|
+
+==============================================================================
+1. INTRODUCTION                                              *simpleplug-intro*
+
+SimplePlug installs, updates and cleans Vim plugins. Vim9 script owns the
+registry, lazy loading and the progress UI; a resident Rust (Tokio) daemon runs
+every git operation in parallel, so Vim never blocks on the network.
+
+Requires Vim 9.0+ with |+job|, |+channel| and |+timers|, plus git in $PATH.
+Run ./install.sh once to compile the daemon (Rust 1.85+).
+
+==============================================================================
+2. DECLARING PLUGINS                                       *simpleplug-declare*
+
+Wrap declarations between simpleplug#Begin() and simpleplug#End(): >
+
+    call simpleplug#Begin('~/.vim/plugged')
+    call simpleplug#Plug('tpope/vim-surround')
+    call simpleplug#Plug('rust-lang/rust.vim', {'for': 'rust'})
+    call simpleplug#End()
+<
+simpleplug#Begin() takes an optional directory; without one it uses
+|g:simpleplug_dir|. It also clears any lazy-load state from a previous run, so
+re-sourcing your vimrc is safe.
+
+simpleplug#End() adds every installed plugin to 'runtimepath' (including its
+after/ directory), sources non-lazy plugins, and enables filetype and syntax.
+
+==============================================================================
+3. PLUGIN OPTIONS                                          *simpleplug-options*
+
+simpleplug#Plug() accepts a repository shorthand ('owner/name'), a full URL, or
+a local path, plus an optional dictionary:
+
+  as        Install under a different directory name.
+  dir       Use this exact directory instead of one under g:simpleplug_dir.
+  branch    Track this branch.
+  tag       Pin to this tag.
+  commit    Pin to this exact commit.
+  do        Shell command to run after install or update (a post-hook).
+  frozen    Never update this plugin.
+  for       Load only for these filetypes (string or list).
+  on        Load on this command or <Plug> mapping (string or list).
+
+`tag` and `commit` make the plugin appear as `pinned` in |:PlugStatus|. Shallow
+clones fetch the requested object directly, falling back to full history only
+when that fails.
+
+`for` sources the plugin's ftdetect/ files eagerly, so a filetype the plugin
+itself defines can still trigger the load. `on` with a <Plug> mapping installs
+a stub that loads the plugin and replays the key on first use.
+
+==============================================================================
+4. COMMANDS                                               *simpleplug-commands*
+
+                                                                *:PlugInstall*
+:PlugInstall [name ...]
+        Install missing plugins. With names (completed from the registry),
+        only those are installed.
+
+                                                                 *:PlugUpdate*
+:PlugUpdate [name ...]
+        Update plugins, skipping frozen and pinned ones.
+
+                                                                  *:PlugClean*
+:PlugClean[!]
+        Remove unregistered plugin directories. Only direct children of
+        |g:simpleplug_dir| that contain a .git directory are considered;
+        symlinks and ordinary data directories are left alone. With [!] it
+        does not ask for confirmation.
+
+                                                                 *:PlugStatus*
+:PlugStatus
+        Show every plugin with its state and the date and subject of its most
+        recent commit.
+
+                                                               *:PlugSnapshot*
+:PlugSnapshot [file]
+        Write the exact commit of every plugin to a snapshot file. Defaults to
+        g:simpleplug_dir/simpleplug.snapshot.json.
+
+                                                                *:PlugRestore*
+:PlugRestore [file]
+        Check every plugin out to the commit recorded in a snapshot.
+
+                                                                   *:PlugHook*
+:PlugHook {name}
+        Re-run a single plugin's `do` post-hook.
+
+                                                                   *:PlugStop*
+:PlugStop
+        Stop the daemon. It starts again on the next command.
+
+See |simpleplug-daemon| for :PlugHealth, :PlugRestart and :PlugLog.
+
+==============================================================================
+5. UI KEYS                                                      *simpleplug-ui*
+
+Inside the progress window:
+
+  q       close
+  R       retry the failed plugins
+  S       show status
+  <CR>    open the plugin directory under the cursor
+  d       view the plugin's incoming diff
+  /       filter the list
+  h, ?    toggle the key help
+
+==============================================================================
+6. CONFIGURATION                                            *simpleplug-config*
+
+                                                            *g:simpleplug_dir*
+Plugin directory. Default: ~/.vim/plugged
+
+                                                   *g:simpleplug_daemon_path*
+Explicit path to the daemon binary. Default: '' (search 'runtimepath'/lib).
+
+                                                          *g:simpleplug_debug*
+Echo daemon traffic as it happens. Default: 0. |:PlugLog| is usually better —
+it records everything without needing to be switched on in advance.
+
+                                                   *g:simpleplug_auto_install*
+Install newly declared plugins on VimEnter. Default: 1
+
+                                                  *g:simpleplug_window_width*
+Width of the progress window. Default: 88
+
+                                                           *g:simpleplug_jobs*
+Maximum parallel git operations, 1..64. Default: 8
+
+                                                   *g:simpleplug_git_timeout*
+Timeout in seconds for a single git operation. Default: 300
+
+                                                  *g:simpleplug_hook_timeout*
+Timeout in seconds for a post-hook. Default: 600
+
+Both timeouts are re-read every time the daemon starts, so changing them takes
+effect on the next |:PlugRestart| without restarting Vim.
+
+==============================================================================
+7. DAEMON SUPERVISION                                        *simpleplug-daemon*
+
+The Rust daemon is managed by simplecore, the supervisor shared by the whole
+simple* plugin suite. It is vendored into this repository at
+autoload/simpleplug/core.vim; that file is generated, do not edit it in place.
+
+What it guarantees:
+
+- Liveness is always read from |job_status()|. job_start() returns a job
+  object even when the exec itself failed, so a daemon that cannot start is
+  never mistaken for one that is running.
+- A superseded daemon's late exit callback cannot clear the state of the
+  replacement that already took its place.
+- Output still queued when you stop the daemon is discarded, so an explicit
+  stop cannot be undone by an event that was already in flight.
+- A daemon that dies is restarted automatically with exponential backoff.
+  If it keeps crashing, the supervisor reports it once and stops trying
+  rather than respawning forever; :PlugRestart re-arms it.
+- Requests are correlated to replies by id and can time out, so a wedged
+  daemon never leaves a callback hanging.
+
+                                                                 *:PlugHealth*
+:PlugHealth
+        Report daemon path, run state, negotiated protocol and capabilities,
+        uptime, crash and restart counts, whether the crash-loop breaker has
+        tripped, the git executable, the plugin directory and both timeouts.
+
+                                                                *:PlugRestart*
+:PlugRestart
+        Stop the daemon and start a fresh one. Clears the crash-loop breaker,
+        so this is the way back after repeated failures.
+
+                                                                    *:PlugLog*
+:PlugLog
+        Open the daemon transcript in a scratch buffer: start and exit events,
+        restarts, protocol handshakes, send failures and stderr.
+
+vim:tw=78:ts=8:noet:ft=help:norl:

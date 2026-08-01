@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Vim
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes vim
+
+      - name: Select stable Rust
+        run: |
+          rustup update stable
+          rustup default stable
+
+      - name: Run quality gate
+        run: make check
+
+      - name: Verify installer and daemon handshake
+        run: |
+          ./install.sh
+          response="$(printf '%s\n' '{"type":"ping","id":1}' | ./lib/simpleplug-daemon)"
+          grep -F '"type":"pong"' <<<"$response"
+          grep -F '"protocol_version":2' <<<"$response"
+
+      - name: Compile every Vim9 def (lazy compilation hides cold-branch errors)
+        run: make defcompile
+
+      - name: simplecore supervisor regression suite
+        run: make vim-core

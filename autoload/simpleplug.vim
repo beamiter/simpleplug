@@ -4,6 +4,7 @@ vim9script
 # SimplePlug — Vim9 包管理器 (Rust 后端)
 # =============================================================
 
+
 const s_plugin_root = fnamemodify(expand('<sfile>'), ':p:h:h')
 
 # ─────────────────── 插件注册表 ───────────────────
@@ -17,8 +18,6 @@ var s_lazy_maps: list<string> = []
 
 # ─────────────────── 后端状态 ───────────────────
 
-var s_job: any = v:null
-var s_running: bool = false
 var s_next_id: number = 0
 var s_cbs: dict<any> = {}   # id -> callback dict
 var s_active_id: number = 0
@@ -349,131 +348,111 @@ def NextId(): number
   return s_next_id
 enddef
 
-def FindBackend(): string
-  var override = get(g:, 'simpleplug_daemon_path', '')
-  if type(override) == v:t_string && override !=# '' && executable(override)
-    return override
+# Process lifecycle belongs to the vendored simplecore supervisor: liveness
+# by job_status (not a cached flag), generation-guarded callbacks, backoff
+# restarts and a crash-loop breaker.
+var s_core_ready: bool = false
+
+def SetupCore()
+  if s_core_ready
+    return
   endif
-  var bundled = s_plugin_root .. '/lib/simpleplug-daemon'
-  if executable(bundled)
-    return bundled
-  endif
-  for d in split(&runtimepath, ',')
-    var p = d .. '/lib/simpleplug-daemon'
-    if executable(p)
-      return p
-    endif
-  endfor
-  return ''
+  s_core_ready = true
+  simpleplug#core#Setup({
+    name: 'SimplePlug',
+    exe: 'simpleplug-daemon',
+    path_var: 'simpleplug_daemon_path',
+    debug_var: 'simpleplug_debug',
+    handshake: {request: {type: 'ping'}, reply_type: 'pong'},
+    OnEvent: OnDaemonEvent,
+    OnExit: OnDaemonExit,
+  })
 enddef
 
 def IsRunning(): bool
-  return s_running
+  return simpleplug#core#IsRunning()
 enddef
 
 def EnsureBackend(): bool
-  if IsRunning()
-    return true
-  endif
-  var exe = FindBackend()
-  if exe ==# '' || !executable(exe)
-    echohl ErrorMsg
-    echom '[SimplePlug] daemon not found. Run install.sh or set g:simpleplug_daemon_path.'
-    echohl None
-    return false
-  endif
+  SetupCore()
+  # Timeouts are read fresh on every start so :PlugInstall picks up a change
+  # to g:simpleplug_git_timeout without a Vim restart.
+  simpleplug#core#Configure('env', {
+    SIMPLEPLUG_GIT_TIMEOUT: string(get(g:, 'simpleplug_git_timeout', 300)),
+    SIMPLEPLUG_HOOK_TIMEOUT: string(get(g:, 'simpleplug_hook_timeout', 600)),
+  })
+  return simpleplug#core#Ensure()
+enddef
 
-  try
-    s_job = job_start([exe], {
-      env: {
-        SIMPLEPLUG_GIT_TIMEOUT: string(get(g:, 'simpleplug_git_timeout', 300)),
-        SIMPLEPLUG_HOOK_TIMEOUT: string(get(g:, 'simpleplug_hook_timeout', 600)),
-      },
-      in_io: 'pipe',
-      out_mode: 'nl',
-      out_cb: (ch, line) => {
-        OnDaemonEvent(line)
-      },
-      err_mode: 'nl',
-      err_cb: (ch, line) => {
-        Log('stderr: ' .. line)
-      },
-      exit_cb: (ch, code) => {
-        s_running = false
-        s_job = v:null
-        s_cbs = {}
-        if s_active_id > 0
-          s_active_id = 0
-          StopSpinner()
-          for [name, st] in items(s_ui_plug_state)
-            if !IsFinishedStatus(get(st, 'status', ''))
-              st.status = 'error'
-              st.action = 'error'
-              st.icon = '✘'
-              st.msg = 'daemon exited unexpectedly (' .. code .. ')'
-              s_ui_plug_state[name] = st
-            endif
-          endfor
-          s_ui_mode ..= s_ui_mode =~# '_done$' ? '' : '_done'
-          UIBuildAndRender()
-        endif
-      },
-      stoponexit: 'term'
-    })
-  catch
-    s_job = v:null
-    s_running = false
-    echohl ErrorMsg
-    echom '[SimplePlug] job_start failed: ' .. v:exception
-    echohl None
-    return false
-  endtry
-
-  s_running = (s_job != v:null)
-  return s_running
+# Mid-flight installs must be reported as failed, not left spinning.
+def OnDaemonExit(code: number, restarting: bool)
+  s_cbs = {}
+  if s_active_id <= 0
+    return
+  endif
+  s_active_id = 0
+  StopSpinner()
+  var reason = restarting
+    ? printf('daemon exited (%d); restarting…', code)
+    : printf('daemon exited unexpectedly (%d)', code)
+  for [name, st] in items(s_ui_plug_state)
+    if !IsFinishedStatus(get(st, 'status', ''))
+      st.status = 'error'
+      st.action = 'error'
+      st.icon = '✘'
+      st.msg = reason
+      s_ui_plug_state[name] = st
+    endif
+  endfor
+  s_ui_mode ..= s_ui_mode =~# '_done$' ? '' : '_done'
+  UIBuildAndRender()
 enddef
 
 export def Stop()
-  if s_job != v:null
-    try
-      call('job_stop', [s_job])
-    catch
-    endtry
-  endif
-  s_running = false
-  s_job = v:null
+  SetupCore()
+  simpleplug#core#Stop()
   s_cbs = {}
   s_active_id = 0
 enddef
 
-def Send(req: dict<any>)
-  if !IsRunning()
-    s_active_id = 0
-    return
+export def Restart()
+  SetupCore()
+  s_cbs = {}
+  s_active_id = 0
+  if simpleplug#core#Restart()
+    echom '[SimplePlug] daemon restarted'
   endif
-  try
-    var json = json_encode(req) .. "\n"
-    ch_sendraw(s_job, json)
-  catch
-    Log('Send error: ' .. v:exception, 'ErrorMsg')
-    s_active_id = 0
-    OnError({message: 'failed to send request: ' .. v:exception})
-  endtry
 enddef
 
-def OnDaemonEvent(line: string)
-  if line ==# ''
-    return
-  endif
-  var ev: any
-  try
-    ev = json_decode(line)
-  catch
-    Log('JSON decode error: ' .. v:exception)
-    return
-  endtry
+export def ShowLog()
+  simpleplug#core#ShowLog()
+enddef
 
-  if type(ev) != v:t_dict || !has_key(ev, 'type')
+export def Health()
+  SetupCore()
+  var lines = ['SimplePlug health', repeat('─', 40)]
+  extend(lines, simpleplug#core#HealthLines())
+  add(lines, printf('[%s] git: %s',
+    executable('git') ? 'OK' : 'ERROR',
+    executable('git') ? exepath('git') : 'not found in $PATH'))
+  add(lines, printf('[INFO] plugin directory: %s', get(g:, 'simpleplug_dir', '(unset)')))
+  add(lines, printf('[INFO] registered plugins: %d', len(s_plugins)))
+  add(lines, printf('[INFO] git timeout: %ds, hook timeout: %ds',
+    get(g:, 'simpleplug_git_timeout', 300), get(g:, 'simpleplug_hook_timeout', 600)))
+  for line in lines
+    echom line
+  endfor
+enddef
+
+def Send(req: dict<any>)
+  if !simpleplug#core#Send(req)
+    s_active_id = 0
+    OnError({message: 'daemon is not running'})
+  endif
+enddef
+
+def OnDaemonEvent(ev: dict<any>)
+  if !has_key(ev, 'type') || ev.type ==# 'pong'
     return
   endif
 

@@ -1,5 +1,47 @@
 # Changelog
 
+## Unreleased - 2026-08-01
+
+### 修复
+
+- `EnsureBackend()` 用 `s_job != v:null` 判定启动成功,而 `job_start()` 在 exec
+  失败时同样返回 job 对象:daemon 起不来时插件整个会话都认为它在运行。
+- `IsRunning()` 只读缓存标志、从不复查 `job_status()`,daemon 死掉后 `:PlugInstall`
+  会静默地把请求写进死管道。
+- 没有代际守卫:停止后紧接着启动时,旧 job 的 `exit_cb` 会清空新 job 的状态。
+
+### 新增
+
+- 协议握手(协议版本 2):daemon 新增 `ping`/`pong`,带版本号与能力集合。
+- `:PlugHealth`、`:PlugRestart`、`:PlugLog`。
+- 首个 GitHub Actions 工作流(此前全套九个插件里只有 simpleplug 没有 CI)。
+- `g:simpleplug_git_timeout` / `g:simpleplug_hook_timeout` 现在每次启动 daemon
+  时重新读取,改完不必重启 Vim。
+
+### 可靠性:统一 daemon 监督层 (simplecore)
+
+- 进程生命周期改由 vendored `simplecore` 监督层接管(`autoload/simpleplug/core.vim`,
+  从 `.simplecore/` 同步,请勿直接编辑)。九个插件共用同一份实现:
+  - 存活判定一律走 `job_status()`。`job_start()` 即使 exec 失败也会返回 job
+    对象,所以 `job != null` 并不能说明进程还活着。
+  - 代际守卫:被替换掉的旧 daemon 的 `exit_cb` 迟到时,不会再清掉接替它的新
+    进程的状态。
+  - 停止栅栏:显式停止后仍在管道里的事件会被丢弃,不会把刚拆掉的状态又写回去。
+  - 指数退避自动重启;同一时间窗内反复崩溃则熔断,只报错一次而不是无限重启。
+    手动 `:PlugRestart` 会重新合闸。
+  - 请求按 id 关联并支持超时,卡死的 daemon 不会让回调永远悬着。
+- 新增 `:PlugHealth`、`:PlugRestart`、`:PlugLog`,全套插件命名一致。
+
+### 测试
+
+- 新增 `tests/vim_core.vim`:监督层回归套件(存活判定、代际守卫、停止栅栏、
+  退避重启、崩溃熔断、请求超时、协议握手、raw/json 两种编解码),由
+  `tests/fake_daemon.py` 驱动——一个可以按需应答/静默/乱码/崩溃/忽略 SIGTERM
+  的假 daemon。
+- 新增 `make defcompile`:强制编译所有 Vim9 `def`。Vim9 惰性编译会把冷分支里的
+  语法/类型错误一直藏到用户真正踩中为止。
+- `make check` 现在包含以上两项。
+
 ## 0.4.0 - 2026-07-25
 
 - 迁移到 Rust edition 2024，最低 Rust 版本提升到 1.85。

@@ -26,6 +26,9 @@ command! PlugStop      simpleplug#Stop()
 command! -nargs=? -complete=file PlugSnapshot simpleplug#Snapshot(<q-args>)
 command! -nargs=? -complete=file PlugRestore simpleplug#Restore(<q-args>)
 command! -nargs=1 -complete=customlist,simpleplug#CompletePluginNames PlugHook simpleplug#RunHook(<q-args>)
+command! PlugHealth   simpleplug#Health()
+command! PlugRestart  simpleplug#Restart()
+command! PlugLog      simpleplug#ShowLog()
 
 # =============== 自动命令 ===============
 augroup SimplePlug

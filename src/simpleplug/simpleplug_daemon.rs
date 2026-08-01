@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -61,6 +61,29 @@ enum Request {
         dir: String,
         cmd: String,
     },
+    /// 能力握手：Vim 端每次启动 daemon 后发一次，按回复决定启用哪些特性，
+    /// 旧 daemon 配新插件时降级而不是行为错乱。
+    #[serde(rename = "ping")]
+    Ping {
+        #[serde(default)]
+        id: u64,
+    },
+}
+
+/// 线格式变更时递增。v1 是尚未协商的隐式格式。
+const PROTOCOL_VERSION: u32 = 2;
+
+fn capabilities() -> BTreeMap<&'static str, bool> {
+    BTreeMap::from([
+        ("install", true),
+        ("update", true),
+        ("clean", true),
+        ("status", true),
+        ("post_hook", true),
+        ("tag_pin", true),
+        ("commit_pin", true),
+        ("submodules", true),
+    ])
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -111,6 +134,14 @@ enum Event {
     /// 清理结果
     #[serde(rename = "clean_done")]
     CleanDone { id: u64, removed: Vec<String> },
+    /// 握手回复
+    #[serde(rename = "pong")]
+    Pong {
+        id: u64,
+        protocol_version: u32,
+        version: &'static str,
+        capabilities: BTreeMap<&'static str, bool>,
+    },
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -197,6 +228,18 @@ async fn main() -> std::io::Result<()> {
 
         tasks.spawn(async move {
             match req {
+                Request::Ping { id } => {
+                    send_event(
+                        &tx,
+                        &Event::Pong {
+                            id,
+                            protocol_version: PROTOCOL_VERSION,
+                            version: env!("CARGO_PKG_VERSION"),
+                            capabilities: capabilities(),
+                        },
+                    )
+                    .await;
+                }
                 Request::Install { id, plugins, jobs } => {
                     handle_install(id, plugins, jobs, &tx, &locks).await;
                 }
