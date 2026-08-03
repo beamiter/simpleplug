@@ -1146,18 +1146,6 @@ def UiWidth(): number
   return get(g:, 'simpleplug_window_width', s_default_width)
 enddef
 
-def PadLine(content: string, width: number): string
-  var text = content
-  while strdisplaywidth(text) > width && strchars(text) > 0
-    text = strcharpart(text, 0, strchars(text) - 1)
-  endwhile
-  var pad = width - strdisplaywidth(text)
-  if pad < 0
-    pad = 0
-  endif
-  return text .. repeat(' ', pad)
-enddef
-
 def ShortLine(content: string, width: number): string
   var text = content
   if width <= 0
@@ -1177,8 +1165,10 @@ def AlignLine(left: string, right: string, width: number): string
   return left .. repeat(' ', gap) .. right
 enddef
 
+# 行尾不补空格：补齐出来的尾随空白会被用户配置里常见的
+# trailing-whitespace 高亮染成红色背景
 def AddUiLine(lines: list<string>, content: string, width: number)
-  add(lines, PadLine(content, width))
+  add(lines, substitute(ShortLine(content, width), '\s\+$', '', ''))
 enddef
 
 def DividerLine(width: number): string
