@@ -400,10 +400,144 @@ async fn clone_plugin(
     Ok("cloned".to_string())
 }
 
+fn branch_refspec(branch: &str) -> String {
+    format!("+refs/heads/{branch}:refs/remotes/origin/{branch}")
+}
+
+async fn git_fetch_branch(dir: &str, branch: &str) -> Result<String, String> {
+    run_git(
+        dir,
+        &["fetch", "--depth", "1", "origin", &branch_refspec(branch)],
+    )
+    .await?;
+    run_git(dir, &["rev-parse", "FETCH_HEAD"]).await
+}
+
+/// The branch origin's HEAD points at. Used to recover when the checkout has no
+/// branch, or tracks one that no longer exists upstream.
+async fn git_remote_head_branch(dir: &str) -> Option<String> {
+    let out = run_git(dir, &["ls-remote", "--symref", "origin", "HEAD"])
+        .await
+        .ok()?;
+    out.lines()
+        .find_map(|line| line.strip_prefix("ref: "))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|r| r.strip_prefix("refs/heads/"))
+        .map(str::to_string)
+}
+
+async fn git_is_shallow(dir: &str) -> bool {
+    run_git(dir, &["rev-parse", "--is-shallow-repository"])
+        .await
+        .map(|s| s == "true")
+        .unwrap_or(false)
+}
+
+async fn git_is_ancestor(dir: &str, ancestor: &str, descendant: &str) -> bool {
+    run_git(dir, &["merge-base", "--is-ancestor", ancestor, descendant])
+        .await
+        .is_ok()
+}
+
+/// A clone made with `--depth 1 --branch <b>` only fetches `<b>`; make sure the
+/// refspec follows the branch we actually track, without narrowing a full clone.
+async fn git_ensure_fetch_refspec(dir: &str, branch: &str) {
+    let existing = run_git(dir, &["config", "--get-all", "remote.origin.fetch"])
+        .await
+        .unwrap_or_default();
+    let covered = existing
+        .lines()
+        .any(|l| l.contains("refs/heads/*") || l.contains(&format!("refs/heads/{branch}:")));
+    if !covered {
+        let _ = run_git(
+            dir,
+            &["config", "remote.origin.fetch", &branch_refspec(branch)],
+        )
+        .await;
+    }
+}
+
+/// Fast-forward the checkout onto origin's tip.
+///
+/// Never rewrites a user's local history: a genuine divergence is reported and
+/// left for the user to resolve. `git pull --ff-only --depth 1` cannot do this
+/// job, because it fails on three states that are not divergences at all — a
+/// detached HEAD has no branch to pull into, a branch renamed upstream (main →
+/// master) leaves the local branch tracking a ref that is gone, and a depth-1
+/// fetch grafts away the commits linking HEAD to the new tip, which makes an
+/// ordinary fast-forward look like diverged history.
 async fn git_pull(dir: &str) -> Result<String, String> {
-    // Never rewrite a user's local history. Diverged branches are reported and
-    // can be resolved explicitly by the user.
-    run_git(dir, &["pull", "--ff-only", "--depth", "1"]).await
+    let current = git_current_branch(dir).await;
+    let detached = current.is_empty() || current == "HEAD";
+
+    // Try the checked-out branch first, and fall back to origin's default branch
+    // when there is none or it no longer exists upstream.
+    let mut target = String::new();
+    let mut tip = String::new();
+    let mut first_err = None;
+    if !detached {
+        match git_fetch_branch(dir, &current).await {
+            Ok(head) => {
+                target = current.clone();
+                tip = head;
+            }
+            Err(e) => first_err = Some(e),
+        }
+    }
+    if target.is_empty() {
+        let fallback = git_remote_head_branch(dir).await.ok_or_else(|| {
+            first_err
+                .clone()
+                .unwrap_or_else(|| "cannot determine origin's default branch".to_string())
+        })?;
+        tip = git_fetch_branch(dir, &fallback).await.map_err(|e| {
+            first_err
+                .clone()
+                .map_or(e.clone(), |first| format!("{first}; {e}"))
+        })?;
+        target = fallback;
+    }
+
+    // Restore the ancestry the shallow fetch truncated before believing the
+    // branches have diverged.
+    if !git_is_ancestor(dir, "HEAD", &tip).await && git_is_shallow(dir).await {
+        let refspec = branch_refspec(&target);
+        for extra in [["--deepen", "50"], ["--unshallow", ""]] {
+            let mut args = vec!["fetch"];
+            args.extend(extra.iter().copied().filter(|a| !a.is_empty()));
+            args.extend(["origin", refspec.as_str()]);
+            if run_git(dir, &args).await.is_ok() {
+                tip = run_git(dir, &["rev-parse", "FETCH_HEAD"]).await?;
+            }
+            if git_is_ancestor(dir, "HEAD", &tip).await || !git_is_shallow(dir).await {
+                break;
+            }
+        }
+    }
+    if !git_is_ancestor(dir, "HEAD", &tip).await {
+        return Err(format!(
+            "local history diverges from origin/{target}; resolve it manually"
+        ));
+    }
+
+    if detached || current != target {
+        // Reattach the branch (or follow the upstream rename) at the fetched tip.
+        run_git(dir, &["checkout", "-B", &target, &tip]).await?;
+        git_ensure_fetch_refspec(dir, &target).await;
+        let _ = run_git(
+            dir,
+            &[
+                "branch",
+                "--set-upstream-to",
+                &format!("origin/{target}"),
+                &target,
+            ],
+        )
+        .await;
+        Ok(format!("on {target}"))
+    } else {
+        run_git(dir, &["merge", "--ff-only", &tip]).await
+    }
 }
 
 async fn git_current_branch(dir: &str) -> String {
@@ -1339,6 +1473,116 @@ mod tests {
             "dev"
         );
         assert_eq!(git_out(&dest, &["rev-parse", "HEAD"]), dev_head);
+    }
+
+    #[tokio::test]
+    async fn update_follows_branch_renamed_upstream() {
+        let origin = make_origin("rename-origin");
+
+        let workdir = TestDir::new("rename-dest");
+        let dest = workdir.0.join("plugin");
+        let plugin = spec(
+            "rename-plugin",
+            origin.0.to_str().unwrap(),
+            dest.to_str().unwrap(),
+        );
+
+        let locks = Arc::new(RwLock::new(HashMap::new()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        handle_install(17, vec![plugin.clone()], 1, &tx, &locks).await;
+        drain_events(&mut rx).await;
+        assert_eq!(
+            git_out(&dest, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "main"
+        );
+
+        // The branch the clone tracks disappears upstream.
+        git(&origin.0, &["branch", "-m", "main", "master"]);
+        std::fs::write(origin.0.join("plugin.txt"), "renamed\n").unwrap();
+        git(&origin.0, &["commit", "-aqm", "after rename"]);
+        let head = git_out(&origin.0, &["rev-parse", "HEAD"]);
+
+        handle_update(18, vec![plugin], 1, &tx, &locks).await;
+        let events = drain_events(&mut rx).await;
+        assert!(
+            events.iter().all(|e| e["status"] != "error"),
+            "unexpected error event: {events:?}"
+        );
+        assert_eq!(
+            git_out(&dest, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "master"
+        );
+        assert_eq!(git_out(&dest, &["rev-parse", "HEAD"]), head);
+    }
+
+    #[tokio::test]
+    async fn update_reattaches_detached_head() {
+        let origin = make_origin("detached-origin");
+
+        let workdir = TestDir::new("detached-dest");
+        let dest = workdir.0.join("plugin");
+        let plugin = spec(
+            "detached-plugin",
+            origin.0.to_str().unwrap(),
+            dest.to_str().unwrap(),
+        );
+
+        let locks = Arc::new(RwLock::new(HashMap::new()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        handle_install(19, vec![plugin.clone()], 1, &tx, &locks).await;
+        drain_events(&mut rx).await;
+        git(&dest, &["checkout", "-q", "--detach", "HEAD"]);
+
+        std::fs::write(origin.0.join("plugin.txt"), "two\n").unwrap();
+        git(&origin.0, &["commit", "-aqm", "two"]);
+        let head = git_out(&origin.0, &["rev-parse", "HEAD"]);
+
+        handle_update(20, vec![plugin], 1, &tx, &locks).await;
+        let events = drain_events(&mut rx).await;
+        assert!(
+            events.iter().all(|e| e["status"] != "error"),
+            "unexpected error event: {events:?}"
+        );
+        assert_eq!(
+            git_out(&dest, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "main"
+        );
+        assert_eq!(git_out(&dest, &["rev-parse", "HEAD"]), head);
+    }
+
+    #[tokio::test]
+    async fn update_fast_forwards_across_shallow_graft() {
+        let origin = make_origin("graft-origin");
+        // file:// keeps the clone genuinely shallow; git ignores --depth for
+        // plain local paths, and the graft is the point of this test.
+        let url = format!("file://{}", origin.0.display());
+
+        let workdir = TestDir::new("graft-dest");
+        let dest = workdir.0.join("plugin");
+        let plugin = spec("graft-plugin", &url, dest.to_str().unwrap());
+
+        let locks = Arc::new(RwLock::new(HashMap::new()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        handle_install(21, vec![plugin.clone()], 1, &tx, &locks).await;
+        drain_events(&mut rx).await;
+        assert_eq!(
+            git_out(&dest, &["rev-parse", "--is-shallow-repository"]),
+            "true"
+        );
+
+        for n in ["two", "three"] {
+            std::fs::write(origin.0.join("plugin.txt"), format!("{n}\n")).unwrap();
+            git(&origin.0, &["commit", "-aqm", n]);
+        }
+        let head = git_out(&origin.0, &["rev-parse", "HEAD"]);
+
+        handle_update(22, vec![plugin], 1, &tx, &locks).await;
+        let events = drain_events(&mut rx).await;
+        assert!(
+            events.iter().all(|e| e["status"] != "error"),
+            "unexpected error event: {events:?}"
+        );
+        assert_eq!(git_out(&dest, &["rev-parse", "HEAD"]), head);
     }
 
     #[test]
