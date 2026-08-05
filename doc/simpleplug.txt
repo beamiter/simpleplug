@@ -4,7 +4,7 @@ Author: beamiter
 License: same terms as Vim
 
 ==============================================================================
-CONTENTS                                                  *simpleplug-contents*
+CONTENTS                                                 *simpleplug-contents*
 
   1. Introduction ................ |simpleplug-intro|
   2. Declaring plugins ........... |simpleplug-declare|
@@ -15,17 +15,17 @@ CONTENTS                                                  *simpleplug-contents*
   7. Daemon supervision .......... |simpleplug-daemon|
 
 ==============================================================================
-1. INTRODUCTION                                              *simpleplug-intro*
+1. INTRODUCTION                                             *simpleplug-intro*
 
 SimplePlug installs, updates and cleans Vim plugins. Vim9 script owns the
 registry, lazy loading and the progress UI; a resident Rust (Tokio) daemon runs
 every git operation in parallel, so Vim never blocks on the network.
 
 Requires Vim 9.0+ with |+job|, |+channel| and |+timers|, plus git in $PATH.
-Run ./install.sh once to compile the daemon (Rust 1.85+).
+Run ./install.sh once to compile the daemon (Rust 1.88+).
 
 ==============================================================================
-2. DECLARING PLUGINS                                       *simpleplug-declare*
+2. DECLARING PLUGINS                                      *simpleplug-declare*
 
 Wrap declarations between simpleplug#Begin() and simpleplug#End(): >
 
@@ -42,7 +42,7 @@ simpleplug#End() adds every installed plugin to 'runtimepath' (including its
 after/ directory), sources non-lazy plugins, and enables filetype and syntax.
 
 ==============================================================================
-3. PLUGIN OPTIONS                                          *simpleplug-options*
+3. PLUGIN OPTIONS                                         *simpleplug-options*
 
 simpleplug#Plug() accepts a repository shorthand ('owner/name'), a full URL, or
 a local path, plus an optional dictionary:
@@ -66,7 +66,7 @@ itself defines can still trigger the load. `on` with a <Plug> mapping installs
 a stub that loads the plugin and replays the key on first use.
 
 ==============================================================================
-4. COMMANDS                                               *simpleplug-commands*
+4. COMMANDS                                              *simpleplug-commands*
 
                                                                 *:PlugInstall*
 :PlugInstall [name ...]
@@ -109,7 +109,7 @@ a stub that loads the plugin and replays the key on first use.
 See |simpleplug-daemon| for :PlugHealth, :PlugRestart and :PlugLog.
 
 ==============================================================================
-5. UI KEYS                                                      *simpleplug-ui*
+5. UI KEYS                                                     *simpleplug-ui*
 
 Inside the progress window:
 
@@ -122,7 +122,7 @@ Inside the progress window:
   h, ?    toggle the key help
 
 ==============================================================================
-6. CONFIGURATION                                            *simpleplug-config*
+6. CONFIGURATION                                           *simpleplug-config*
 
                                                             *g:simpleplug_dir*
 Plugin directory. Default: ~/.vim/plugged
@@ -153,7 +153,7 @@ Both timeouts are re-read every time the daemon starts, so changing them takes
 effect on the next |:PlugRestart| without restarting Vim.
 
 ==============================================================================
-7. DAEMON SUPERVISION                                        *simpleplug-daemon*
+7. DAEMON SUPERVISION                                      *simpleplug-daemon*
 
 The Rust daemon is managed by simplecore, the supervisor shared by the whole
 simple* plugin suite. It is vendored into this repository at
@@ -189,5 +189,36 @@ What it guarantees:
 :PlugLog
         Open the daemon transcript in a scratch buffer: start and exit events,
         restarts, protocol handshakes, send failures and stderr.
+
+
+==============================================================================
+DAEMON COMMAND LINE                                    *simpleplug-daemon-cli*
+
+The daemon takes no arguments in normal use: the plugin starts it and speaks
+JSON over its stdin and stdout.  For diagnosis it also answers: >
+
+  simpleplug-daemon --version
+  simpleplug-daemon --help
+  simpleplug-daemon --self-test
+<
+--self-test checks the handshake reply serialises and prints "ok".
+install.sh runs it on the freshly built binary before replacing a working one,
+so a build that compiles but does not work never reaches lib/.
+
+Every daemon in the simple* suite answers these three the same way.
+
+VENDORED SUPERVISOR                                    *simpleplug-simplecore*
+
+The daemon supervisor in autoload/simpleplug/core.vim, and the test harness
+beside it, are vendored from the suite's shared .simplecore bundle rather
+than written here — each plugin carries its own copy so that installing
+this plugin alone is enough.  Do not edit those files in place: >
+
+  make core-verify
+<
+checks each of them against the sha256 recorded in .simplecore.manifest and
+fails the build when one has drifted.  `make check` depends on it.  To change
+the supervisor, edit .simplecore/core.vim in the suite checkout and re-run
+.simplecore/vendor.sh.
 
 vim:tw=78:ts=8:noet:ft=help:norl:

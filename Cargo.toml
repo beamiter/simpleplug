@@ -2,7 +2,7 @@
 name = "simpleplug"
 version = "0.4.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [[bin]]
 name = "simpleplug-daemon"

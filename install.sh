@@ -1,16 +1,13 @@
 #!/usr/bin/env bash
+# Builds the SimplePlug daemon and installs it into lib/.
+#
+# The work is shared with the rest of the simple* suite; see install-common.sh,
+# which is vendored from .simplecore and must not be edited in place.
 set -euo pipefail
 
-root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-cd "$root"
+SIMPLECORE_BINARY="simpleplug-daemon"
+SIMPLECORE_DISPLAY="SimplePlug"
+SIMPLECORE_MIN_RUST_MINOR=88
+SIMPLECORE_VERIFY="self-test"
 
-if ! command -v cargo >/dev/null 2>&1; then
-  echo "error: Rust/Cargo is required to build simpleplug-daemon" >&2
-  exit 1
-fi
-
-cargo build --release --locked
-mkdir -p lib
-install -m 755 target/release/simpleplug-daemon lib/simpleplug-daemon
-
-echo "Installed to $root/lib/simpleplug-daemon"
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/install-common.sh"
