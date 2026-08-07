@@ -110,11 +110,22 @@ restoring the directory and repeating the trigger retries the load.
                                                                *:PlugSnapshot*
 :PlugSnapshot [file]
         Write the exact commit of every plugin to a snapshot file. Defaults to
-        g:simpleplug_dir/simpleplug.snapshot.json.
+        g:simpleplug_dir/simpleplug.snapshot.json. The legacy JSON object shape
+        ({plugin-name: full-oid}) is retained. A private 0700 staging directory
+        is atomically claimed beside the target on the same filesystem; the
+        complete file is written inside it and atomically renamed, so a failed
+        write leaves the previous snapshot intact. Pre-existing staging names
+        are skipped without following them. A snapshot target that is itself a
+        symbolic link is refused.
 
                                                                 *:PlugRestore*
 :PlugRestore [file]
         Check every plugin out to the commit recorded in a snapshot.
+        Validation happens before the daemon starts: the root must be an
+        object, every entry must have the expected type, and each commit must
+        be a full 40-digit SHA-1 or 64-digit SHA-256 hexadecimal object ID.
+        Existing snapshots produced by earlier SimplePlug versions use this
+        same shape and remain readable.
 
                                                                    *:PlugHook*
 :PlugHook {name}

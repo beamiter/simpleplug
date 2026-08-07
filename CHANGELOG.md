@@ -2,6 +2,18 @@
 
 ## Unreleased - 2026-08-05
 
+### 事务型安全快照
+
+- `:PlugSnapshot` 保持原有 `name -> SHA` JSON 格式，但改为在目标旁原子创建
+  同文件系统的 0700 私有 staging 目录，完整写入其中文件后原子替换；
+  写入或 rename 失败不会截断上一版锁文件，也不会遗留插件创建的 staging 目录。
+  预置的 staging 目录/符号链接只会促使重试，快照目标本身是符号链接时也拒绝跟随。
+- `:PlugRestore` 在启动 daemon 前严格验证 JSON 根与每个条目类型，OID 仅接受完整
+  40 位 SHA-1 或 64 位 SHA-256 十六进制值；旧版生成的有效快照无需迁移，同时
+  无效 revision/选项字符串不会进入 Git 参数。
+- Vim smoke 覆盖旧格式、40/64 位 OID、错误根/值、私有 staging 权限与清理、
+  目录/符号链接名冲突重试、rename 失败保留旧目标，以及快照符号链接目标不被覆盖。
+
 ### Runtime 子目录
 
 - `Plug()` 新增向后兼容的 `rtp` 选项，可把仓库内的 `vim`、`editors/vim`

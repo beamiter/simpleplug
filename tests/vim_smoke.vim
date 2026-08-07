@@ -224,9 +224,116 @@ if executable('ln')
   delete(escape_base, 'rf')
 endif
 
+# Snapshots retain the legacy name -> full OID JSON shape, but are written from
+# a private same-filesystem staging directory beside the target.
+var snapshot_home = tempname()
+var snapshot_path = snapshot_home .. '/locks/plugins.json'
+mkdir(snapshot_home, 'p')
+mkdir(fnamemodify(snapshot_path, ':h'), 'p')
+simpleplug#Begin('/tmp/simpleplug-vim-smoke')
+simpleplug#Plug('local/snapshot-fixture', {
+  as: 'snapshot-fixture',
+  dir: root,
+})
+
+# mkdir() raises E739 for an occupied candidate. Pre-claim the very first name
+# as a directory: Snapshot must leave it untouched, retry the nonce and finish.
+var simpleplug_script = getscriptinfo({name: 'autoload/simpleplug.vim'})[0]
+var simpleplug_details = getscriptinfo({sid: simpleplug_script.sid})[0]
+var snapshot_nonce: number = get(simpleplug_details.variables, 's_snapshot_nonce', -1)
+assert_equal(0, snapshot_nonce, 'snapshot staging nonce advanced before its first use')
+var occupied_stage = printf('%s/.%s.stage.%d.1', fnamemodify(snapshot_path, ':h'),
+  fnamemodify(snapshot_path, ':t'), getpid())
+mkdir(occupied_stage, '', 0o700)
+simpleplug#Snapshot(snapshot_path)
+var snapshot_json = json_decode(join(readfile(snapshot_path), "\n"))
+assert_equal(v:t_dict, type(snapshot_json), 'snapshot root is not the legacy JSON object')
+assert_match('^\x\{40}\%([0-9a-f]\{24}\)\?$', get(snapshot_json, 'snapshot-fixture', ''),
+  'snapshot did not contain a full Git OID')
+assert_equal([], readdir(occupied_stage), 'snapshot used an attacker-occupied staging directory')
+delete(occupied_stage, 'd')
+assert_equal([], globpath(fnamemodify(snapshot_path, ':h'), '.*.stage.*', 0, 1),
+  'atomic snapshot left a staging directory behind')
+
+# A candidate symlink is another collision, never a directory to enter. Derive
+# the next nonce from script state so this remains stable if retries are added.
+if executable('ln')
+  simpleplug_details = getscriptinfo({sid: simpleplug_script.sid})[0]
+  snapshot_nonce = get(simpleplug_details.variables, 's_snapshot_nonce', -1)
+  var linked_stage = printf('%s/.%s.stage.%d.%d', fnamemodify(snapshot_path, ':h'),
+    fnamemodify(snapshot_path, ':t'), getpid(), snapshot_nonce + 1)
+  var linked_stage_target = snapshot_home .. '/stage-symlink-target'
+  mkdir(linked_stage_target, 'p')
+  call system('ln -s ' .. shellescape(linked_stage_target) .. ' ' .. shellescape(linked_stage))
+  assert_equal(0, v:shell_error, 'could not preplant staging symlink')
+  simpleplug#Snapshot(snapshot_path)
+  assert_equal([], readdir(linked_stage_target), 'snapshot followed a planted staging symlink')
+  assert_equal('link', getftype(linked_stage), 'snapshot replaced a planted staging symlink')
+  delete(linked_stage)
+  assert_equal([], globpath(fnamemodify(snapshot_path, ':h'), '.*.stage.*', 0, 1),
+    'symlink collision left a plugin-created staging directory')
+endif
+
+# The atomically claimed boundary itself is owner-only on Unix.
+if has('unix')
+  var CreateStage = function(printf('<SNR>%d_CreateSnapshotStageDir', simpleplug_script.sid))
+  var permission_stage: string = call(CreateStage, [snapshot_path])
+  assert_equal('rwx------', getfperm(permission_stage), 'snapshot staging directory is not 0700')
+  delete(permission_stage, 'd')
+endif
+
+# Restore validates the entire legacy object before it starts the daemon. A
+# malformed root/value is rejected, while a 64-digit SHA-256 OID remains valid.
+var invalid_snapshot = snapshot_home .. '/invalid.json'
+var backend_starts_before_invalid_restore = simpleplug#core#Health().starts
+writefile(['[]'], invalid_snapshot)
+simpleplug#Restore(invalid_snapshot)
+assert_match('snapshot root must be a JSON object', execute('messages'))
+assert_equal(backend_starts_before_invalid_restore, simpleplug#core#Health().starts,
+  'malformed snapshot started the daemon')
+writefile([json_encode({snapshot_fixture: 123})], invalid_snapshot)
+simpleplug#Restore(invalid_snapshot)
+assert_match('must map to a full 40- or 64-digit hexadecimal Git OID', execute('messages'))
+assert_equal(backend_starts_before_invalid_restore, simpleplug#core#Health().starts,
+  'wrong snapshot entry type started the daemon')
+writefile([json_encode({'not-registered': repeat('a', 64)})], invalid_snapshot)
+simpleplug#Restore(invalid_snapshot)
+assert_match('snapshot matches no registered plugins', execute('messages'),
+  'a valid 64-digit OID was rejected')
+assert_equal(backend_starts_before_invalid_restore, simpleplug#core#Health().starts,
+  'unmatched snapshot started the daemon')
+
+# Force rename() itself to fail by making the destination a non-empty
+# directory. The pre-existing target stays intact and finally removes staging.
+var rename_failure_target = snapshot_home .. '/rename-failure-target'
+mkdir(rename_failure_target, 'p')
+writefile(['old-target'], rename_failure_target .. '/old.json')
+simpleplug#Snapshot(rename_failure_target)
+assert_equal(['old-target'], readfile(rename_failure_target .. '/old.json'),
+  'failed atomic rename damaged the old target')
+assert_equal([], globpath(snapshot_home, '.*.stage.*', 0, 1),
+  'failed atomic rename leaked a staging directory')
+assert_match('atomic rename failed', execute('messages'))
+
+# A lockfile path that is itself a symlink is never followed. The pointed-to
+# file must retain its old content and no staging directory may leak.
+if executable('ln')
+  var snapshot_target = snapshot_home .. '/outside.json'
+  var snapshot_link = snapshot_home .. '/snapshot-link.json'
+  writefile(['keep-me'], snapshot_target)
+  call system('ln -s ' .. shellescape(snapshot_target) .. ' ' .. shellescape(snapshot_link))
+  assert_equal(0, v:shell_error, 'could not create snapshot symlink')
+  simpleplug#Snapshot(snapshot_link)
+  assert_equal(['keep-me'], readfile(snapshot_target), 'snapshot followed and overwrote a symlink')
+  assert_match('refusing to replace snapshot symlink:', execute('messages'))
+  assert_equal([], globpath(snapshot_home, '.*.stage.*', 0, 1),
+    'symlink target refusal leaked a staging directory')
+endif
+
 &runtimepath = join(filter(split(&runtimepath, ','), (_, entry) =>
   entry !=# retry_runtime && entry !=# retry_runtime .. '/after'), ',')
 delete(retry_checkout, 'rf')
+delete(snapshot_home, 'rf')
 
 # Reinitializing must clear generated lazy-load state without errors.
 simpleplug#Begin('/tmp/simpleplug-vim-smoke')

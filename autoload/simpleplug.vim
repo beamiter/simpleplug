@@ -825,9 +825,118 @@ enddef
 # Snapshot / Restore — 记录并恢复所有插件的精确 commit
 # =============================================================
 
+var s_snapshot_nonce: number = 0
+
 def SnapshotPath(file: string): string
   return file ==# '' ? g:simpleplug_dir .. '/simpleplug.snapshot.json' : fnamemodify(file, ':p')
 enddef
+
+
+def IsFullGitOid(value: any): bool
+  return type(value) == v:t_string && value =~? '^\x\{40}\%([0-9a-f]\{24}\)\?$'
+enddef
+
+
+# Snapshot files deliberately keep the original {name: oid} shape. Strictly
+# validating that small format before starting the daemon both preserves old
+# lockfiles and prevents arbitrary revision/option strings from reaching Git.
+def ReadSnapshot(path: string): dict<string>
+  var decoded: any = json_decode(join(readfile(path), "\n"))
+  if type(decoded) != v:t_dict
+    throw 'snapshot root must be a JSON object'
+  endif
+  var result: dict<string> = {}
+  for [name, oid] in items(decoded)
+    if name !~# '^[A-Za-z0-9._-]\+$'
+      throw 'invalid plugin name: ' .. string(name)
+    endif
+    if !IsFullGitOid(oid)
+      throw printf('%s must map to a full 40- or 64-digit hexadecimal Git OID', name)
+    endif
+    result[name] = tolower(oid)
+  endfor
+  return result
+enddef
+
+
+def CreateSnapshotStageDir(path: string): string
+  var parent = fnamemodify(path, ':h')
+  var leaf = fnamemodify(path, ':t')
+  # mkdir() without "p" is the atomic claim: a pre-existing file, directory or
+  # symlink makes the attempt fail, so we never trust an attacker-created path.
+  # Once claimed, 0700 protects the fixed child filename from other users.
+  for _ in range(128)
+    s_snapshot_nonce += 1
+    var candidate = printf('%s/.%s.stage.%d.%d', parent, leaf, getpid(), s_snapshot_nonce)
+    try
+      if mkdir(candidate, '', 0o700)
+        return candidate
+      endif
+    catch
+      # An existing directory or symlink raises E739 instead of returning
+      # zero. It is only a name collision: never inspect/follow it, just try
+      # the next nonce inside the bounded search.
+      continue
+    endtry
+  endfor
+  throw 'could not claim a private staging directory'
+enddef
+
+
+# Atomically claim a private directory beside the destination, write a fixed
+# child inside that 0700 boundary, then rename the completed file. Unlike a
+# getftype()->writefile() sequence, a planted symlink can only make mkdir fail;
+# it is never opened. Failed write/rename leaves the existing lockfile intact.
+def WriteSnapshotAtomic(path: string, encoded: string): bool
+  var parent = fnamemodify(path, ':h')
+  try
+    if !isdirectory(parent) && mkdir(parent, 'p') == 0 && !isdirectory(parent)
+      throw 'cannot create parent directory'
+    endif
+  catch
+    echohl ErrorMsg
+    echom printf('[SimplePlug] failed to prepare snapshot directory %s: %s', parent, v:exception)
+    echohl None
+    return false
+  endtry
+  if getftype(path) ==# 'link'
+    echohl ErrorMsg
+    echom '[SimplePlug] refusing to replace snapshot symlink: ' .. path
+    echohl None
+    return false
+  endif
+
+  var stage_dir = ''
+  var temporary = ''
+  var ok = false
+  try
+    stage_dir = CreateSnapshotStageDir(path)
+    temporary = stage_dir .. '/snapshot'
+    if writefile([encoded], temporary) != 0
+      throw 'temporary write failed'
+    endif
+    if rename(temporary, path) != 0
+      throw 'atomic rename failed'
+    endif
+    ok = true
+  catch
+    echohl ErrorMsg
+    echom printf('[SimplePlug] failed to write snapshot %s: %s', path, v:exception)
+    echohl None
+  finally
+    if temporary !=# '' && getftype(temporary) ==# 'file'
+      delete(temporary)
+    endif
+    # Non-recursive removal is intentional: the directory was private and may
+    # contain only our fixed file. If that invariant is somehow violated, leave
+    # evidence behind instead of recursively deleting an unexpected subtree.
+    if stage_dir !=# '' && getftype(stage_dir) ==# 'dir'
+      delete(stage_dir, 'd')
+    endif
+  endtry
+  return ok
+enddef
+
 
 export def Snapshot(file: string = '')
   var path = SnapshotPath(file)
@@ -837,23 +946,17 @@ export def Snapshot(file: string = '')
       continue
     endif
     var commit = trim(system('git -C ' .. shellescape(p.dir) .. ' rev-parse HEAD'))
-    if v:shell_error == 0 && commit =~# '^\x\+$'
-      snap[p.name] = commit
+    if v:shell_error == 0 && IsFullGitOid(commit)
+      snap[p.name] = tolower(commit)
     endif
   endfor
-  if writefile([json_encode(snap)], path) != 0
-    echohl ErrorMsg
-    echom '[SimplePlug] failed to write snapshot: ' .. path
-    echohl None
+  if !WriteSnapshotAtomic(path, json_encode(snap))
     return
   endif
   echom printf('[SimplePlug] snapshot of %d plugins written to %s', len(snap), path)
 enddef
 
 export def Restore(file: string = '')
-  if !EnsureBackend()
-    return
-  endif
   var path = SnapshotPath(file)
   if !filereadable(path)
     echohl ErrorMsg
@@ -861,12 +964,12 @@ export def Restore(file: string = '')
     echohl None
     return
   endif
-  var snap: dict<any>
+  var snap: dict<string>
   try
-    snap = json_decode(join(readfile(path), "\n"))
+    snap = ReadSnapshot(path)
   catch
     echohl ErrorMsg
-    echom '[SimplePlug] invalid snapshot file: ' .. path
+    echom printf('[SimplePlug] invalid snapshot file %s: %s', path, v:exception)
     echohl None
     return
   endtry
@@ -878,6 +981,9 @@ export def Restore(file: string = '')
   endfor
   if empty(plugs)
     echom '[SimplePlug] snapshot matches no registered plugins'
+    return
+  endif
+  if !EnsureBackend()
     return
   endif
   var specs = PluginSpecs(plugs)
