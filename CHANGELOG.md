@@ -2,6 +2,14 @@
 
 ## Unreleased - 2026-08-05
 
+### 快照漂移审计
+
+- 新增只读 `:PlugSnapshotDiff [file]`：按插件名逐项稳定报告 matched、commit drift、
+  checkout 缺失、非 Git 目录、HEAD 不可读、已注册但未锁定，以及快照孤儿项；
+  不启动 daemon、不访问网络，也不会改动快照。
+- diff 与 restore 共用完整 JSON/OID 校验。无效或不可读文件在检查任何 checkout、
+  输出任何部分结果前即失败；回归同时钉住确定性排序与零写入行为。
+
 ### 事务型安全快照
 
 - `:PlugSnapshot` 保持原有 `name -> SHA` JSON 格式，但改为在目标旁原子创建

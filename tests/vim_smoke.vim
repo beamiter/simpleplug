@@ -6,6 +6,7 @@ g:simpleplug_auto_install = 0
 var root = fnamemodify(expand('<sfile>'), ':p:h:h')
 execute 'set runtimepath^=' .. fnameescape(root)
 execute 'source ' .. fnameescape(root .. '/plugin/simpleplug.vim')
+assert_equal(2, exists(':PlugSnapshotDiff'))
 
 var fixture = root .. '/tests/fixtures/lazy-plugin'
 simpleplug#Begin('/tmp/simpleplug-vim-smoke')
@@ -230,10 +231,19 @@ var snapshot_home = tempname()
 var snapshot_path = snapshot_home .. '/locks/plugins.json'
 mkdir(snapshot_home, 'p')
 mkdir(fnamemodify(snapshot_path, ':h'), 'p')
+mkdir(snapshot_home .. '/plain-directory', 'p')
 simpleplug#Begin('/tmp/simpleplug-vim-smoke')
 simpleplug#Plug('local/snapshot-fixture', {
   as: 'snapshot-fixture',
   dir: root,
+})
+simpleplug#Plug('local/missing-fixture', {
+  as: 'missing-fixture',
+  dir: snapshot_home .. '/not-a-checkout',
+})
+simpleplug#Plug('local/plain-fixture', {
+  as: 'plain-fixture',
+  dir: snapshot_home .. '/plain-directory',
 })
 
 # mkdir() raises E739 for an occupied candidate. Pre-claim the very first name
@@ -254,6 +264,38 @@ assert_equal([], readdir(occupied_stage), 'snapshot used an attacker-occupied st
 delete(occupied_stage, 'd')
 assert_equal([], globpath(fnamemodify(snapshot_path, ':h'), '.*.stage.*', 0, 1),
   'atomic snapshot left a staging directory behind')
+
+# SnapshotDiff is read-only and deterministic. A generated snapshot matches
+# the installed checkout while the registered non-checkout is explicitly
+# reported as unlocked rather than silently folded into another category.
+var clean_diff = execute('PlugSnapshotDiff ' .. fnameescape(snapshot_path))
+assert_match('matched=1 drifted=0 missing=0 non-git=0 unreadable=0 unlocked=2 orphaned=0', clean_diff)
+assert_match('\[matched\] snapshot-fixture current=', clean_diff)
+assert_match('\[unlocked\] missing-fixture (missing)', clean_diff)
+assert_match('\[unlocked\] plain-fixture (not-git)', clean_diff)
+var current_oid: string = snapshot_json['snapshot-fixture']
+var drift_oid = (current_oid[0] ==# '0' ? '1' : '0') .. strpart(current_oid, 1)
+var diff_snapshot = snapshot_home .. '/locks/diff.json'
+writefile([json_encode({
+  'z-orphan': repeat('a', 40),
+  'snapshot-fixture': drift_oid,
+  'missing-fixture': repeat('b', 40),
+  'plain-fixture': repeat('c', 40),
+})], diff_snapshot)
+var diff_before = readfile(diff_snapshot)
+var starts_before_diff = simpleplug#core#Health().starts
+var drift_output = execute('PlugSnapshotDiff ' .. fnameescape(diff_snapshot))
+assert_match('matched=0 drifted=1 missing=1 non-git=1 unreadable=0 unlocked=0 orphaned=1', drift_output)
+var missing_pos = match(drift_output, '\[missing\] missing-fixture')
+var plain_pos = match(drift_output, '\[not-git\] plain-fixture')
+var changed_pos = match(drift_output, '\[drifted\] snapshot-fixture')
+var orphan_pos = match(drift_output, '\[orphaned\] z-orphan')
+assert_true(missing_pos >= 0 && missing_pos < plain_pos && plain_pos < changed_pos
+    && changed_pos < orphan_pos,
+  'snapshot diff details were not sorted by plugin name: ' .. drift_output)
+assert_equal(diff_before, readfile(diff_snapshot), 'snapshot diff modified its input file')
+assert_equal(starts_before_diff, simpleplug#core#Health().starts,
+  'snapshot diff started the daemon')
 
 # A candidate symlink is another collision, never a directory to enter. Derive
 # the next nonce from script state so this remains stable if retries are added.
@@ -287,6 +329,16 @@ endif
 var invalid_snapshot = snapshot_home .. '/invalid.json'
 var backend_starts_before_invalid_restore = simpleplug#core#Health().starts
 writefile(['[]'], invalid_snapshot)
+var invalid_diff = execute('PlugSnapshotDiff ' .. fnameescape(invalid_snapshot))
+assert_match('snapshot root must be a JSON object', invalid_diff)
+assert_notmatch('snapshot diff:', invalid_diff,
+  'invalid snapshot produced a partial diff report')
+var missing_diff = execute('PlugSnapshotDiff ' .. fnameescape(snapshot_home .. '/absent.json'))
+assert_match('snapshot not found:', missing_diff)
+assert_notmatch('snapshot diff:', missing_diff,
+  'missing snapshot produced a partial diff report')
+assert_equal(backend_starts_before_invalid_restore, simpleplug#core#Health().starts,
+  'invalid or unreadable snapshot diff started the daemon')
 simpleplug#Restore(invalid_snapshot)
 assert_match('snapshot root must be a JSON object', execute('messages'))
 assert_equal(backend_starts_before_invalid_restore, simpleplug#core#Health().starts,

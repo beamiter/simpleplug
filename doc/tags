@@ -6,6 +6,7 @@
 :PlugRestart	simpleplug.txt	/*:PlugRestart*
 :PlugRestore	simpleplug.txt	/*:PlugRestore*
 :PlugSnapshot	simpleplug.txt	/*:PlugSnapshot*
+:PlugSnapshotDiff	simpleplug.txt	/*:PlugSnapshotDiff*
 :PlugStatus	simpleplug.txt	/*:PlugStatus*
 :PlugStop	simpleplug.txt	/*:PlugStop*
 :PlugUpdate	simpleplug.txt	/*:PlugUpdate*

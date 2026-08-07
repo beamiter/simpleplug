@@ -938,22 +938,120 @@ def WriteSnapshotAtomic(path: string, encoded: string): bool
 enddef
 
 
+def PluginCheckoutState(plugin: dict<any>): dict<string>
+  if !isdirectory(plugin.dir)
+    return {status: 'missing', oid: ''}
+  endif
+  if getftype(plugin.dir .. '/.git') ==# ''
+    return {status: 'not-git', oid: ''}
+  endif
+  var commit = trim(system('git -C ' .. shellescape(plugin.dir) .. ' rev-parse HEAD'))
+  return v:shell_error == 0 && IsFullGitOid(commit)
+    ? {status: 'ok', oid: tolower(commit)}
+    : {status: 'unreadable', oid: ''}
+enddef
+
+
 export def Snapshot(file: string = '')
   var path = SnapshotPath(file)
   var snap: dict<string> = {}
   for p in s_plugins
-    if getftype(p.dir .. '/.git') ==# ''
-      continue
-    endif
-    var commit = trim(system('git -C ' .. shellescape(p.dir) .. ' rev-parse HEAD'))
-    if v:shell_error == 0 && IsFullGitOid(commit)
-      snap[p.name] = tolower(commit)
+    var checkout = PluginCheckoutState(p)
+    if checkout.status ==# 'ok'
+      snap[p.name] = checkout.oid
     endif
   endfor
   if !WriteSnapshotAtomic(path, json_encode(snap))
     return
   endif
   echom printf('[SimplePlug] snapshot of %d plugins written to %s', len(snap), path)
+enddef
+
+
+export def SnapshotDiff(file: string = '')
+  var path = SnapshotPath(file)
+  if !filereadable(path)
+    echohl ErrorMsg
+    echom '[SimplePlug] snapshot not found: ' .. path
+    echohl None
+    return
+  endif
+
+  # Parse and validate the complete file before reading a checkout or printing
+  # a partial report. This shares Restore's strict legacy-format boundary and
+  # keeps a malformed lockfile completely side-effect free.
+  var snap: dict<string>
+  try
+    snap = ReadSnapshot(path)
+  catch
+    echohl ErrorMsg
+    echom printf('[SimplePlug] invalid snapshot file %s: %s', path, v:exception)
+    echohl None
+    return
+  endtry
+
+  var registered: dict<bool> = {}
+  var rows: list<dict<string>> = []
+  var matched = 0
+  var drifted = 0
+  var missing = 0
+  var non_git = 0
+  var unreadable = 0
+  var unlocked = 0
+  var orphaned = 0
+  for plugin in s_plugins
+    registered[plugin.name] = true
+    var checkout = PluginCheckoutState(plugin)
+    var actual = checkout.oid
+    if !has_key(snap, plugin.name)
+      unlocked += 1
+      rows->add({name: plugin.name, status: 'unlocked', expected: '', actual: actual,
+        reason: checkout.status})
+    elseif checkout.status ==# 'missing'
+      missing += 1
+      rows->add({name: plugin.name, status: 'missing', expected: snap[plugin.name], actual: '', reason: ''})
+    elseif checkout.status ==# 'not-git'
+      non_git += 1
+      rows->add({name: plugin.name, status: 'not-git', expected: snap[plugin.name], actual: '', reason: ''})
+    elseif checkout.status ==# 'unreadable'
+      unreadable += 1
+      rows->add({name: plugin.name, status: 'unreadable', expected: snap[plugin.name], actual: '', reason: ''})
+    elseif actual ==# snap[plugin.name]
+      matched += 1
+      rows->add({name: plugin.name, status: 'matched', expected: snap[plugin.name], actual: actual, reason: ''})
+    else
+      drifted += 1
+      rows->add({name: plugin.name, status: 'drifted', expected: snap[plugin.name], actual: actual, reason: ''})
+    endif
+  endfor
+  for name in keys(snap)
+    if !has_key(registered, name)
+      orphaned += 1
+      rows->add({name: name, status: 'orphaned', expected: snap[name], actual: '', reason: ''})
+    endif
+  endfor
+  rows->sort((left, right) => left.name ==# right.name ? 0 : (left.name <# right.name ? -1 : 1))
+
+  echom printf('[SimplePlug] snapshot diff: matched=%d drifted=%d missing=%d non-git=%d unreadable=%d unlocked=%d orphaned=%d',
+    matched, drifted, missing, non_git, unreadable, unlocked, orphaned)
+  for row in rows
+    if row.status ==# 'matched'
+      echom printf('  [matched] %s current=%s', row.name, row.actual)
+    elseif row.status ==# 'drifted'
+      echom printf('  [drifted] %s expected=%s current=%s', row.name, row.expected, row.actual)
+    elseif row.status ==# 'missing'
+      echom printf('  [missing] %s expected=%s (checkout directory absent)', row.name, row.expected)
+    elseif row.status ==# 'not-git'
+      echom printf('  [not-git] %s expected=%s (.git metadata absent)', row.name, row.expected)
+    elseif row.status ==# 'unreadable'
+      echom printf('  [unreadable] %s expected=%s (HEAD is not a full Git OID)', row.name, row.expected)
+    elseif row.status ==# 'unlocked'
+      echom printf('  [unlocked] %s%s', row.name,
+        row.actual !=# '' ? ' current=' .. row.actual : ' (' .. row.reason .. ')')
+    else
+      echom printf('  [orphaned] %s expected=%s (not registered)', row.name, row.expected)
+    endif
+  endfor
 enddef
 
 export def Restore(file: string = '')

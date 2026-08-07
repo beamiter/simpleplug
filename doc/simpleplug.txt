@@ -118,6 +118,16 @@ restoring the directory and repeating the trigger retries the load.
         are skipped without following them. A snapshot target that is itself a
         symbolic link is refused.
 
+                                                           *:PlugSnapshotDiff*
+:PlugSnapshotDiff [file]
+        Compare registered local checkouts with a snapshot without starting
+        the daemon, accessing the network, or changing the snapshot. The
+        complete legacy object is validated before any checkout is inspected
+        or output is printed. Results are sorted by plugin name and distinguish
+        matched entries, commit drift, a missing checkout, a non-Git directory,
+        an unreadable HEAD, a registered plugin absent from the snapshot
+        (unlocked), and an unregistered snapshot entry (orphaned).
+
                                                                 *:PlugRestore*
 :PlugRestore [file]
         Check every plugin out to the commit recorded in a snapshot.

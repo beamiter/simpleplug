@@ -9,6 +9,7 @@
 - 支持 `branch`、`tag`、`commit`（版本锁定）、`do`（post-install hook）、`frozen`（锁定不更新）
 - 支持 `for`（按文件类型延迟加载）、`on`（按命令或 `<Plug>` 映射延迟加载）
 - 快照与恢复：`:PlugSnapshot` 记录全部插件的精确 commit，`:PlugRestore` 一键回滚
+- 快照漂移审计：`:PlugSnapshotDiff` 只读检查 checkout 与锁文件是否一致
 - `:PlugInstall` / `:PlugUpdate` 可指定插件名（带补全），只操作选中的插件
 - 内置 UI 进度窗口，彩色状态显示
 - API 兼容 vim-plug 风格，迁移成本极低
@@ -67,6 +68,7 @@ simpleplug#End()
 | `:PlugClean!` | 跳过确认并执行安全清理 |
 | `:PlugStatus` | 查看所有插件状态（分支、commit、最近提交、是否有修改） |
 | `:PlugSnapshot [file]` | 把所有插件的精确 commit 写入快照文件 |
+| `:PlugSnapshotDiff [file]` | 只读比较当前 checkout 与快照，报告漂移及缺失项 |
 | `:PlugRestore [file]` | 将插件恢复到快照中记录的 commit |
 | `:PlugHook {name}` | 对指定插件执行 post-install hook |
 | `:PlugStop` | 停止当前后端任务 |
@@ -79,6 +81,11 @@ simpleplug#End()
 旧快照；写入或重命名失败不会破坏上一版，预置的同名目录/符号链接也不会被跟随。
 为避免锁文件被当作 Git 参数注入，恢复会在启动后台前校验整个对象：每个值必须
 是 40 位 SHA-1 或 64 位 SHA-256 十六进制 OID。快照目标本身若是符号链接会被拒绝。
+
+`:PlugSnapshotDiff` 使用同一套完整校验，但只读取本地 Git HEAD，不启动后台、
+不访问网络也不改动快照。结果按插件名排序并严格区分：已匹配、commit 漂移、
+已锁定但 checkout 缺失、目录非 Git、HEAD 不可读、已注册但未锁定，以及快照中
+已不再注册的孤儿项；matched 项也会逐项输出，结果可直接保存作审计记录。
 
 ## 选项
 
