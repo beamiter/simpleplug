@@ -10,7 +10,7 @@ const s_plugin_root = fnamemodify(expand('<sfile>'), ':p:h:h')
 # ─────────────────── 插件注册表 ───────────────────
 
 var s_plugins: list<dict<any>> = []
-# {name, repo, url, dir, branch, tag, commit, do, frozen, on_ft, on_cmd}
+# {name, repo, url, dir, rtp, branch, tag, commit, do, frozen, on_ft, on_cmd}
 
 var s_loaded_plugins: dict<bool> = {}
 var s_lazy_commands: list<string> = []
@@ -39,6 +39,85 @@ var s_ui_spinner_idx: number = 0
 var s_ui_spinner_timer: number = 0
 var s_auto_install_checked: bool = false
 const s_spinners = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+
+
+# A repository may keep its Vim runtime in a subdirectory (common in
+# monorepos).  Git operations always use plug.dir; loading and helptags use
+# this derived path.
+def RuntimeDir(plug: dict<any>): string
+  var rtp = get(plug, 'rtp', '')
+  return empty(rtp) ? plug.dir : plug.dir .. '/' .. rtp
+enddef
+
+
+def CanonicalPath(path: string): string
+  var canonical = substitute(simplify(resolve(fnamemodify(path, ':p'))), '\\', '/', 'g')
+  if canonical !=# '/' && canonical !~? '^\a:/$'
+    canonical = substitute(canonical, '/\+$', '', '')
+  endif
+  return canonical
+enddef
+
+
+# Lexical checks at registration catch malformed paths even before a plugin is
+# installed.  This canonical check is repeated immediately before every load,
+# so a runtime subdirectory replaced by an escaping symlink cannot be sourced.
+def IsInsideCheckout(path: string, checkout: string): bool
+  var candidate = CanonicalPath(path)
+  var root = CanonicalPath(checkout)
+  if has('win32') || has('win64')
+    candidate = tolower(candidate)
+    root = tolower(root)
+  endif
+  var prefix = root[-1 :] ==# '/' ? root : root .. '/'
+  return candidate ==# root || stridx(candidate, prefix) == 0
+enddef
+
+
+def RuntimeIssue(plug: dict<any>, message: string, warning: bool = false)
+  echohl {warning ? 'WarningMsg' : 'ErrorMsg'}
+  echom printf('[SimplePlug] %s %s', plug.name, message)
+  echohl None
+enddef
+
+
+def CheckedRuntimeDir(plug: dict<any>, missing_is_error: bool = false): string
+  var runtime_dir = RuntimeDir(plug)
+  if !isdirectory(runtime_dir)
+    RuntimeIssue(plug, 'runtime directory is missing: ' .. runtime_dir, !missing_is_error)
+    return ''
+  endif
+  if !IsInsideCheckout(runtime_dir, plug.dir)
+    RuntimeIssue(plug, printf('runtime directory escapes plugin directory: %s -> %s',
+      runtime_dir, CanonicalPath(runtime_dir)))
+    return ''
+  endif
+  return runtime_dir
+enddef
+
+
+def AddRuntimePath(runtime_dir: string)
+  if index(split(&runtimepath, ','), runtime_dir) < 0
+    &runtimepath = runtime_dir .. ',' .. &runtimepath
+  endif
+  # The after/ entry is independent: users may already have inserted the main
+  # runtime directory without its override directory.
+  var afterdir = runtime_dir .. '/after'
+  if isdirectory(afterdir) && index(split(&runtimepath, ','), afterdir) < 0
+    &runtimepath = &runtimepath .. ',' .. afterdir
+  endif
+enddef
+
+
+def RemoveRuntimePath(runtime_dir: string)
+  var kept: list<string> = []
+  for entry in split(&runtimepath, ',')
+    if entry !=# runtime_dir && entry !=# runtime_dir .. '/after'
+      add(kept, entry)
+    endif
+  endfor
+  &runtimepath = join(kept, ',')
+enddef
 
 # ─────────────────── UI 交互状态 ───────────────────
 
@@ -101,68 +180,79 @@ export def End()
   # 将所有已注册插件加入 runtimepath
   for plug in s_plugins
     if isdirectory(plug.dir)
-      if index(split(&runtimepath, ','), plug.dir) < 0
-        &runtimepath = plug.dir .. ',' .. &runtimepath
-        # after 目录
-        var afterdir = plug.dir .. '/after'
-        if isdirectory(afterdir) && index(split(&runtimepath, ','), afterdir) < 0
-          &runtimepath = &runtimepath .. ',' .. afterdir
-        endif
+      var runtime_dir = CheckedRuntimeDir(plug)
+      if empty(runtime_dir)
+        continue
       endif
+      AddRuntimePath(runtime_dir)
       # 加载插件
-      LoadPlugin(plug)
+      LoadPlugin(plug, runtime_dir)
     endif
   endfor
   filetype plugin indent on
   syntax enable
 enddef
 
-def LoadPlugin(plug: dict<any>)
+def LoadPlugin(plug: dict<any>, runtime_dir: string)
   if has_key(s_loaded_plugins, plug.name)
     return
   endif
   # 延迟插件必须保持未加载状态，直到对应事件真正触发。
   if !empty(get(plug, 'on_ft', '')) || !empty(get(plug, 'on_cmd', ''))
     s_loaded_plugins[plug.name] = false
-    SetupLazyLoad(plug)
+    SetupLazyLoad(plug, runtime_dir)
     return
   endif
   s_loaded_plugins[plug.name] = true
   # End() 也可能由用户在 VimEnter 之后调用，此时 Vim 不会再自动扫描 plugin/。
   if v:vim_did_enter
-    SourcePluginScripts(plug.dir)
+    SourcePluginScripts(runtime_dir)
   endif
 enddef
 
-def SetupLazyLoad(plug: dict<any>)
+def LazyTriggers(plug: dict<any>): list<string>
+  var result: list<string> = []
+  var configured = get(plug, 'on_cmd', '')
+  if type(configured) == v:t_string && configured !=# ''
+    add(result, configured)
+  elseif type(configured) == v:t_list
+    for trigger in configured
+      if type(trigger) == v:t_string && trigger !=# ''
+        add(result, trigger)
+      endif
+    endfor
+  endif
+  return result
+enddef
+
+
+def DefineLazyCommand(pname: string, command: string)
+  execute printf(
+    'command! -nargs=* -range -bang %s call simpleplug#LazyLoadCommand(%s, %s, <bang>0, <line1>, <line2>, <range>, <q-args>)',
+    command, string(pname), string(command))
+enddef
+
+
+def SetupLazyLoad(plug: dict<any>, pdir: string)
   var pname = plug.name
-  var pdir = plug.dir
 
   # on_ft 延迟加载
   var ft = get(plug, 'on_ft', '')
   if type(ft) == v:t_string && ft !=# ''
-    execute printf('autocmd SimplePlugLazy FileType %s ++once call simpleplug#LazyLoad("%s")', ft, pname)
+    execute printf('autocmd SimplePlugLazy FileType %s call simpleplug#LazyLoad(%s)', ft, string(pname))
   elseif type(ft) == v:t_list
     for f in ft
-      execute printf('autocmd SimplePlugLazy FileType %s ++once call simpleplug#LazyLoad("%s")', f, pname)
+      execute printf('autocmd SimplePlugLazy FileType %s call simpleplug#LazyLoad(%s)', f, string(pname))
     endfor
   endif
 
   # on_cmd 延迟加载：普通命令走 command stub，<Plug>/按键序列走 mapping stub
-  var cmd = get(plug, 'on_cmd', '')
-  var triggers: list<string> = []
-  if type(cmd) == v:t_string && cmd !=# ''
-    triggers = [cmd]
-  elseif type(cmd) == v:t_list
-    triggers = cmd
-  endif
-  for c in triggers
+  for c in LazyTriggers(plug)
     if c =~# '^<'
       SetupLazyMap(pname, c)
     else
       add(s_lazy_commands, c)
-      execute printf('command! -nargs=* -range -bang %s delcommand %s | call simpleplug#LazyLoad("%s") | %s<bang> <args>',
-        c, c, pname, c)
+      DefineLazyCommand(pname, c)
     endif
   endfor
 
@@ -179,16 +269,7 @@ def SetupLazyLoad(plug: dict<any>)
   augroup END
 
   # 从 rtp 里暂时移除
-  if index(split(&runtimepath, ','), pdir) >= 0
-    var parts = split(&runtimepath, ',')
-    var newparts: list<string> = []
-    for p in parts
-      if p !=# pdir && p !=# pdir .. '/after'
-        add(newparts, p)
-      endif
-    endfor
-    &runtimepath = join(newparts, ',')
-  endif
+  RemoveRuntimePath(pdir)
 enddef
 
 # <Plug> 映射延迟加载：先注册 stub，触发时卸载 stub、加载插件、重放按键。
@@ -203,41 +284,82 @@ def SetupLazyMap(pname: string, keys: string)
 enddef
 
 export def LazyLoadMap(name: string, keys: string, mode: string)
-  for md in ['n', 'x', 'o']
-    execute 'silent! ' .. md .. 'unmap ' .. keys
-  endfor
-  LazyLoad(name)
+  if !LazyLoad(name)
+    return
+  endif
   if mode ==# 'x'
     feedkeys('gv', 'n')
   endif
   feedkeys(substitute(keys, '\c^<Plug>', "\<Plug>", ''))
 enddef
 
-export def LazyLoad(name: string)
+
+export def LazyLoadCommand(
+    name: string,
+    command: string,
+    bang: number,
+    line1: number,
+    line2: number,
+    range_count: number,
+    args: string)
+  if !LazyLoad(name)
+    return
+  endif
+  if exists(':' .. command) != 2
+    echohl ErrorMsg
+    echom printf('[SimplePlug] %s loaded but did not define :%s', name, command)
+    echohl None
+    return
+  endif
+  var replay = range_count > 0 ? printf('%d,%d%s', line1, line2, command) : command
+  replay ..= bang ? '!' : ''
+  if args !=# ''
+    replay ..= ' ' .. args
+  endif
+  execute replay
+enddef
+
+
+def RemoveLazyStubs(plug: dict<any>)
+  for trigger in LazyTriggers(plug)
+    if trigger =~# '^<'
+      for md in ['n', 'x', 'o']
+        execute 'silent! ' .. md .. 'unmap ' .. trigger
+      endfor
+    elseif exists(':' .. trigger) == 2
+      execute 'silent! delcommand ' .. trigger
+    endif
+  endfor
+enddef
+
+
+export def LazyLoad(name: string): bool
   var plug = FindPlugin(name)
   if plug == {}
-    return
+    echohl ErrorMsg
+    echom '[SimplePlug] cannot lazy-load unknown plugin: ' .. name
+    echohl None
+    return false
   endif
   if get(s_loaded_plugins, name, false)
-    return
+    return true
+  endif
+
+  # Validate before removing a command/mapping stub or changing loaded state.
+  # A missing runtime may appear after an update; leaving the stub intact makes
+  # the next invocation a real retry instead of a permanently dead command.
+  var dir = CheckedRuntimeDir(plug, true)
+  if empty(dir)
+    return false
   endif
   s_loaded_plugins[name] = true
-
-  var dir = plug.dir
-  if !isdirectory(dir)
-    return
-  endif
+  RemoveLazyStubs(plug)
 
   # 重新加入 runtimepath
-  if index(split(&runtimepath, ','), dir) < 0
-    &runtimepath = dir .. ',' .. &runtimepath
-    var afterdir = dir .. '/after'
-    if isdirectory(afterdir)
-      &runtimepath = &runtimepath .. ',' .. afterdir
-    endif
-  endif
+  AddRuntimePath(dir)
 
   SourcePluginScripts(dir)
+  return true
 enddef
 
 def SourcePluginScripts(dir: string)
@@ -310,6 +432,47 @@ export def Plug(repo: string, opts: dict<any> = {})
     dir = g:simpleplug_dir .. '/' .. name
   endif
 
+  var rtp_value = get(opts, 'rtp', '')
+  if type(rtp_value) != v:t_string
+    echohl ErrorMsg
+    echom '[SimplePlug] rtp must be a relative directory for: ' .. name
+    echohl None
+    return
+  endif
+  if stridx(rtp_value, ',') >= 0
+    echohl ErrorMsg
+    echom '[SimplePlug] rtp must not contain a comma for: ' .. name
+    echohl None
+    return
+  endif
+  var rtp = substitute(rtp_value, '\\', '/', 'g')
+  if rtp =~# '^/' || rtp =~# '^\a:/'
+    echohl ErrorMsg
+    echom '[SimplePlug] rtp must stay inside the plugin directory: ' .. rtp_value
+    echohl None
+    return
+  endif
+  var rtp_parts = filter(split(rtp, '/'), (_, part) => part !=# '' && part !=# '.')
+  if index(rtp_parts, '..') >= 0
+    echohl ErrorMsg
+    echom '[SimplePlug] rtp must not contain ..: ' .. rtp_value
+    echohl None
+    return
+  endif
+  rtp = join(rtp_parts, '/')
+
+  # Existing local checkouts can be validated immediately.  Missing plugins
+  # are checked again by End()/LazyLoad() after installation.
+  var configured_runtime = empty(rtp) ? dir : dir .. '/' .. rtp
+  if isdirectory(dir) && isdirectory(configured_runtime)
+      && !IsInsideCheckout(configured_runtime, dir)
+    echohl ErrorMsg
+    echom printf('[SimplePlug] %s runtime directory escapes plugin directory: %s -> %s',
+      name, configured_runtime, CanonicalPath(configured_runtime))
+    echohl None
+    return
+  endif
+
   var branch = get(opts, 'branch', '')
   var tag = get(opts, 'tag', '')
   var commit = get(opts, 'commit', '')
@@ -329,6 +492,7 @@ export def Plug(repo: string, opts: dict<any> = {})
     repo: repo,
     url: url,
     dir: dir,
+    rtp: rtp,
     branch: branch,
     tag: tag,
     commit: commit,
@@ -607,7 +771,11 @@ enddef
 
 def GenerateHelptags()
   for p in s_plugins
-    var doc = p.dir .. '/doc'
+    var runtime_dir = RuntimeDir(p)
+    if !isdirectory(runtime_dir) || !IsInsideCheckout(runtime_dir, p.dir)
+      continue
+    endif
+    var doc = runtime_dir .. '/doc'
     if isdirectory(doc)
       execute 'silent! helptags ' .. fnameescape(doc)
     endif

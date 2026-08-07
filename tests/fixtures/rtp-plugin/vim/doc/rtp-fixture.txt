@@ -1,0 +1,8 @@
+*rtp-fixture.txt*  Nested runtime fixture
+
+This help file proves that SimplePlug exposes doc/ below an `rtp` subdirectory.
+
+                                                        *rtp-fixture-test*
+The fixture is intentionally small.
+
+vim:tw=78:ts=8:noet:ft=help:norl:

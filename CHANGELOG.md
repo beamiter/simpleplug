@@ -2,6 +2,19 @@
 
 ## Unreleased - 2026-08-05
 
+### Runtime 子目录
+
+- `Plug()` 新增向后兼容的 `rtp` 选项，可把仓库内的 `vim`、`editors/vim`
+  等相对子目录作为真正的 Vim runtime。普通加载、`for`/`on` 延迟加载、
+  `ftdetect`、`after/` 和 helptags 全部遵循该目录；Git 更新、hook、快照和清理
+  仍作用于完整 checkout。绝对路径及包含 `..` 或逗号的路径会在注册时被拒绝；
+  实际加载前还会解析符号链接并复查 containment，避免 runtimepath 分隔符注入和
+  checkout 外跳转。
+- `after/` 不再依赖主 runtime 是否由 SimplePlug 本次加入；lazy runtime 暂时缺失
+  时也不会提前标记 loaded 或永久删除 command/mapping stub，报错后可原地重试。
+- 新增 nested runtime fixture，覆盖 eager、command/`for` lazy、ftdetect、after、
+  help tags、缺目录重试、逗号与符号链接逃逸回归。
+
 ### 全套统一
 
 - `.simplecore/` 回来了。10 个仓库里的 supervisor(`autoload/<plugin>/core.vim`

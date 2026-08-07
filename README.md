@@ -1,4 +1,4 @@
-# SimplePlug 0.3
+# SimplePlug
 
 轻量、安全的 Vim9 插件管理器，使用 Rust/Tokio 后端执行可控并行 Git 操作。
 
@@ -42,6 +42,8 @@ simpleplug#Plug('neoclide/coc.nvim', {branch: 'release'})
 simpleplug#Plug('beamiter/simpletree', {do: './install.sh'})
 simpleplug#Plug('junegunn/fzf', {dir: '~/.fzf', do: './install --all'})
 simpleplug#Plug('example/shared-name', {as: 'shared-name-alt'})
+# 仓库里的 Vim runtime 位于子目录（monorepo / 多编辑器插件）
+simpleplug#Plug('example/editor-tools', {rtp: 'editors/vim'})
 
 # 版本锁定
 simpleplug#Plug('preservim/nerdtree', {tag: '7.1.2'})
@@ -96,11 +98,22 @@ g:simpleplug_hook_timeout  " post-hook 超时秒数 (默认 600)
 | `do` | 安装/更新后执行的 shell 命令 |
 | `frozen` | 设为 1 则 `:PlugUpdate` 跳过该插件 |
 | `dir` | 自定义安装目录 |
+| `rtp` | 相对仓库根目录的 Vim runtime 子目录，例如 `vim` 或 `editors/vim` |
 | `as` | 自定义插件名，用于解决同名仓库冲突 |
 | `for` | 按文件类型延迟加载（字符串或列表；插件自带 ftdetect 会预先生效） |
 | `on` | 按命令或 `<Plug>` 映射延迟加载（字符串或列表） |
 
 版本锁定优先级：`commit` > `tag` > `branch`。
+
+`rtp` 只改变加入 `'runtimepath'`、延迟加载和生成 helptags 时使用的目录；
+clone、update、snapshot、hook 与 clean 仍以完整仓库目录为单位。为避免插件逃出
+自己的 checkout，`rtp` 必须是相对路径，不能包含 `..` 或逗号；目录存在时还会
+在每次实际加载前解析符号链接，确认最终路径仍位于 checkout 内。`after/` 会独立
+加入 `'runtimepath'`，即使主 runtime 已由其他配置预先加入也不会漏掉。
+
+若 `on` / `for` 延迟加载触发时 `rtp` 目录暂时不存在（例如刚切换到目录结构不同
+的分支），SimplePlug 会给出明确错误并保留命令或映射 stub 及未加载状态；目录恢复
+后再次触发即可重试，不需要重启 Vim。
 
 ## 更新与清理安全
 

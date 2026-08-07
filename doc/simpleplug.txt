@@ -40,6 +40,8 @@ re-sourcing your vimrc is safe.
 
 simpleplug#End() adds every installed plugin to 'runtimepath' (including its
 after/ directory), sources non-lazy plugins, and enables filetype and syntax.
+For a plugin with `rtp`, the configured subdirectory is used instead of the
+checkout root.
 
 ==============================================================================
 3. PLUGIN OPTIONS                                         *simpleplug-options*
@@ -49,6 +51,9 @@ a local path, plus an optional dictionary:
 
   as        Install under a different directory name.
   dir       Use this exact directory instead of one under g:simpleplug_dir.
+  rtp       Vim runtime below the checkout root, for example "vim" or
+            "editors/vim". Must be relative and may not contain ".." or a
+            comma.
   branch    Track this branch.
   tag       Pin to this tag.
   commit    Pin to this exact commit.
@@ -64,6 +69,19 @@ when that fails.
 `for` sources the plugin's ftdetect/ files eagerly, so a filetype the plugin
 itself defines can still trigger the load. `on` with a <Plug> mapping installs
 a stub that loads the plugin and replays the key on first use.
+
+`rtp` affects 'runtimepath', eager/lazy script loading, ftdetect and helptags.
+Git operations, hooks, snapshots and cleanup still operate on the checkout
+root. This makes monorepos and multi-editor repositories first-class without
+weakening SimplePlug's directory safety checks. Existing runtime directories
+are resolved before every load; a symlink whose final target leaves the
+checkout is rejected. Its after/ directory is added independently even when
+the main runtime entry was already present.
+
+If an `on` or `for` trigger fires while its runtime directory is temporarily
+missing, SimplePlug reports the path and keeps the plugin unloaded. Command
+and mapping stubs remain usable, and FileType triggers remain registered, so
+restoring the directory and repeating the trigger retries the load.
 
 ==============================================================================
 4. COMMANDS                                              *simpleplug-commands*
