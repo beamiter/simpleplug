@@ -83,6 +83,14 @@ simpleplug#End()
 `.git` 目录本身不算装好：clone 被中途杀掉（安装途中退出 Vim 就会）留下的半成品
 会被识别出来并重新 clone，而不是永远报告 "already installed"。
 
+重新 clone 会删目录，所以只在三个条件同时成立时才做：git 真的跑起来并给出了结论
+（git 不在 `PATH` 上、超时、或拒绝读这个 checkout —— 目录属于别的用户、`.git`
+不可读或指向已经不存在的 gitdir —— 都只报错，目录原封不动）；git 确认 `.git` 是仓库
+且 HEAD 不指向任何提交；`git status` 报告工作区是空的。半成品 clone 还没来得及 checkout
+任何文件，所以里面要是有东西那就是你的，这时报 `dirty` 并跳过。上游本身还没有提交的
+仓库同样是 unborn HEAD，但那是一次完成了的 clone，会被当作装好，不会每次都重新 clone；
+下次 `:PlugUpdate` 时上游有了第一个提交就直接采用。
+
 脚本化用法：`:PlugInstall!` 会阻塞到操作结束（上限 `g:simpleplug_sync_timeout` 秒，
 CTRL-C 可中断），所以标准的无头引导可以直接写成
 

@@ -379,16 +379,41 @@ async fn run_with_timeout(
     }
 }
 
-async fn run_git(dir: &str, args: &[&str]) -> Result<String, String> {
+/// What a `git` invocation actually established.
+///
+/// Most callers only care whether it worked, and `run_git` still gives them a
+/// plain `Result`.  Anything that is about to *delete* a directory does not
+/// have that luxury: collapsing "git ran and said no" into the same `Err` as
+/// "git never ran at all" is how a git that is not on PATH came to look
+/// exactly like an unusable checkout.
+enum GitOutcome {
+    Ok(String),
+    /// git ran and exited non-zero.  The payload is git's own stderr, so it is
+    /// a verdict about the repository.
+    Failed(String),
+    /// git produced no verdict: not on PATH, not executable, or killed by the
+    /// timeout.  Says nothing whatsoever about the repository.
+    Unavailable(String),
+}
+
+async fn try_git(dir: &str, args: &[&str]) -> GitOutcome {
     let mut cmd = Command::new("git");
     cmd.args(args).current_dir(dir);
-    let output = run_with_timeout(cmd, "git", git_timeout()).await?;
+    match run_with_timeout(cmd, "git", git_timeout()).await {
+        Err(e) => GitOutcome::Unavailable(e),
+        Ok(output) if output.status.success() => {
+            GitOutcome::Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        }
+        Ok(output) => {
+            GitOutcome::Failed(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        }
+    }
+}
 
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        Err(stderr)
+async fn run_git(dir: &str, args: &[&str]) -> Result<String, String> {
+    match try_git(dir, args).await {
+        GitOutcome::Ok(out) => Ok(out),
+        GitOutcome::Failed(e) | GitOutcome::Unavailable(e) => Err(e),
     }
 }
 
@@ -418,34 +443,121 @@ async fn git_clone(url: &str, dir: &str, refname: &str) -> Result<(), String> {
     }
 }
 
-/// Does this directory hold a checkout we can actually use?
+/// What a plugin directory actually is.
 ///
-/// A `.git` entry is not proof of one.  `git clone` creates the target and its
-/// `.git` before the objects finish transferring, and the partial-directory
-/// cleanup below only runs on `clone_plugin`'s Err path — which never executes
-/// when the process is killed instead of failing.  `:PlugStop` and VimLeavePre
-/// both send SIGTERM, so an install interrupted by quitting Vim leaves exactly
-/// that: a directory every later `:PlugInstall` calls "already installed" and
-/// every `:PlugUpdate` trips over with an obscure git error.
+/// A `.git` entry is not proof of a usable checkout.  `git clone` creates the
+/// target and its `.git` before the objects finish transferring, and the
+/// partial-directory cleanup in `clone_plugin` only runs on its Err path —
+/// which never executes when the process is killed instead of failing.
+/// `:PlugStop` and VimLeavePre both send SIGTERM, so an install interrupted by
+/// quitting Vim leaves exactly that.
 ///
-/// `--resolve-git-dir` comes first because a `.git` that is not a valid
-/// repository makes git's discovery walk *up*: without it, a plugged/ tree
-/// inside a dotfiles repository would answer with that repository's HEAD and
-/// the broken checkout would still look healthy.
-async fn git_checkout_is_valid(dir: &str) -> bool {
+/// The one thing this must never do is answer `Interrupted` when it does not
+/// know, because `Interrupted` is what authorises `remove_dir_all`.
+enum CheckoutState {
+    /// Nothing here that git would call a repository.
+    Missing,
+    /// A checkout whose HEAD resolves to a commit.
+    Valid,
+    /// git resolved `.git`, HEAD names no commit, and the clone that produced
+    /// it never finished.  Only a re-clone fixes this.
+    Interrupted,
+    /// The same unborn HEAD, but the clone *did* finish: the upstream simply
+    /// has no commits yet.  Re-cloning would land right back here, forever.
+    EmptyUpstream,
+    /// git could not answer.  It is not on PATH, it timed out, or it refuses
+    /// to treat the directory as a repository — dubious ownership on a tree
+    /// owned by another uid, an unreadable `.git`, a `.git` file pointing at a
+    /// gitdir that is gone.  None of that is evidence about the user's files,
+    /// so none of it may delete them.
+    Undetermined(String),
+}
+
+async fn git_checkout_state(dir: &str) -> CheckoutState {
     let gitdir = Path::new(dir).join(".git");
+    if !gitdir.exists() {
+        return CheckoutState::Missing;
+    }
     let Some(gitdir) = gitdir.to_str() else {
+        return CheckoutState::Undetermined(format!("{dir}/.git is not valid UTF-8"));
+    };
+    // `--resolve-git-dir` comes first because a `.git` that is not a valid
+    // repository makes git's discovery walk *up*: without it, a plugged/ tree
+    // inside a dotfiles repository would answer with that repository's HEAD
+    // and a broken checkout would still look healthy.
+    match try_git(dir, &["rev-parse", "--resolve-git-dir", gitdir]).await {
+        GitOutcome::Ok(_) => {}
+        GitOutcome::Failed(e) | GitOutcome::Unavailable(e) => {
+            return CheckoutState::Undetermined(e);
+        }
+    }
+    match try_git(dir, &["rev-parse", "--verify", "HEAD"]).await {
+        GitOutcome::Ok(_) => CheckoutState::Valid,
+        GitOutcome::Unavailable(e) => CheckoutState::Undetermined(e),
+        GitOutcome::Failed(_) if clone_completed(dir).await => CheckoutState::EmptyUpstream,
+        GitOutcome::Failed(_) => CheckoutState::Interrupted,
+    }
+}
+
+/// Did the `git clone` that produced this directory run to completion?
+///
+/// `git clone` writes `remote.origin.url` before it fetches, but the
+/// `branch.<name>.remote` pair only afterwards, once HEAD has been pointed at
+/// the branch it fetched.  An unborn HEAD *with* that config is therefore a
+/// finished clone of a repository that has no commits yet, not a transfer that
+/// was killed halfway through.
+async fn clone_completed(dir: &str) -> bool {
+    let Ok(branch) = run_git(dir, &["symbolic-ref", "--quiet", "--short", "HEAD"]).await else {
         return false;
     };
-    if run_git(dir, &["rev-parse", "--resolve-git-dir", gitdir])
-        .await
-        .is_err()
-    {
+    if branch.is_empty() {
         return false;
     }
-    run_git(dir, &["rev-parse", "--verify", "HEAD"])
-        .await
-        .is_ok()
+    run_git(
+        dir,
+        &["config", "--get", &format!("branch.{branch}.remote")],
+    )
+    .await
+    .is_ok()
+}
+
+/// Is there anything in this working tree that a re-clone would destroy?
+///
+/// Fails closed.  An answer git could not give is not permission to delete: on
+/// an unborn HEAD `git status --porcelain` still lists every untracked file,
+/// so a genuinely interrupted clone — which never got as far as checking
+/// anything out — is the only thing that comes back empty.
+async fn worktree_has_local_changes(dir: &str) -> Result<bool, String> {
+    match try_git(dir, &["status", "--porcelain"]).await {
+        GitOutcome::Ok(out) => Ok(!out.is_empty()),
+        GitOutcome::Failed(e) | GitOutcome::Unavailable(e) => Err(e),
+    }
+}
+
+/// A checkout of a repository that had no commits when it was cloned.  Fetch
+/// once: if the upstream has since grown a branch, adopt it; otherwise there is
+/// still nothing to update to, and saying so beats re-cloning it every run.
+async fn adopt_first_upstream_commit(dir: &str) -> Result<Option<String>, String> {
+    let Some(branch) = git_remote_head_branch(dir).await else {
+        return Ok(None);
+    };
+    let tip = git_fetch_branch(dir, &branch).await?;
+    run_git(dir, &["checkout", "-B", &branch, &tip]).await?;
+    git_ensure_fetch_refspec(dir, &branch).await;
+    let _ = run_git(
+        dir,
+        &[
+            "branch",
+            "--set-upstream-to",
+            &format!("origin/{branch}"),
+            &branch,
+        ],
+    )
+    .await;
+    Ok(Some(format!(
+        "adopted origin/{branch} at {}",
+        short_commit(&tip)
+    )))
 }
 
 fn short_commit(commit: &str) -> &str {
@@ -829,8 +941,9 @@ async fn handle_install(
             let _guard = lock.lock().await;
 
             let dir_path = PathBuf::from(&p.dir);
-            if dir_path.join(".git").exists() {
-                if git_checkout_is_valid(&p.dir).await {
+            match git_checkout_state(&p.dir).await {
+                CheckoutState::Missing => {}
+                CheckoutState::Valid => {
                     send_event(
                         &tx,
                         &Event::Progress {
@@ -843,31 +956,92 @@ async fn handle_install(
                     .await;
                     return OperationResult::Already;
                 }
-                // An interrupted clone. Nothing here is salvageable — the
-                // objects that would let `git fetch` resume are the ones that
-                // never arrived — so start over from an empty directory.
-                send_event(
-                    &tx,
-                    &Event::Progress {
-                        id,
-                        name: p.name.clone(),
-                        status: "working".into(),
-                        message: "incomplete checkout; re-cloning".into(),
-                    },
-                )
-                .await;
-                if let Err(e) = tokio::fs::remove_dir_all(&dir_path).await {
+                CheckoutState::EmptyUpstream => {
+                    send_event(
+                        &tx,
+                        &Event::Progress {
+                            id,
+                            name: p.name.clone(),
+                            status: "already".into(),
+                            message: "already installed; upstream has no commits yet".into(),
+                        },
+                    )
+                    .await;
+                    return OperationResult::Already;
+                }
+                CheckoutState::Undetermined(e) => {
                     send_event(
                         &tx,
                         &Event::Progress {
                             id,
                             name: p.name.clone(),
                             status: "error".into(),
-                            message: format!("cannot remove incomplete checkout: {e}"),
+                            message: format!("cannot inspect checkout: {e}"),
                         },
                     )
                     .await;
                     return OperationResult::Error;
+                }
+                CheckoutState::Interrupted => {
+                    // An interrupted clone. Nothing here is salvageable — the
+                    // objects that would let `git fetch` resume are the ones
+                    // that never arrived — so start over from an empty
+                    // directory. But only once we know the directory holds
+                    // nothing of the user's.
+                    match worktree_has_local_changes(&p.dir).await {
+                        Ok(false) => {}
+                        Ok(true) => {
+                            send_event(
+                                &tx,
+                                &Event::Progress {
+                                    id,
+                                    name: p.name.clone(),
+                                    status: "dirty".into(),
+                                    message:
+                                        "incomplete checkout holds local files; not re-cloning"
+                                            .into(),
+                                },
+                            )
+                            .await;
+                            return OperationResult::Error;
+                        }
+                        Err(e) => {
+                            send_event(
+                                &tx,
+                                &Event::Progress {
+                                    id,
+                                    name: p.name.clone(),
+                                    status: "error".into(),
+                                    message: format!("cannot check for local changes: {e}"),
+                                },
+                            )
+                            .await;
+                            return OperationResult::Error;
+                        }
+                    }
+                    send_event(
+                        &tx,
+                        &Event::Progress {
+                            id,
+                            name: p.name.clone(),
+                            status: "working".into(),
+                            message: "incomplete checkout; re-cloning".into(),
+                        },
+                    )
+                    .await;
+                    if let Err(e) = tokio::fs::remove_dir_all(&dir_path).await {
+                        send_event(
+                            &tx,
+                            &Event::Progress {
+                                id,
+                                name: p.name.clone(),
+                                status: "error".into(),
+                                message: format!("cannot remove incomplete checkout: {e}"),
+                            },
+                        )
+                        .await;
+                        return OperationResult::Error;
+                    }
                 }
             }
 
@@ -979,12 +1153,110 @@ async fn handle_update(
             let _guard = lock.lock().await;
 
             let dir_path = PathBuf::from(&p.dir);
-            if !git_checkout_is_valid(&p.dir).await {
+            let state = git_checkout_state(&p.dir).await;
+            let interrupted = matches!(state, CheckoutState::Interrupted);
+            match state {
+                CheckoutState::Valid => {}
+                CheckoutState::Undetermined(e) => {
+                    // git could not tell us what this directory is. Every git
+                    // command below would fail with something the user cannot
+                    // act on, and deleting it on a non-answer is how
+                    // uncommitted work disappears.
+                    send_event(
+                        &tx,
+                        &Event::Progress {
+                            id,
+                            name: p.name.clone(),
+                            status: "error".into(),
+                            message: format!("cannot inspect checkout: {e}"),
+                        },
+                    )
+                    .await;
+                    return OperationResult::Error;
+                }
+                CheckoutState::EmptyUpstream => {
+                    return match adopt_first_upstream_commit(&p.dir).await {
+                        Ok(Some(msg)) => {
+                            send_event(
+                                &tx,
+                                &Event::Progress {
+                                    id,
+                                    name: p.name.clone(),
+                                    status: "updated".into(),
+                                    message: msg,
+                                },
+                            )
+                            .await;
+                            OperationResult::Updated
+                        }
+                        Ok(None) => {
+                            send_event(
+                                &tx,
+                                &Event::Progress {
+                                    id,
+                                    name: p.name.clone(),
+                                    status: "already".into(),
+                                    message: "upstream has no commits yet".into(),
+                                },
+                            )
+                            .await;
+                            OperationResult::Already
+                        }
+                        Err(e) => {
+                            send_event(
+                                &tx,
+                                &Event::Progress {
+                                    id,
+                                    name: p.name.clone(),
+                                    status: "error".into(),
+                                    message: e,
+                                },
+                            )
+                            .await;
+                            OperationResult::Error
+                        }
+                    };
+                }
+                CheckoutState::Missing | CheckoutState::Interrupted => {}
+            }
+            if !matches!(state, CheckoutState::Valid) {
                 // A .git without a resolvable HEAD is an interrupted clone, not
-                // a repository to pull into: every git command below would fail
-                // with something the user cannot act on. Re-clone it instead.
-                let interrupted = dir_path.join(".git").exists();
+                // a repository to pull into. Re-clone it — but the dirty-
+                // worktree guard below is worthless if the directory is gone
+                // before it runs, so ask first whether there is anything here
+                // the user has not committed.
                 if interrupted {
+                    match worktree_has_local_changes(&p.dir).await {
+                        Ok(false) => {}
+                        Ok(true) => {
+                            send_event(
+                                &tx,
+                                &Event::Progress {
+                                    id,
+                                    name: p.name.clone(),
+                                    status: "dirty".into(),
+                                    message:
+                                        "incomplete checkout holds local files; not re-cloning"
+                                            .into(),
+                                },
+                            )
+                            .await;
+                            return OperationResult::Error;
+                        }
+                        Err(e) => {
+                            send_event(
+                                &tx,
+                                &Event::Progress {
+                                    id,
+                                    name: p.name.clone(),
+                                    status: "error".into(),
+                                    message: format!("cannot check for local changes: {e}"),
+                                },
+                            )
+                            .await;
+                            return OperationResult::Error;
+                        }
+                    }
                     send_event(
                         &tx,
                         &Event::Progress {
@@ -1090,18 +1362,34 @@ async fn handle_update(
                 return OperationResult::Already;
             }
 
-            if git_is_dirty(&p.dir).await {
-                send_event(
-                    &tx,
-                    &Event::Progress {
-                        id,
-                        name: p.name.clone(),
-                        status: "dirty".into(),
-                        message: "local changes detected; update skipped".into(),
-                    },
-                )
-                .await;
-                return OperationResult::Error;
+            match worktree_has_local_changes(&p.dir).await {
+                Ok(false) => {}
+                Ok(true) => {
+                    send_event(
+                        &tx,
+                        &Event::Progress {
+                            id,
+                            name: p.name.clone(),
+                            status: "dirty".into(),
+                            message: "local changes detected; update skipped".into(),
+                        },
+                    )
+                    .await;
+                    return OperationResult::Error;
+                }
+                Err(e) => {
+                    send_event(
+                        &tx,
+                        &Event::Progress {
+                            id,
+                            name: p.name.clone(),
+                            status: "error".into(),
+                            message: format!("cannot check for local changes: {e}"),
+                        },
+                    )
+                    .await;
+                    return OperationResult::Error;
+                }
             }
 
             let old_commit = git_current_commit(&p.dir).await;
@@ -1830,7 +2118,10 @@ mod tests {
         let workdir = make_interrupted_clone("interrupted-install");
         let dest = workdir.0.join("plugin");
         assert!(dest.join(".git").exists());
-        assert!(!git_checkout_is_valid(dest.to_str().unwrap()).await);
+        assert!(matches!(
+            git_checkout_state(dest.to_str().unwrap()).await,
+            CheckoutState::Interrupted
+        ));
 
         let plugin = spec(
             "interrupted-plugin",
@@ -1848,7 +2139,10 @@ mod tests {
         );
         assert!(events.iter().any(|e| e["status"] == "installed"));
         assert!(dest.join("plugin.txt").exists());
-        assert!(git_checkout_is_valid(dest.to_str().unwrap()).await);
+        assert!(matches!(
+            git_checkout_state(dest.to_str().unwrap()).await,
+            CheckoutState::Valid
+        ));
     }
 
     #[tokio::test]
@@ -1873,7 +2167,10 @@ mod tests {
         );
         assert!(events.iter().any(|e| e["status"] == "installed"));
         assert!(dest.join("plugin.txt").exists());
-        assert!(git_checkout_is_valid(dest.to_str().unwrap()).await);
+        assert!(matches!(
+            git_checkout_state(dest.to_str().unwrap()).await,
+            CheckoutState::Valid
+        ));
     }
 
     /// The repair must not fire on a healthy checkout — including one nested
@@ -1913,6 +2210,210 @@ mod tests {
         // broken rather than answering with the enclosing repository's HEAD.
         std::fs::remove_dir_all(dest.join(".git")).unwrap();
         std::fs::create_dir_all(dest.join(".git")).unwrap();
-        assert!(!git_checkout_is_valid(dest.to_str().unwrap()).await);
+        assert!(matches!(
+            git_checkout_state(dest.to_str().unwrap()).await,
+            CheckoutState::Undetermined(_)
+        ));
+    }
+
+    /// A git that never produced a verdict must not look like a verdict.
+    /// `run_git` used to collapse "git exited non-zero" and "git could not be
+    /// started at all" into the same `Err`, and the re-clone path read that as
+    /// licence to delete the directory.
+    #[tokio::test]
+    async fn a_git_that_cannot_run_is_not_a_verdict() {
+        // A working directory that does not exist makes the spawn itself fail,
+        // which is the same failure class as a git that is not on PATH.
+        assert!(matches!(
+            try_git("/nonexistent-simpleplug-test-dir", &["--version"]).await,
+            GitOutcome::Unavailable(_)
+        ));
+        let temp = TestDir::new("verdict");
+        git(&temp.0, &["init", "-q"]);
+        assert!(matches!(
+            try_git(temp.0.to_str().unwrap(), &["rev-parse", "--verify", "HEAD"]).await,
+            GitOutcome::Failed(_)
+        ));
+    }
+
+    /// git refusing to read the directory is not evidence about the directory.
+    /// A `.git` file pointing at a gitdir that is gone is the shape "dubious
+    /// ownership" and an unreadable `.git` also take: `rev-parse` exits
+    /// non-zero without ever saying the checkout is broken.
+    #[tokio::test]
+    async fn update_will_not_delete_a_checkout_git_cannot_read() {
+        let workdir = TestDir::new("unreadable");
+        let dest = workdir.0.join("plugin");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(
+            dest.join(".git"),
+            "gitdir: /nonexistent-simpleplug-gitdir\n",
+        )
+        .unwrap();
+        std::fs::write(dest.join("MYNOTES.txt"), "local work\n").unwrap();
+
+        assert!(matches!(
+            git_checkout_state(dest.to_str().unwrap()).await,
+            CheckoutState::Undetermined(_)
+        ));
+
+        let plugin = spec(
+            "unreadable-plugin",
+            "https://example.invalid/x/y",
+            dest.to_str().unwrap(),
+        );
+        let locks = Arc::new(RwLock::new(HashMap::new()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        handle_update(25, vec![plugin.clone()], 1, &tx, &locks).await;
+        let events = drain_events(&mut rx).await;
+        assert!(
+            events.iter().any(|e| e["status"] == "error"),
+            "an unreadable checkout was not reported: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("re-cloning"))),
+            "an unreadable checkout was treated as an interrupted clone: {events:?}"
+        );
+        assert!(
+            dest.join("MYNOTES.txt").exists(),
+            "update deleted a checkout git could not read"
+        );
+
+        handle_install(26, vec![plugin], 1, &tx, &locks).await;
+        drain_events(&mut rx).await;
+        assert!(
+            dest.join("MYNOTES.txt").exists(),
+            "install deleted a checkout git could not read"
+        );
+    }
+
+    /// The re-clone is a `remove_dir_all`, so the dirty-worktree guard has to
+    /// run before it, not after: an interrupted clone the user has since put
+    /// files into is not disposable.
+    #[tokio::test]
+    async fn a_re_clone_never_takes_local_files_with_it() {
+        let origin = make_origin("localfiles-origin");
+        let workdir = make_interrupted_clone("localfiles");
+        let dest = workdir.0.join("plugin");
+        std::fs::write(dest.join("MYNOTES.txt"), "local work\n").unwrap();
+        assert!(matches!(
+            git_checkout_state(dest.to_str().unwrap()).await,
+            CheckoutState::Interrupted
+        ));
+
+        let plugin = spec(
+            "localfiles-plugin",
+            origin.0.to_str().unwrap(),
+            dest.to_str().unwrap(),
+        );
+        let locks = Arc::new(RwLock::new(HashMap::new()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        handle_update(27, vec![plugin.clone()], 1, &tx, &locks).await;
+        let events = drain_events(&mut rx).await;
+        assert!(
+            events.iter().any(|e| e["status"] == "dirty"),
+            "the user was not told why the plugin was left alone: {events:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join("MYNOTES.txt")).unwrap(),
+            "local work\n",
+            "update re-cloned over the user's own files"
+        );
+
+        handle_install(28, vec![plugin], 1, &tx, &locks).await;
+        drain_events(&mut rx).await;
+        assert_eq!(
+            std::fs::read_to_string(dest.join("MYNOTES.txt")).unwrap(),
+            "local work\n",
+            "install re-cloned over the user's own files"
+        );
+    }
+
+    fn make_empty_origin(label: &str) -> TestDir {
+        let origin = TestDir::new(label);
+        git(&origin.0, &["init", "-q", "-b", "main", "--bare"]);
+        origin
+    }
+
+    /// A clone of a repository with no commits also has an unborn HEAD, but it
+    /// is a finished clone: calling it an interrupted one re-clones it on every
+    /// single run and the cycle never converges.
+    #[tokio::test]
+    async fn an_empty_upstream_is_not_an_interrupted_clone() {
+        let origin = make_empty_origin("empty-origin");
+        let workdir = TestDir::new("empty-dest");
+        let dest = workdir.0.join("plugin");
+        let plugin = spec(
+            "empty-plugin",
+            origin.0.to_str().unwrap(),
+            dest.to_str().unwrap(),
+        );
+        let locks = Arc::new(RwLock::new(HashMap::new()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+
+        handle_install(29, vec![plugin.clone()], 1, &tx, &locks).await;
+        drain_events(&mut rx).await;
+        assert!(matches!(
+            git_checkout_state(dest.to_str().unwrap()).await,
+            CheckoutState::EmptyUpstream
+        ));
+
+        // Second install: settled, not re-cloned.
+        handle_install(30, vec![plugin.clone()], 1, &tx, &locks).await;
+        let events = drain_events(&mut rx).await;
+        assert!(
+            events.iter().any(|e| e["status"] == "already"),
+            "an empty upstream was re-cloned instead of settling: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("re-cloning"))),
+            "an empty upstream was reported as an incomplete checkout: {events:?}"
+        );
+
+        // An update has nothing to fetch yet, and says so.
+        handle_update(31, vec![plugin.clone()], 1, &tx, &locks).await;
+        let events = drain_events(&mut rx).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| e["status"] == "already" && e["message"] == "upstream has no commits yet"),
+            "an empty upstream was not reported plainly on update: {events:?}"
+        );
+
+        // ...and once the upstream grows a first commit, the update adopts it.
+        let seed = TestDir::new("empty-seed");
+        git(
+            &seed.0,
+            &["clone", "-q", origin.0.to_str().unwrap(), "work"],
+        );
+        let work = seed.0.join("work");
+        git(&work, &["config", "user.name", "SimplePlug Test"]);
+        git(
+            &work,
+            &["config", "user.email", "simpleplug@example.invalid"],
+        );
+        std::fs::write(work.join("plugin.txt"), "first\n").unwrap();
+        git(&work, &["add", "plugin.txt"]);
+        git(&work, &["commit", "-qm", "first"]);
+        git(&work, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+
+        handle_update(32, vec![plugin], 1, &tx, &locks).await;
+        let events = drain_events(&mut rx).await;
+        assert!(
+            !events.iter().any(|e| e["status"] == "error"),
+            "adopting the first upstream commit failed: {events:?}"
+        );
+        assert!(
+            dest.join("plugin.txt").exists(),
+            "the first upstream commit was never checked out: {events:?}"
+        );
+        assert!(matches!(
+            git_checkout_state(dest.to_str().unwrap()).await,
+            CheckoutState::Valid
+        ));
     }
 }

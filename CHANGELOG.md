@@ -2,6 +2,31 @@
 
 ## Unreleased - 2026-08-08
 
+### 重新 clone 不再吃掉未提交的工作
+
+- 修复（数据丢失）：`git_checkout_is_valid()` 把"git 说这不是个能用的 checkout"和
+  "git 根本没跑起来"折叠成同一个 `false`，而 `handle_update` 把它当成
+  `remove_dir_all` 的许可，并且这一步排在既有的 dirty 检查之前。于是一个
+  `PATH` 里没有 git 的 GUI Vim（或 git 装坏了、容器里没装 git、git 超时）
+  执行 `:PlugUpdate`，会先把插件目录连同里面未提交的改动一起删掉，再报
+  "exec git clone: No such file or directory"。`:PlugInstall` 走同一个判断，
+  同样会删。
+- 现在 `run_git` 之下分出 `GitOutcome::{Ok,Failed,Unavailable}`，checkout 的判定
+  也从一个 bool 变成 `CheckoutState::{Missing,Valid,Interrupted,EmptyUpstream,
+  Undetermined}`。只有 `Interrupted`——git 确认 `.git` 是仓库、且 HEAD 不指向任何
+  提交——才允许删除；git 给不出结论（不在 PATH 上、超时、dubious ownership、
+  `.git` 不可读或指向已不存在的 gitdir）一律报错并原样保留目录。
+- 删除之前先跑 dirty 检查，不是之后：半成品 clone 还没 checkout 过任何文件，
+  工作区里但凡有东西就是用户的，这时报 `dirty` 并跳过。`git status` 本身失败
+  也算脏——给不出的答案不是删除的许可。
+- 修复：上游还没有任何提交的仓库 clone 出来同样是 unborn HEAD，之前被当成半成品，
+  于是每次 `:PlugInstall` 都"重新 clone → installed"，永远收敛不了。现在按
+  `branch.<name>.remote` 是否已写入区分"clone 跑完了"和"clone 被杀在半路"，前者
+  报 already；`:PlugUpdate` 则在上游出现第一个提交时直接采用它。
+- 回归：git 跑不起来时的分类、update/install 都不删 git 读不了的 checkout、
+  半成品 clone 里的用户文件在 update 与 install 之后都还在、空上游装两次都是
+  already 且上游长出提交后 update 会跟上。
+
 ### :PlugStop 之后紧接着的请求不再丢
 
 - 修复：`job_stop()` 只发 SIGTERM，进程被回收之前 `job_status()` 一直答 `run`，

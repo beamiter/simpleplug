@@ -33,6 +33,7 @@ simpleplug-daemon-cli	simpleplug.txt	/*simpleplug-daemon-cli*
 simpleplug-declare	simpleplug.txt	/*simpleplug-declare*
 simpleplug-intro	simpleplug.txt	/*simpleplug-intro*
 simpleplug-options	simpleplug.txt	/*simpleplug-options*
+simpleplug-re-clone	simpleplug.txt	/*simpleplug-re-clone*
 simpleplug-scripting	simpleplug.txt	/*simpleplug-scripting*
 simpleplug-simplecore	simpleplug.txt	/*simpleplug-simplecore*
 simpleplug-ui	simpleplug.txt	/*simpleplug-ui*

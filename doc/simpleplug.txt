@@ -112,13 +112,35 @@ restoring the directory and repeating the trigger retries the load.
         it — the daemon requires a resolvable HEAD, not merely a .git — and
         removes and re-clones it instead of reporting "already installed"
         forever.
+                                                       *simpleplug-re-clone*
+        Re-cloning deletes a directory, so it happens only where all three of
+        these hold:
+
+        - git ran and gave a verdict. If git is not on 'path', times out, or
+          refuses to read the checkout (a tree owned by another user, an
+          unreadable or dangling .git), the plugin is reported as an error and
+          the directory is left exactly as it is.
+        - git confirmed .git is a repository and that its HEAD names no
+          commit. A repository git cannot resolve at all is not assumed to be
+          a broken one.
+        - `git status` reports the working tree empty. An interrupted clone
+          never got as far as checking anything out, so anything found there
+          is yours: the plugin is reported as `dirty` and left alone.
+
+        A clone of an upstream that simply has no commits yet also has an
+        unborn HEAD, but it is a finished clone; it is reported as installed
+        and left alone rather than re-cloned on every run.
 
                                                                  *:PlugUpdate*
 :PlugUpdate[!] [name ...]
         Update plugins, skipping frozen and pinned ones. A plugin whose
         directory is missing, or left half-written by an interrupted clone, is
-        cloned rather than pulled. [!] waits for completion, as with
-        |:PlugInstall|.
+        cloned rather than pulled, under the conditions in
+        |simpleplug-re-clone|. A plugin with uncommitted local changes is
+        never updated or re-cloned; it is reported as `dirty` and left for you
+        to resolve. If the upstream had no commits when the plugin was cloned
+        and has some now, the update adopts them. [!] waits for completion, as
+        with |:PlugInstall|.
 
                                                                   *:PlugClean*
 :PlugClean[!]
