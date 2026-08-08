@@ -15,6 +15,11 @@ Environment
   FAKE_PLUG_FROZEN    comma-separated plugin names to report as skipped/frozen
   FAKE_PLUG_SILENT    if set, answer the handshake and nothing else
   FAKE_PLUG_DELAY_MS  wait this long before the first progress event
+  FAKE_PLUG_TERM_DELAY_MS
+                      linger this long on SIGTERM before exiting, reading
+                      nothing, so a test can hold the window in which
+                      job_status() still says 'run' for a daemon that is on
+                      its way out
   FAKE_PLUG_DUMP      append every request to this file, one JSON line each,
                       so a test can assert on what actually went over the wire
 
@@ -26,6 +31,7 @@ only once the "clone" reports success.
 import json
 import os
 import shutil
+import signal
 import sys
 import time
 
@@ -51,12 +57,19 @@ def names_from_env(key):
     return {n for n in os.environ.get(key, "").split(",") if n}
 
 
+def ms_from_env(key):
+    """Seconds from a millisecond env var.  Vim clears one by setting it to the
+    empty string rather than removing it, so "" has to mean zero."""
+    raw = os.environ.get(key, "").strip()
+    return float(raw) / 1000.0 if raw else 0.0
+
+
 def handle_batch(req):
     kind = req["type"]
     rid = req.get("id", 0)
     failing = names_from_env("FAKE_PLUG_FAIL")
     frozen = names_from_env("FAKE_PLUG_FROZEN")
-    delay = float(os.environ.get("FAKE_PLUG_DELAY_MS", "0")) / 1000.0
+    delay = ms_from_env("FAKE_PLUG_DELAY_MS")
     if delay:
         time.sleep(delay)
 
@@ -113,7 +126,26 @@ def handle_batch(req):
     emit({"type": "done", "id": rid, "summary": summary})
 
 
+def install_slow_term():
+    """Stay alive, and deaf, for a while after SIGTERM.
+
+    job_stop() only sends SIGTERM, so between it and the process actually
+    being reaped job_status() keeps answering 'run'.  A request sent in that
+    window lands in the stdin pipe of a process that will never read it.
+    """
+    delay = ms_from_env("FAKE_PLUG_TERM_DELAY_MS")
+    if not delay:
+        return
+
+    def linger(_signum, _frame):
+        time.sleep(delay)
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, linger)
+
+
 def main():
+    install_slow_term()
     silent = bool(os.environ.get("FAKE_PLUG_SILENT"))
     for line in sys.stdin:
         line = line.strip()

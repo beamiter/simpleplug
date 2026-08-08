@@ -234,6 +234,35 @@ $FAKE_PLUG_DUMP = ''
 $FAKE_PLUG_FAIL = ''
 simpleplug#UIClose()
 
+# ── :PlugStop followed by a request must not lose it ────────────────────────
+# job_stop() only sends SIGTERM, so job_status() keeps answering 'run' until
+# the process is reaped. core#Ensure() handed that dying job back and the
+# request went into a channel that was already closing: :PlugStop (or the
+# daemon-env change every section here makes) immediately followed by
+# :PlugInstall either reported "daemon is not running" or watched the daemon
+# exit mid-flight. FAKE_PLUG_TERM_DELAY_MS holds that window open on purpose.
+$FAKE_PLUG_TERM_DELAY_MS = '300'
+simpleplug#Stop()
+var race_dir = home .. '/batch-race'
+PlantTemplate(race_dir, ['vim9script', 'g:simpleplug_batch_race_loaded = 1'])
+simpleplug#Begin(home)
+simpleplug#Plug('local/batch-race', {as: 'batch-race', dir: race_dir})
+simpleplug#End()
+PlugInstall!
+assert_equal(1, get(simpleplug#LastResult(), 'installed', -1),
+  'the daemon started with the slow-SIGTERM fixture did not install')
+
+# ...and now the window is real: this daemon takes 300ms to die.
+delete(race_dir, 'rf')
+simpleplug#Stop()
+PlugInstall!
+result = simpleplug#LastResult()
+assert_equal(0, get(result, 'errors', -1),
+  'a request sent right after :PlugStop was lost: ' .. string(result))
+assert_equal(1, get(result, 'installed', -1),
+  'a request sent right after :PlugStop was lost: ' .. string(result))
+$FAKE_PLUG_TERM_DELAY_MS = ''
+
 # ── a silent daemon must not wedge Vim forever ──────────────────────────────
 simpleplug#Stop()
 $FAKE_PLUG_SILENT = '1'

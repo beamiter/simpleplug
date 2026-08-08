@@ -32,6 +32,9 @@ enddef
 var s_next_id: number = 0
 var s_cbs: dict<any> = {}   # id -> callback dict
 var s_active_id: number = 0
+# Set by Stop(): job_stop() only sends SIGTERM, so the process is still alive
+# when Stop() returns.  See EnsureBackend().
+var s_stop_pending: bool = false
 
 # ─────────────────── UI 状态 ───────────────────
 
@@ -594,6 +597,20 @@ def EnsureBackend(): bool
     SIMPLEPLUG_GIT_TIMEOUT: string(get(g:, 'simpleplug_git_timeout', 300)),
     SIMPLEPLUG_HOOK_TIMEOUT: string(get(g:, 'simpleplug_hook_timeout', 600)),
   })
+  # :PlugStop only sends SIGTERM, and job_status() keeps answering 'run' until
+  # the process is actually reaped — so core#Ensure() would hand back the
+  # daemon we just killed and the request would go into a channel that is
+  # closing. :PlugStop immediately followed by :PlugInstall then either lost
+  # the request ("daemon is not running") or had it die mid-flight ("daemon
+  # exited unexpectedly"). Wait for the old process to go first; `sleep` is
+  # what lets Vim run the exit callback that reaps it.
+  if s_stop_pending
+    var since = reltime()
+    while simpleplug#core#IsRunning() && reltimefloat(reltime(since)) < 5.0
+      sleep 10m
+    endwhile
+    s_stop_pending = false
+  endif
   return simpleplug#core#Ensure()
 enddef
 
@@ -625,6 +642,7 @@ enddef
 export def Stop()
   SetupCore()
   simpleplug#core#Stop()
+  s_stop_pending = true
   s_cbs = {}
   s_active_id = 0
 enddef
@@ -659,10 +677,20 @@ export def Health()
 enddef
 
 def Send(req: dict<any>)
-  if !simpleplug#core#Send(req)
-    s_active_id = 0
-    OnError({message: 'daemon is not running'})
+  if simpleplug#core#Send(req)
+    return
   endif
+  # The daemon can disappear between EnsureBackend() and here. job_stop() only
+  # sends SIGTERM, so job_status() still answers 'run' for a moment afterwards
+  # and core#Ensure() hands back the dying job instead of starting a new one —
+  # :PlugStop or :PlugRestart followed promptly by :PlugInstall then loses the
+  # request and reports "daemon is not running". Start a fresh one and send
+  # again before giving up on it.
+  if EnsureBackend() && simpleplug#core#Send(req)
+    return
+  endif
+  s_active_id = 0
+  OnError({message: 'daemon is not running'})
 enddef
 
 def OnDaemonEvent(ev: dict<any>)

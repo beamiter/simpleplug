@@ -171,7 +171,10 @@ restoring the directory and repeating the trigger retries the load.
 
                                                                    *:PlugStop*
 :PlugStop
-        Stop the daemon. It starts again on the next command.
+        Stop the daemon. It starts again on the next command, which waits for
+        the stopped process to actually exit first — a stop is a SIGTERM, and
+        a request handed to a daemon that is still on its way out is a request
+        nobody answers.
 
 See |simpleplug-daemon| for :PlugHealth, :PlugRestart and :PlugLog.
 

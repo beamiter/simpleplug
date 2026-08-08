@@ -2,6 +2,20 @@
 
 ## Unreleased - 2026-08-08
 
+### :PlugStop 之后紧接着的请求不再丢
+
+- 修复：`job_stop()` 只发 SIGTERM，进程被回收之前 `job_status()` 一直答 `run`，
+  于是 `core#Ensure()` 把正在退出的那个 job 原样交回来，请求写进一条马上要关的
+  channel。`:PlugStop`（或 `:PlugRestart`）之后立刻 `:PlugInstall`，要么报
+  "daemon is not running"，要么眼看着 daemon 中途退出——`make check` 里
+  `tests/vim_batch.vim` 大约每十次就红一次，就是这个。
+- `Stop()` 现在记下"停止还在进行中"，`EnsureBackend()` 会先等旧进程真正退出
+  （`sleep` 正是让 Vim 跑那个回收它的 exit 回调的东西，上限 5 秒）再启动新的；
+  `Send()` 万一还是失败，会重新 Ensure 并重发一次才认输。
+- 回归：fake daemon 新增 `FAKE_PLUG_TERM_DELAY_MS`，收到 SIGTERM 后故意赖着不
+  退也不读，把那个窗口稳定地撑开；测试在 `simpleplug#Stop()` 之后立刻
+  `:PlugInstall!`，断言结果里没有错误。修复前必然失败。
+
 ### 进度窗口的选择模型
 
 - 修复：光标所在行是拿每个已注册插件名去子串匹配行文本解析的，于是前缀名会盖住
