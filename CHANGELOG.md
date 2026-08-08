@@ -2,6 +2,35 @@
 
 ## Unreleased - 2026-08-08
 
+### 装好的插件当场生效
+
+- `g:simpleplug_auto_install` 默认开着，可首次启动的实际体验是：Vim 起来，克隆
+  21 个插件，然后一个都不能用——`End()` 只对目录已存在的插件动 `runtimepath`，
+  安装完成路径压根不碰 rtp。现在批处理结束时把每个 `installed` 的插件加进
+  `runtimepath`、source 它的 `plugin/`、`after/plugin/` 与 `ftdetect/`，并对已打开的
+  buffer 重跑一次 filetype 检测；`for`/`on` 插件只装触发器，仍旧按需加载。
+- 目录实际没落地的插件会被报出来并保持未加载；某个脚本抛异常只记在它自己那一行
+  上，不影响这一批里的其他插件。新增 `g:simpleplug_activate_on_install`（默认 1），
+  置 0 即回到"重启 Vim 才生效"。
+
+### 完成事件与同步模式
+
+- 新增 `User SimplePlugComplete` 自动命令与 `g:simpleplug_last_result`
+  （`mode`/`total`/`installed`/`updated`/`ok`/`frozen`/`removed`/`errors`/`failed`/
+  `elapsed`），install、update、status、clean、hook 以及失败和 daemon 中途退出都会
+  写入并触发。此前想知道结果只能盯着进度窗口，或者像作者的 vimrc 那样每 200ms
+  轮询、正则抓取 UI buffer 第二行的错误数。
+- `:PlugInstall!` / `:PlugUpdate!` 同步等待到操作结束，于是标准的无头引导
+  `vim -es -u vimrc +'PlugInstall!' +qall` 第一次真正可用；上限
+  `g:simpleplug_sync_timeout`（默认 1800 秒），CTRL-C 中断等待并停止操作。
+  另导出 `simpleplug#Await([timeout])` 与 `simpleplug#LastResult()`。
+- 等待用 `sleep` 而不是轮询 `getchar()`：Ex 模式下 `getchar()` 会去读脚本自己的
+  输入，读到 EOF 就直接退出 Vim——正好把它要服务的无头引导静默截断。
+- 新增 `make vim-batch`：用脚本化的 fake daemon 端到端驱动一整批 install/update，
+  断言完成事件、结果字典、同步等待（含静默 daemon 的超时）与安装后激活。测试自带
+  完成哨兵，因为 `-es` 会把好几种中途夭折变成静默的 exit 0。
+- 补齐文档缺口：`g:simpleplug_spinner_interval` 一直被读取却从未声明或记录。
+
 ### 中断的 clone 能被识别并修复
 
 - 修复：`git clone` 先建好目标目录和 `.git`，对象才慢慢传输；而 `clone_plugin`

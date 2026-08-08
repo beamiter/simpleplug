@@ -11,8 +11,9 @@ CONTENTS                                                 *simpleplug-contents*
   3. Plugin options .............. |simpleplug-options|
   4. Commands .................... |simpleplug-commands|
   5. UI keys ..................... |simpleplug-ui|
-  6. Configuration ............... |simpleplug-config|
-  7. Daemon supervision .......... |simpleplug-daemon|
+  6. Scripting ................... |simpleplug-scripting|
+  7. Configuration ............... |simpleplug-config|
+  8. Daemon supervision .......... |simpleplug-daemon|
 
 ==============================================================================
 1. INTRODUCTION                                             *simpleplug-intro*
@@ -91,9 +92,18 @@ restoring the directory and repeating the trigger retries the load.
 4. COMMANDS                                              *simpleplug-commands*
 
                                                                 *:PlugInstall*
-:PlugInstall [name ...]
+:PlugInstall[!] [name ...]
         Install missing plugins. With names (completed from the registry),
         only those are installed.
+
+        With [!] the command does not return until the operation has finished
+        (or |g:simpleplug_sync_timeout| expires), which is what makes a
+        headless bootstrap work: >
+
+            vim -es -u vimrc +'PlugInstall!' +qall
+<
+        CTRL-C abandons the wait and stops the operation. Without [!] the
+        install runs asynchronously, exactly as before.
 
         A checkout left behind by an interrupted clone counts as missing. git
         creates the destination and its .git before the objects finish
@@ -104,10 +114,11 @@ restoring the directory and repeating the trigger retries the load.
         forever.
 
                                                                  *:PlugUpdate*
-:PlugUpdate [name ...]
+:PlugUpdate[!] [name ...]
         Update plugins, skipping frozen and pinned ones. A plugin whose
         directory is missing, or left half-written by an interrupted clone, is
-        cloned rather than pulled.
+        cloned rather than pulled. [!] waits for completion, as with
+        |:PlugInstall|.
 
                                                                   *:PlugClean*
 :PlugClean[!]
@@ -175,7 +186,47 @@ Inside the progress window:
   h, ?    toggle the key help
 
 ==============================================================================
-6. CONFIGURATION                                           *simpleplug-config*
+6. SCRIPTING                                            *simpleplug-scripting*
+
+An install or update reports what it did, so nothing has to watch the progress
+window to find out.
+
+                                                       *SimplePlugComplete*
+When an operation finishes — including when it fails, and when the daemon dies
+mid-flight — SimplePlug sets |g:simpleplug_last_result| and then fires the
+|User| autocommand SimplePlugComplete: >
+
+    autocmd User SimplePlugComplete
+      \ if g:simpleplug_last_result.errors > 0 | PlugLog | endif
+<
+                                                 *g:simpleplug_last_result*
+The result of the most recent operation, a dictionary with these keys:
+
+  mode       'install', 'update', 'status', 'clean' or 'hook'
+  total      number of plugins the operation covered
+  installed  newly cloned
+  updated    moved to a new commit
+  ok         already up to date, pinned, or hook-only
+  frozen     skipped because of `frozen`
+  removed    directories :PlugClean deleted
+  errors     number of entries in `failed`
+  failed     list of {name, message}, sorted by name
+  elapsed    wall-clock seconds
+
+                                                     *simpleplug#Await()*
+simpleplug#Await([{timeout}])
+        Block until the running operation finishes and return the same
+        dictionary. {timeout} is in seconds; omitted or negative means
+        |g:simpleplug_sync_timeout|. Returns the previous result immediately
+        when nothing is running. This is what [!] on |:PlugInstall| uses.
+
+                                                *simpleplug#LastResult()*
+simpleplug#LastResult()
+        The dictionary above, or an empty one if no operation has finished
+        yet.
+
+==============================================================================
+7. CONFIGURATION                                           *simpleplug-config*
 
                                                             *g:simpleplug_dir*
 Plugin directory. Default: ~/.vim/plugged
@@ -205,8 +256,31 @@ Timeout in seconds for a post-hook. Default: 600
 Both timeouts are re-read every time the daemon starts, so changing them takes
 effect on the next |:PlugRestart| without restarting Vim.
 
+                                            *g:simpleplug_activate_on_install*
+Make a newly installed plugin usable in the running session instead of at the
+next Vim start. Default: 1
+
+When an install finishes, each plugin it reports as newly installed is added
+to 'runtimepath' and its plugin/ and after/plugin/ scripts are sourced; its
+ftdetect/ files are sourced too and already-open buffers are re-detected, so a
+filetype the plugin introduces takes effect immediately. A plugin declared
+with `for` or `on` only gets its triggers armed — it stays unloaded until one
+of them fires, as usual. A plugin whose directory did not actually appear is
+reported and left unloaded, and a script that throws is reported on that
+plugin's row without stopping the rest of the batch.
+
+Set it to 0 if you would rather restart Vim: sourcing third-party code at an
+unusual moment can upset a plugin that assumes it loads before |VimEnter|.
+
+                                                  *g:simpleplug_sync_timeout*
+How many seconds [!] on |:PlugInstall| / |:PlugUpdate| and |simpleplug#Await()|
+will wait before giving up. Default: 1800. The operation itself keeps running.
+
+                                              *g:simpleplug_spinner_interval*
+Progress window refresh interval in milliseconds. Default: 200
+
 ==============================================================================
-7. DAEMON SUPERVISION                                      *simpleplug-daemon*
+8. DAEMON SUPERVISION                                      *simpleplug-daemon*
 
 The Rust daemon is managed by simplecore, the supervisor shared by the whole
 simple* plugin suite. It is vendored into this repository at

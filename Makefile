@@ -1,6 +1,6 @@
-.PHONY: check fmt clippy test vim-test vim-core defcompile core-verify
+.PHONY: check fmt clippy test vim-test vim-batch vim-core defcompile core-verify
 
-check: core-verify fmt clippy test defcompile vim-core vim-test
+check: core-verify fmt clippy test defcompile vim-core vim-test vim-batch
 
 fmt:
 	cargo fmt --all -- --check
@@ -13,6 +13,12 @@ test:
 
 vim-test:
 	vim -Nu NONE -n -i NONE -es -S tests/vim_smoke.vim
+
+# Install/update batches end to end against a scripted daemon: the completion
+# event and its result dictionary, the synchronous bang, and activation of a
+# freshly installed plugin in the running session.
+vim-batch:
+	vim -Nu NONE -n -i NONE -es -S tests/vim_batch.vim
 
 # ---------------------------------------------------------------------------
 # simplecore: the vendored daemon supervisor shared by the simple* suite.

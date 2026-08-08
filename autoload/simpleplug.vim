@@ -278,15 +278,7 @@ def SetupLazyLoad(plug: dict<any>, pdir: string)
 
   # ftdetect 必须立即生效，否则插件自带的文件类型永远不会被识别，
   # for 延迟加载也就永远不会触发。
-  augroup filetypedetect
-  for f in globpath(pdir, 'ftdetect/*.vim', 0, 1)
-    try
-      execute 'source ' .. fnameescape(f)
-    catch
-      Log('ftdetect source error: ' .. v:exception, 'ErrorMsg')
-    endtry
-  endfor
-  augroup END
+  SourceFtdetect(pdir)
 
   # 从 rtp 里暂时移除。已经加载过的插件必须留下：它的 autoload/ftplugin/
   # syntax 仍在被使用，而重新 source 本体已经被 reload guard 挡住了。
@@ -396,21 +388,37 @@ export def LazyLoad(name: string): bool
   return true
 enddef
 
-def SourcePluginScripts(name: string, dir: string)
+# Returns one message per file that threw.  Sourcing third-party code is
+# best-effort by design — one broken script must not stop the rest of a plugin
+# from loading — but the caller may still want to say so.
+def SourcePluginScripts(name: string, dir: string): list<string>
   s_sourced_runtime[name] = dir
-  for f in globpath(dir, 'plugin/**/*.vim', 0, 1)
+  var failures: list<string> = []
+  for pattern in ['plugin/**/*.vim', 'after/plugin/**/*.vim']
+    for f in globpath(dir, pattern, 0, 1)
+      try
+        execute 'source ' .. fnameescape(f)
+      catch
+        Log('source error: ' .. v:exception, 'ErrorMsg')
+        add(failures, fnamemodify(f, ':t') .. ': ' .. v:exception)
+      endtry
+    endfor
+  endfor
+  return failures
+enddef
+
+# ftdetect must be sourced by hand whenever a runtime directory appears after
+# Vim's own startup scan: 'runtimepath' is only walked for it at startup.
+def SourceFtdetect(dir: string)
+  augroup filetypedetect
+  for f in globpath(dir, 'ftdetect/*.vim', 0, 1)
     try
       execute 'source ' .. fnameescape(f)
     catch
-      Log('LazyLoad source error: ' .. v:exception, 'ErrorMsg')
+      Log('ftdetect source error: ' .. v:exception, 'ErrorMsg')
     endtry
   endfor
-  for f in globpath(dir, 'after/plugin/**/*.vim', 0, 1)
-    try
-      execute 'source ' .. fnameescape(f)
-    catch
-    endtry
-  endfor
+  augroup END
 enddef
 
 def FindPlugin(name: string): dict<any>
@@ -604,6 +612,7 @@ def OnDaemonExit(code: number, restarting: bool)
     endif
   endfor
   s_ui_mode ..= s_ui_mode =~# '_done$' ? '' : '_done'
+  PublishResult()
   UIBuildAndRender()
 enddef
 
@@ -813,7 +822,9 @@ def RunBatch(mode: string, plugs: list<dict<any>>, specs: list<dict<any>>)
       StopSpinner()
       s_ui_mode = mode .. '_done'
       RecountFinished()
+      ActivateInstalled()
       GenerateHelptags()
+      PublishResult()
       UIBuildAndRender()
     },
     OnError: (ev) => {
@@ -822,6 +833,55 @@ def RunBatch(mode: string, plugs: list<dict<any>>, specs: list<dict<any>>)
     },
   }
   Send({type: mode, id: id, plugins: specs, jobs: JobCount()})
+enddef
+
+# 刚装好的插件在当前会话里直接可用，不必重启 Vim。
+#
+# End() 只对目录已存在的插件动 'runtimepath'，所以首次启动自动安装完之后，
+# 21 个插件全都躺在磁盘上却一个都没生效——作者自己的配置为此在 timer 里整个
+# 重新 source .vimrc，那会把每个 mapping、autocmd、option 都重跑一遍。
+def ActivateInstalled()
+  if !get(g:, 'simpleplug_activate_on_install', 1)
+    return
+  endif
+  var activated = 0
+  for name in s_ui_targets
+    var st = get(s_ui_plug_state, name, {})
+    if get(st, 'action', '') !=# 'installed' || get(s_loaded_plugins, name, false)
+      continue
+    endif
+    var plug = FindPlugin(name)
+    if plug == {}
+      continue
+    endif
+    # 第三方代码在一个不寻常的时刻运行：单个插件失败只记在它自己那一行上，
+    # 不影响这一批里的其他插件。
+    var dir = CheckedRuntimeDir(plug, true)
+    if empty(dir)
+      st.msg = get(st, 'msg', '') .. ' | not activated'
+      s_ui_plug_state[name] = st
+      continue
+    endif
+    if !empty(get(plug, 'on_ft', '')) || !empty(get(plug, 'on_cmd', ''))
+      # End() 当时整个跳过了这个插件（目录还不存在），触发器是第一次装上。
+      s_loaded_plugins[name] = false
+      SetupLazyLoad(plug, dir)
+    else
+      s_loaded_plugins[name] = true
+      AddRuntimePath(dir)
+      var failures = SourcePluginScripts(name, dir)
+      SourceFtdetect(dir)
+      if !empty(failures)
+        st.msg = get(st, 'msg', '') .. ' | activate: ' .. failures[0]
+        s_ui_plug_state[name] = st
+      endif
+    endif
+    activated += 1
+  endfor
+  if activated > 0
+    # 已经打开的 buffer 也该认出新插件带来的 filetype。
+    silent! doautoall filetypedetect BufRead
+  endif
 enddef
 
 def GenerateHelptags()
@@ -837,7 +897,78 @@ def GenerateHelptags()
   endfor
 enddef
 
-export def Install(names: list<string> = [])
+# ─────────────────── 完成事件与同步等待 ───────────────────
+
+# The machine-readable record of what an operation did.  Without it the only
+# way to learn the outcome is to look at the window — or, as scripts actually
+# did, poll on a timer and regex-scrape line 2 of the progress buffer.
+def PublishResult()
+  var counts = SummaryCounts()
+  var failed: list<dict<string>> = []
+  for name in sort(keys(s_ui_plug_state))
+    var st = s_ui_plug_state[name]
+    var action = UiAction(st)
+    if action ==# 'error' || action ==# 'missing' || action ==# 'dirty'
+      add(failed, {name: name, message: get(st, 'msg', '')})
+    endif
+  endfor
+  g:simpleplug_last_result = {
+    mode: substitute(s_ui_mode, '_done$', '', ''),
+    total: s_ui_total,
+    installed: counts.installed,
+    updated: counts.updated,
+    ok: counts.ok,
+    frozen: counts.frozen,
+    removed: counts.removed,
+    errors: len(failed),
+    failed: failed,
+    elapsed: empty(s_ui_start_time) ? 0.0 : reltimefloat(reltime(s_ui_start_time)),
+  }
+  if exists('#User#SimplePlugComplete')
+    silent doautocmd <nomodeline> User SimplePlugComplete
+  endif
+enddef
+
+export def LastResult(): dict<any>
+  return get(g:, 'simpleplug_last_result', {})
+enddef
+
+def SyncTimeout(): number
+  var limit = get(g:, 'simpleplug_sync_timeout', 1800)
+  return type(limit) == v:t_number && limit > 0 ? limit : 1800
+enddef
+
+# Block until the running operation finishes, then return its result.
+#
+# `sleep` does two jobs here.  Vim services channel and timer callbacks during
+# it — including under -es — which is the only reason the daemon's events are
+# delivered while we are parked; and CTRL-C interrupts it and surfaces as a
+# catchable Vim:Interrupt, so the wait can always be abandoned.  Polling
+# getchar() for CTRL-C instead is not an option: in Ex mode that reads the
+# script's own input and quits Vim at EOF, silently truncating exactly the
+# headless bootstrap this exists for.
+export def Await(timeout: number = -1): dict<any>
+  var limit = timeout >= 0 ? timeout : SyncTimeout()
+  var start = reltime()
+  while s_active_id > 0
+    if reltimefloat(reltime(start)) >= limit
+      echohl WarningMsg
+      echom printf('[SimplePlug] stopped waiting after %ds; the operation is still running', limit)
+      echohl None
+      break
+    endif
+    try
+      sleep 50m
+    catch /^Vim:Interrupt$/
+      echom '[SimplePlug] interrupted; stopping the operation'
+      Stop()
+      break
+    endtry
+  endwhile
+  return LastResult()
+enddef
+
+export def Install(names: list<string> = [], sync: bool = false)
   if !EnsureBackend()
     return
   endif
@@ -846,6 +977,9 @@ export def Install(names: list<string> = [])
     return
   endif
   RunBatch('install', plugs, PluginSpecs(plugs))
+  if sync
+    Await()
+  endif
 enddef
 
 export def AutoInstallMissing()
@@ -865,7 +999,7 @@ export def AutoInstallMissing()
   Install()
 enddef
 
-export def Update(names: list<string> = [])
+export def Update(names: list<string> = [], sync: bool = false)
   if !EnsureBackend()
     return
   endif
@@ -874,6 +1008,9 @@ export def Update(names: list<string> = [])
     return
   endif
   RunBatch('update', plugs, PluginSpecs(plugs))
+  if sync
+    Await()
+  endif
 enddef
 
 # =============================================================
@@ -1355,6 +1492,7 @@ def OnError(ev: dict<any>)
   endif
   RecountFinished()
   s_ui_mode ..= s_ui_mode =~# '_done$' ? '' : '_done'
+  PublishResult()
   UIBuildAndRender()
 enddef
 
@@ -1392,6 +1530,7 @@ def OnStatusResult(ev: dict<any>)
   endfor
   s_ui_finished = len(items)
   s_ui_mode = 'status_done'
+  PublishResult()
   UIBuildAndRender()
 enddef
 
@@ -1410,6 +1549,7 @@ def OnHookDone(ev: dict<any>)
   st.msg = output
   s_ui_plug_state[name] = st
   s_ui_mode = 'hook_done'
+  PublishResult()
   UIBuildAndRender()
 enddef
 
@@ -1421,6 +1561,7 @@ def OnCleanDone(ev: dict<any>)
   endfor
   s_ui_finished = len(removed)
   s_ui_mode = 'clean_done'
+  PublishResult()
   UIBuildAndRender()
 enddef
 

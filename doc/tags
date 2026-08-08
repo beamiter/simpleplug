@@ -10,6 +10,8 @@
 :PlugStatus	simpleplug.txt	/*:PlugStatus*
 :PlugStop	simpleplug.txt	/*:PlugStop*
 :PlugUpdate	simpleplug.txt	/*:PlugUpdate*
+SimplePlugComplete	simpleplug.txt	/*SimplePlugComplete*
+g:simpleplug_activate_on_install	simpleplug.txt	/*g:simpleplug_activate_on_install*
 g:simpleplug_auto_install	simpleplug.txt	/*g:simpleplug_auto_install*
 g:simpleplug_daemon_path	simpleplug.txt	/*g:simpleplug_daemon_path*
 g:simpleplug_debug	simpleplug.txt	/*g:simpleplug_debug*
@@ -17,7 +19,12 @@ g:simpleplug_dir	simpleplug.txt	/*g:simpleplug_dir*
 g:simpleplug_git_timeout	simpleplug.txt	/*g:simpleplug_git_timeout*
 g:simpleplug_hook_timeout	simpleplug.txt	/*g:simpleplug_hook_timeout*
 g:simpleplug_jobs	simpleplug.txt	/*g:simpleplug_jobs*
+g:simpleplug_last_result	simpleplug.txt	/*g:simpleplug_last_result*
+g:simpleplug_spinner_interval	simpleplug.txt	/*g:simpleplug_spinner_interval*
+g:simpleplug_sync_timeout	simpleplug.txt	/*g:simpleplug_sync_timeout*
 g:simpleplug_window_width	simpleplug.txt	/*g:simpleplug_window_width*
+simpleplug#Await()	simpleplug.txt	/*simpleplug#Await()*
+simpleplug#LastResult()	simpleplug.txt	/*simpleplug#LastResult()*
 simpleplug-commands	simpleplug.txt	/*simpleplug-commands*
 simpleplug-config	simpleplug.txt	/*simpleplug-config*
 simpleplug-contents	simpleplug.txt	/*simpleplug-contents*
@@ -26,6 +33,7 @@ simpleplug-daemon-cli	simpleplug.txt	/*simpleplug-daemon-cli*
 simpleplug-declare	simpleplug.txt	/*simpleplug-declare*
 simpleplug-intro	simpleplug.txt	/*simpleplug-intro*
 simpleplug-options	simpleplug.txt	/*simpleplug-options*
+simpleplug-scripting	simpleplug.txt	/*simpleplug-scripting*
 simpleplug-simplecore	simpleplug.txt	/*simpleplug-simplecore*
 simpleplug-ui	simpleplug.txt	/*simpleplug-ui*
 simpleplug.txt	simpleplug.txt	/*simpleplug.txt*

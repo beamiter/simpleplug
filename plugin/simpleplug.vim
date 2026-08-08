@@ -16,10 +16,16 @@ g:simpleplug_jobs = get(g:, 'simpleplug_jobs', 8)
 # 单个 git 操作 / post-hook 的超时秒数
 g:simpleplug_git_timeout = get(g:, 'simpleplug_git_timeout', 300)
 g:simpleplug_hook_timeout = get(g:, 'simpleplug_hook_timeout', 600)
+# 装好的插件立刻在当前会话生效；置 0 则维持旧行为，等下次启动 Vim
+g:simpleplug_activate_on_install = get(g:, 'simpleplug_activate_on_install', 1)
+# :PlugInstall! / :PlugUpdate! 最多阻塞多少秒
+g:simpleplug_sync_timeout = get(g:, 'simpleplug_sync_timeout', 1800)
+# 进度窗口 spinner 的刷新间隔（毫秒）
+g:simpleplug_spinner_interval = get(g:, 'simpleplug_spinner_interval', 200)
 
 # =============== 命令 ===============
-command! -nargs=* -complete=customlist,simpleplug#CompletePluginNames PlugInstall simpleplug#Install([<f-args>])
-command! -nargs=* -complete=customlist,simpleplug#CompletePluginNames PlugUpdate simpleplug#Update([<f-args>])
+command! -bang -nargs=* -complete=customlist,simpleplug#CompletePluginNames PlugInstall simpleplug#Install([<f-args>], <bang>0)
+command! -bang -nargs=* -complete=customlist,simpleplug#CompletePluginNames PlugUpdate simpleplug#Update([<f-args>], <bang>0)
 command! -bang PlugClean simpleplug#Clean(<bang>0)
 command! PlugStatus    simpleplug#Status()
 command! PlugStop      simpleplug#Stop()

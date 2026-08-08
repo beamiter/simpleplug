@@ -11,6 +11,8 @@
 - 快照与恢复：`:PlugSnapshot` 记录全部插件的精确 commit，`:PlugRestore` 一键回滚
 - 快照漂移审计：`:PlugSnapshotDiff` 只读检查 checkout 与锁文件是否一致
 - `:PlugInstall` / `:PlugUpdate` 可指定插件名（带补全），只操作选中的插件
+- 装好的插件当场生效：新安装的插件直接进 `runtimepath` 并被 source，不必重启 Vim
+- 可编程：`:PlugInstall!` 同步等待，`User SimplePlugComplete` 事件 + `g:simpleplug_last_result` 给出结构化结果
 - 内置 UI 进度窗口，彩色状态显示
 - API 兼容 vim-plug 风格，迁移成本极低
 - 安全更新：工作区有改动时跳过，分支分叉时报错，不重写本地历史
@@ -62,8 +64,8 @@ simpleplug#End()
 
 | 命令 | 说明 |
 |------|------|
-| `:PlugInstall [name ...]` | 安装未安装的插件（并行 git clone）；可指定插件名 |
-| `:PlugUpdate [name ...]` | 安全更新插件；同时补装缺失插件；可指定插件名 |
+| `:PlugInstall[!] [name ...]` | 安装未安装的插件（并行 git clone）；可指定插件名；`!` 同步等待完成 |
+| `:PlugUpdate[!] [name ...]` | 安全更新插件；同时补装缺失插件；可指定插件名；`!` 同步等待完成 |
 | `:PlugClean` | 确认后清理未注册的 Git 插件目录 |
 | `:PlugClean!` | 跳过确认并执行安全清理 |
 | `:PlugStatus` | 查看所有插件状态（分支、commit、最近提交、是否有修改） |
@@ -74,6 +76,23 @@ simpleplug#End()
 | `:PlugStop` | 停止当前后端任务 |
 
 默认情况下，Vim 启动时会自动检查已注册插件里是否有尚未安装的新插件；如果有，则自动触发一次 `:PlugInstall`。
+安装完成后这些插件会直接在当前会话生效（加入 `runtimepath`、source `plugin/` 与 `ftdetect/`），
+不需要重启 Vim；`for` / `on` 插件只装上触发器，仍旧按需加载。
+把 `g:simpleplug_activate_on_install` 设为 0 可以退回“重启后生效”的旧行为。
+
+`.git` 目录本身不算装好：clone 被中途杀掉（安装途中退出 Vim 就会）留下的半成品
+会被识别出来并重新 clone，而不是永远报告 "already installed"。
+
+脚本化用法：`:PlugInstall!` 会阻塞到操作结束（上限 `g:simpleplug_sync_timeout` 秒，
+CTRL-C 可中断），所以标准的无头引导可以直接写成
+
+```bash
+vim -es -u vimrc +'PlugInstall!' +qall
+```
+
+每次操作结束都会写入 `g:simpleplug_last_result`（`mode` / `installed` / `updated` /
+`ok` / `frozen` / `errors` / `failed` / `elapsed`）并触发 `User SimplePlugComplete`，
+`simpleplug#Await()` 与 `simpleplug#LastResult()` 提供同样的结果，不必再去正则解析进度窗口。
 
 快照默认路径为 `g:simpleplug_dir .. '/simpleplug.snapshot.json'`。
 文件继续采用兼容旧版本的 `{插件名: 完整 Git OID}` JSON 对象；写入先在目标旁
@@ -98,6 +117,9 @@ g:simpleplug_window_width  " 右侧 UI 窗口宽度 (默认 88)
 g:simpleplug_jobs          " 最大并行任务数 (默认 8，范围 1..64)
 g:simpleplug_git_timeout   " 单个 git 操作超时秒数 (默认 300)
 g:simpleplug_hook_timeout  " post-hook 超时秒数 (默认 600)
+g:simpleplug_activate_on_install  " 安装后立即在当前会话生效 (默认 1)
+g:simpleplug_sync_timeout  " :PlugInstall! / :PlugUpdate! 最长等待秒数 (默认 1800)
+g:simpleplug_spinner_interval     " 进度窗口刷新间隔毫秒 (默认 200)
 ```
 
 ## Plug() 选项
@@ -154,7 +176,12 @@ git clone / pull / status
 ./tests/run.sh
 ```
 
-测试包含 Rust 协议/并发/安全清理/脏工作区/版本锁定/浅克隆分支切换回归，以及 Vim9 延迟加载（filetype、命令、`<Plug>` 映射、ftdetect）smoke test。
+完整门禁是 `make check`（fmt、clippy、cargo test、`:defcompile`、simplecore supervisor
+回归、Vim smoke，以及跑在脚本化 daemon 上的 install/update 批处理端到端测试）。
+
+测试包含 Rust 协议/并发/安全清理/脏工作区/版本锁定/浅克隆分支切换/中断 clone 修复回归，
+Vim9 延迟加载（filetype、命令、`<Plug>` 映射、ftdetect、重新 source vimrc）smoke test，
+以及完成事件、同步等待与安装后激活的端到端断言。
 
 ## License
 
