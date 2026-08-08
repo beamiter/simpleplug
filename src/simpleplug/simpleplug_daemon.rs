@@ -53,6 +53,14 @@ enum Request {
         #[serde(default = "default_jobs")]
         jobs: usize,
     },
+    /// 只读地问一句"有没有更新"：fetch 之后只数提交，不动工作区、不跑 hook
+    #[serde(rename = "check")]
+    Check {
+        id: u64,
+        plugins: Vec<PluginSpec>,
+        #[serde(default = "default_jobs")]
+        jobs: usize,
+    },
     /// 对单个插件执行 post-install 命令
     #[serde(rename = "post_hook")]
     PostHook {
@@ -84,6 +92,7 @@ fn capabilities() -> BTreeMap<&'static str, bool> {
         ("commit_pin", true),
         ("submodules", true),
         ("update_detail", true),
+        ("check", true),
     ])
 }
 
@@ -141,6 +150,9 @@ enum Event {
     /// 状态查询结果
     #[serde(rename = "status_result")]
     StatusResult { id: u64, items: Vec<PluginStatus> },
+    /// 更新检查结果
+    #[serde(rename = "check_result")]
+    CheckResult { id: u64, items: Vec<CheckItem> },
     /// post-hook 结果
     #[serde(rename = "hook_done")]
     HookDone {
@@ -168,6 +180,20 @@ struct Summary {
     updated: u32,
     already_ok: u32,
     errors: u32,
+}
+
+/// `state` 说明这一行为什么长这样，Vim 端据此上色，不必去解析 message：
+/// `behind`（有 N 个新提交）、`current`、`pinned`（tag/commit 锁定，不联网）、
+/// `frozen`（update 本来就不会碰它，不联网）、`error`。
+#[derive(Debug, Serialize)]
+struct CheckItem {
+    name: String,
+    state: &'static str,
+    behind: u32,
+    dirty: bool,
+    subjects: Vec<String>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    message: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -346,6 +372,9 @@ async fn serve() -> std::io::Result<()> {
                 }
                 Request::Status { id, plugins, jobs } => {
                     handle_status(id, plugins, jobs, &tx).await;
+                }
+                Request::Check { id, plugins, jobs } => {
+                    handle_check(id, plugins, jobs, &tx, &locks).await;
                 }
                 Request::PostHook { id, name, dir, cmd } => {
                     handle_post_hook(id, &name, &dir, &cmd, &tx).await;
@@ -805,12 +834,12 @@ const MAX_SUBJECTS: usize = 50;
 ///
 /// 回滚（`to` 是 `from` 的祖先）时这里是空的，那不是错误：没有任何提交被带
 /// 进来，UI 说的就是这句话。
-async fn incoming_subjects(dir: &str, from: &str, to: &str) -> Vec<String> {
+async fn incoming_subjects(dir: &str, from: &str, to: &str, limit: usize) -> Vec<String> {
     if from.is_empty() || to.is_empty() || from == to {
         return Vec::new();
     }
     let range = format!("{from}..{to}");
-    let max = format!("--max-count={MAX_SUBJECTS}");
+    let max = format!("--max-count={limit}");
     run_git(dir, &["log", "--no-merges", "--format=%h %s", &max, &range])
         .await
         .map(|out| {
@@ -1521,7 +1550,13 @@ async fn handle_update(
                             &Event::UpdateDetail {
                                 id,
                                 name: p.name.clone(),
-                                subjects: incoming_subjects(&p.dir, &from_oid, &to_oid).await,
+                                subjects: incoming_subjects(
+                                    &p.dir,
+                                    &from_oid,
+                                    &to_oid,
+                                    MAX_SUBJECTS,
+                                )
+                                .await,
                                 from: from_oid.clone(),
                                 to: to_oid,
                             },
@@ -1743,6 +1778,150 @@ async fn handle_status(id: u64, plugins: Vec<PluginSpec>, jobs: usize, tx: &Even
     }
 
     send_event(tx, &Event::StatusResult { id, items }).await;
+}
+
+// ─────────────────── check ───────────────────
+
+/// 检查一行能显示几条主题。检查是"要不要更新"，不是"更新了什么"——想看全部
+/// 提交，更新完 `:PlugDiff`。
+const CHECK_SUBJECTS: usize = 5;
+
+fn check_error(name: String, message: String) -> CheckItem {
+    CheckItem {
+        name,
+        state: "error",
+        behind: 0,
+        dirty: false,
+        subjects: Vec::new(),
+        message,
+    }
+}
+
+/// 只读的更新检查。
+///
+/// 唯一会写盘的是 `git fetch` 往 .git 里放的对象和 remote 引用：不 checkout、
+/// 不 merge、不跑 `do` hook。之所以值得单独存在，就是因为今天想知道"有没有
+/// 更新"的唯一办法是真的更新一遍——在作者自己的配置里那意味着二十多个
+/// checkout 被改写、每个 `do: './install.sh'` 重新 cargo build 一次。
+///
+/// fetch 不带 `--depth`：在完整克隆上加 `--depth` 会把取回来的引用变成浅的，
+/// 一次只读检查没有任何理由去动仓库的形状。浅克隆自己的 fetch 默认沿用原来
+/// 的深度边界，所以两边都不需要特别处理。
+async fn handle_check(
+    id: u64,
+    plugins: Vec<PluginSpec>,
+    jobs: usize,
+    tx: &EventTx,
+    locks: &DirLocks,
+) {
+    let mut items = Vec::new();
+    let mut handles = Vec::new();
+    let semaphore = Arc::new(Semaphore::new(job_limit(jobs)));
+
+    for p in plugins {
+        let locks = locks.clone();
+        let semaphore = semaphore.clone();
+        handles.push(tokio::spawn(async move {
+            let _permit = semaphore.acquire_owned().await.expect("semaphore closed");
+            let lock = get_lock(&locks, &p.dir).await;
+            let _guard = lock.lock().await;
+
+            match git_checkout_state(&p.dir).await {
+                CheckoutState::Valid => {}
+                CheckoutState::Missing => {
+                    return check_error(p.name, "not installed".into());
+                }
+                CheckoutState::Interrupted => {
+                    return check_error(p.name, "incomplete checkout; run :PlugUpdate".into());
+                }
+                CheckoutState::EmptyUpstream => {
+                    return check_error(p.name, "upstream has no commits yet".into());
+                }
+                CheckoutState::Undetermined(e) => {
+                    return check_error(p.name, format!("cannot inspect checkout: {e}"));
+                }
+            }
+
+            let dirty = git_is_dirty(&p.dir).await;
+
+            // 锁死的插件不联网：update 也不会把它们挪到别处去，问上游没有意义。
+            if p.frozen {
+                return CheckItem {
+                    name: p.name,
+                    state: "frozen",
+                    behind: 0,
+                    dirty,
+                    subjects: Vec::new(),
+                    message: "frozen".into(),
+                };
+            }
+            if !p.commit.is_empty() || !p.tag.is_empty() {
+                let pin = if p.commit.is_empty() {
+                    format!("tag {}", p.tag)
+                } else {
+                    format!("commit {}", short_commit(&p.commit))
+                };
+                return CheckItem {
+                    name: p.name,
+                    state: "pinned",
+                    behind: 0,
+                    dirty,
+                    subjects: Vec::new(),
+                    message: format!("pinned at {pin}"),
+                };
+            }
+
+            // 跟哪条分支比：显式声明 > 当前分支 > 上游的 HEAD。detached HEAD
+            // 的当前分支是 "HEAD"，那不是分支名。
+            let current = git_current_branch(&p.dir).await;
+            let branch = if !p.branch.is_empty() {
+                p.branch.clone()
+            } else if !current.is_empty() && current != "HEAD" {
+                current
+            } else {
+                match git_remote_head_branch(&p.dir).await {
+                    Some(b) => b,
+                    None => return check_error(p.name, "cannot determine upstream branch".into()),
+                }
+            };
+
+            git_ensure_fetch_refspec(&p.dir, &branch).await;
+            if let Err(e) = run_git(&p.dir, &["fetch", "origin", &branch_refspec(&branch)]).await {
+                return check_error(p.name, format!("fetch: {e}"));
+            }
+            let behind = match run_git(&p.dir, &["rev-list", "--count", "HEAD..FETCH_HEAD"]).await {
+                Ok(count) => count.trim().parse::<u32>().unwrap_or(0),
+                Err(e) => return check_error(p.name, format!("compare: {e}")),
+            };
+            if behind == 0 {
+                return CheckItem {
+                    name: p.name,
+                    state: "current",
+                    behind: 0,
+                    dirty,
+                    subjects: Vec::new(),
+                    message: format!("up to date on {branch}"),
+                };
+            }
+            CheckItem {
+                name: p.name,
+                state: "behind",
+                behind,
+                dirty,
+                subjects: incoming_subjects(&p.dir, "HEAD", "FETCH_HEAD", CHECK_SUBJECTS).await,
+                message: format!("{behind} new on {branch}"),
+            }
+        }));
+    }
+
+    for h in handles {
+        if let Ok(item) = h.await {
+            items.push(item);
+        }
+    }
+    items.sort_by(|a, b| a.name.cmp(&b.name));
+
+    send_event(tx, &Event::CheckResult { id, items }).await;
 }
 
 // ─────────────────── post-hook ───────────────────
@@ -2205,6 +2384,117 @@ mod tests {
         assert_eq!(detail["to"], before);
         assert_eq!(detail["subjects"].as_array().unwrap().len(), 0);
         assert_eq!(git_out(&dest, &["rev-parse", "HEAD"]), before);
+    }
+
+    /// A check must answer "is there anything to update" without becoming an
+    /// update: no working-tree write, no hook, and — the part that is easy to
+    /// get wrong — no change to the shape of the repository that would stop
+    /// the real update from fast-forwarding afterwards.
+    #[tokio::test]
+    async fn check_reports_updates_without_taking_them() {
+        let origin = make_origin("check-origin");
+        let workdir = TestDir::new("check-dest");
+        let dest = workdir.0.join("plugin");
+        let base = spec(
+            "check-plugin",
+            origin.0.to_str().unwrap(),
+            dest.to_str().unwrap(),
+        );
+
+        let locks = Arc::new(RwLock::new(HashMap::new()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        handle_install(50, vec![base.clone()], 1, &tx, &locks).await;
+        drain_events(&mut rx).await;
+        let installed_at = git_out(&dest, &["rev-parse", "HEAD"]);
+
+        handle_check(51, vec![base.clone()], 1, &tx, &locks).await;
+        let events = drain_events(&mut rx).await;
+        let items = events
+            .iter()
+            .find(|e| e["type"] == "check_result")
+            .expect("check produced no result")["items"]
+            .clone();
+        assert_eq!(items[0]["state"], "current");
+        assert_eq!(items[0]["behind"], 0);
+
+        std::fs::write(origin.0.join("plugin.txt"), "two\n").unwrap();
+        git(&origin.0, &["commit", "-aqm", "checkable subject"]);
+
+        handle_check(52, vec![base.clone()], 1, &tx, &locks).await;
+        let events = drain_events(&mut rx).await;
+        let items = events
+            .iter()
+            .find(|e| e["type"] == "check_result")
+            .expect("check produced no result")["items"]
+            .clone();
+        assert_eq!(items[0]["state"], "behind");
+        assert_eq!(items[0]["behind"], 1);
+        assert!(
+            items[0]["subjects"][0]
+                .as_str()
+                .unwrap()
+                .ends_with("checkable subject"),
+            "check did not name the incoming commit: {items:?}"
+        );
+        assert_eq!(
+            git_out(&dest, &["rev-parse", "HEAD"]),
+            installed_at,
+            "a check moved the checkout"
+        );
+
+        // And the update that follows still fast-forwards.
+        handle_update(53, vec![base.clone()], 1, &tx, &locks).await;
+        let events = drain_events(&mut rx).await;
+        assert!(
+            events
+                .iter()
+                .any(|e| e["type"] == "progress" && e["status"] == "updated"),
+            "the update after a check did not fast-forward: {events:?}"
+        );
+        assert_eq!(
+            git_out(&dest, &["rev-parse", "HEAD"]),
+            git_out(&origin.0, &["rev-parse", "HEAD"])
+        );
+
+        // A pinned plugin has nothing upstream can offer, so it is reported
+        // without touching the network at all.
+        let mut pinned = base.clone();
+        pinned.commit = installed_at.clone();
+        handle_check(54, vec![pinned], 1, &tx, &locks).await;
+        let events = drain_events(&mut rx).await;
+        let items = events
+            .iter()
+            .find(|e| e["type"] == "check_result")
+            .expect("check produced no result")["items"]
+            .clone();
+        assert_eq!(items[0]["state"], "pinned");
+
+        let mut frozen = base;
+        frozen.frozen = true;
+        handle_check(55, vec![frozen], 1, &tx, &locks).await;
+        let events = drain_events(&mut rx).await;
+        let items = events
+            .iter()
+            .find(|e| e["type"] == "check_result")
+            .expect("check produced no result")["items"]
+            .clone();
+        assert_eq!(items[0]["state"], "frozen");
+
+        // A plugin that is not there is a reported error, not a panic.
+        let absent = spec(
+            "absent-plugin",
+            origin.0.to_str().unwrap(),
+            workdir.0.join("nothing-here").to_str().unwrap(),
+        );
+        handle_check(56, vec![absent], 1, &tx, &locks).await;
+        let events = drain_events(&mut rx).await;
+        let items = events
+            .iter()
+            .find(|e| e["type"] == "check_result")
+            .expect("check produced no result")["items"]
+            .clone();
+        assert_eq!(items[0]["state"], "error");
+        assert_eq!(items[0]["message"], "not installed");
     }
 
     #[tokio::test]

@@ -157,6 +157,31 @@ restoring the directory and repeating the trigger retries the load.
         Show every plugin with its state and the date and subject of its most
         recent commit.
 
+                                                                  *:PlugCheck*
+:PlugCheck [name ...]
+        Report which plugins have updates waiting, without taking them. The
+        only thing written is what `git fetch` puts inside .git: no checkout,
+        no merge, no `do` hooks. Plugins with updates are listed first, with
+        the number of new commits and the newest subjects.
+
+        This is the read-only half of |:PlugUpdate|. Without it the only way
+        to learn whether anything needed updating was to update everything —
+        rewriting every checkout and re-running every `do` hook, which for a
+        hook that compiles something is minutes of CPU to be told nothing had
+        changed.
+
+        Press u on a row to update just that plugin. Nothing is checked on a
+        timer or at startup; a check only happens when you ask for one.
+
+        A `frozen` plugin, and one pinned with `tag` or `commit`, is reported
+        as such without touching the network: an update would not move it
+        either. The fetch does not pass --depth, so a full clone is not
+        narrowed into a shallow one by a read-only question.
+
+        Requires a daemon that announces the `check` capability. If yours does
+        not, SimplePlug says so and does nothing rather than sending a request
+        it cannot answer.
+
                                                                    *:PlugDiff*
 :PlugDiff [name ...]
         Review what the last update brought in. One section per plugin that
@@ -275,6 +300,7 @@ Inside the progress window:
   d           show that plugin's recent git log in a scratch buffer
   D           open |:PlugDiff| for that plugin: the commits its last update
               brought in, with X to roll it back
+  u           update only the plugin under the cursor
   R           retry only the plugins that failed
   S           show status
   /           filter the list

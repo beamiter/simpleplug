@@ -9,6 +9,7 @@
 - 支持 `branch`、`tag`、`commit`（版本锁定）、`do`（post-install hook）、`frozen`（锁定不更新）
 - 支持 `for`（按文件类型延迟加载）、`on`（按命令或 `<Plug>` 映射延迟加载）
 - 快照与恢复：`:PlugSnapshot` 记录全部插件的精确 commit，`:PlugRestore` 一键回滚
+- `:PlugCheck` 只读地问"有没有更新"：只 fetch，不动工作区、不跑 hook
 - `:PlugDiff` 审阅一次更新带进来的每条提交，`X` 单独把某个插件退回更新前的 commit
 - 快照漂移审计：`:PlugSnapshotDiff` 只读检查 checkout 与锁文件是否一致
 - `:PlugInstall` / `:PlugUpdate` 可指定插件名（带补全），只操作选中的插件
@@ -70,6 +71,7 @@ simpleplug#End()
 | `:PlugClean` | 确认后清理未注册的 Git 插件目录 |
 | `:PlugClean!` | 跳过确认并执行安全清理 |
 | `:PlugStatus` | 查看所有插件状态（分支、commit、最近提交、是否有修改） |
+| `:PlugCheck [name ...]` | 只读地检查哪些插件有更新（只 fetch，不改工作区、不跑 hook）；行内 `u` 只更新这一个 |
 | `:PlugDiff [name ...]` | 查看上一次更新带进来的提交，`X` 把光标所在插件回滚到更新前的 commit |
 | `:PlugRollback[!] {name}` | 直接把某个插件回滚到上一次更新前的 commit；`!` 跳过确认 |
 | `:PlugSnapshot [file]` | 把所有插件的精确 commit 写入快照文件 |

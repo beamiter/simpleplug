@@ -1,3 +1,4 @@
+:PlugCheck	simpleplug.txt	/*:PlugCheck*
 :PlugClean	simpleplug.txt	/*:PlugClean*
 :PlugDiff	simpleplug.txt	/*:PlugDiff*
 :PlugHealth	simpleplug.txt	/*:PlugHealth*

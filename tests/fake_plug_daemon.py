@@ -9,6 +9,7 @@ that appears on disk — without a network, a git server or a clock.
 Requests answered
   {"type":"ping","id":N}                    -> pong (protocol 2, real caps)
   {"type":"install"|"update","id":N,...}    -> progress per plugin, then done
+  {"type":"check","id":N,...}               -> one check_result for the batch
 
 An `update` also emits one `update_detail` per plugin it reports as updated,
 with the full OIDs and commit subjects :PlugDiff renders and its rollback
@@ -17,6 +18,9 @@ pins.  The OIDs are derived from the plugin name so a test can predict them.
 Environment
   FAKE_PLUG_FAIL      comma-separated plugin names to report as errors
   FAKE_PLUG_FROZEN    comma-separated plugin names to report as skipped/frozen
+  FAKE_PLUG_BEHIND    comma-separated plugin names a check reports as behind
+  FAKE_PLUG_DROP_CAPS comma-separated capability names to withhold from the
+                      handshake, so a test can act out an un-rebuilt daemon
   FAKE_PLUG_SILENT    if set, answer the handshake and nothing else
   FAKE_PLUG_DELAY_MS  wait this long before the first progress event
   FAKE_PLUG_TERM_DELAY_MS
@@ -51,6 +55,7 @@ CAPABILITIES = [
     "commit_pin",
     "submodules",
     "update_detail",
+    "check",
 ]
 
 
@@ -148,6 +153,33 @@ def handle_batch(req):
     emit({"type": "done", "id": rid, "summary": summary})
 
 
+def handle_check(req):
+    rid = req.get("id", 0)
+    behind = names_from_env("FAKE_PLUG_BEHIND")
+    frozen = names_from_env("FAKE_PLUG_FROZEN")
+    items = []
+    for plugin in req.get("plugins", []):
+        name = plugin["name"]
+        if name in frozen:
+            items.append({
+                "name": name, "state": "frozen", "behind": 0,
+                "dirty": False, "subjects": [], "message": "frozen",
+            })
+        elif name in behind:
+            items.append({
+                "name": name, "state": "behind", "behind": 2, "dirty": False,
+                "subjects": ["2222222 " + name + " incoming"],
+                "message": "2 new on main",
+            })
+        else:
+            items.append({
+                "name": name, "state": "current", "behind": 0,
+                "dirty": False, "subjects": [], "message": "up to date on main",
+            })
+    items.sort(key=lambda item: item["name"])
+    emit({"type": "check_result", "id": rid, "items": items})
+
+
 def install_slow_term():
     """Stay alive, and deaf, for a while after SIGTERM.
 
@@ -189,11 +221,17 @@ def main():
                     "id": req.get("id", 0),
                     "protocol_version": PROTOCOL_VERSION,
                     "version": "fake",
-                    "capabilities": {c: True for c in CAPABILITIES},
+                    "capabilities": {
+                        c: True
+                        for c in CAPABILITIES
+                        if c not in names_from_env("FAKE_PLUG_DROP_CAPS")
+                    },
                 }
             )
         elif kind in ("install", "update") and not silent:
             handle_batch(req)
+        elif kind == "check" and not silent:
+            handle_check(req)
 
 
 if __name__ == "__main__":

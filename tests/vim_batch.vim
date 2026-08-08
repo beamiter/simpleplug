@@ -269,6 +269,70 @@ assert_match('no recorded update to roll back for: diff-two-missing', execute('m
 simpleplug#UIClose()
 $FAKE_PLUG_DUMP = ''
 
+# ── :PlugCheck ──────────────────────────────────────────────────────────────
+# Before this, the only way to learn whether anything needed updating was to
+# update everything — rewriting every checkout and re-running every `do` hook.
+var check_dump = home .. '/check-requests.jsonl'
+$FAKE_PLUG_DUMP = check_dump
+$FAKE_PLUG_BEHIND = 'check-behind'
+$FAKE_PLUG_FROZEN = ''
+simpleplug#Stop()
+simpleplug#Begin(home)
+simpleplug#Plug('local/check-current', {as: 'check-current', dir: home .. '/check-current'})
+simpleplug#Plug('local/check-behind', {as: 'check-behind', dir: home .. '/check-behind'})
+simpleplug#End()
+PlugCheck
+simpleplug#Await(30)
+var check_result = simpleplug#LastResult()
+assert_equal('check', get(check_result, 'mode', ''), ':PlugCheck did not publish a result')
+assert_equal(1, get(check_result, 'behind', -1),
+  'wrong behind count: ' .. string(check_result))
+
+# The whole point is that it changes nothing.
+var check_sent = mapnew(readfile(check_dump), (_, l) => json_decode(l))
+assert_equal([], filter(mapnew(check_sent, (_, r) => get(r, 'type', '')),
+  (_, t) => t ==# 'install' || t ==# 'update'),
+  'a check sent a request that would have changed a checkout')
+
+var check_bufs = filter(getbufinfo(), (_, b) => getbufvar(b.bufnr, '&filetype') ==# 'simpleplug')
+assert_equal(1, len(check_bufs), 'expected exactly one progress buffer')
+assert_true(win_gotoid(win_findbuf(check_bufs[0].bufnr)[0]), 'the check window is gone')
+var check_rows = filter(range(1, line('$')), (_, l) => getline(l) =~# 'check-\%(behind\|current\)')
+assert_equal(2, len(check_rows), 'the check did not render both plugins')
+assert_match('check-behind', getline(check_rows[0]),
+  'a plugin with updates was not sorted to the top')
+assert_match('behind', getline(check_rows[0]), 'the behind state was not rendered')
+assert_match('2 new on main', getline(check_rows[0]), 'the check did not say what is waiting')
+
+# u updates only the plugin under the cursor — not updating everything is why
+# the check exists.
+delete(check_dump)
+cursor(check_rows[0], 1)
+feedkeys('u', 'x')
+simpleplug#Await(30)
+var check_updated = filter(mapnew(readfile(check_dump), (_, l) => json_decode(l)),
+  (_, r) => get(r, 'type', '') ==# 'update')
+assert_equal(1, len(check_updated), 'u did not send exactly one update request')
+assert_equal(['check-behind'], mapnew(check_updated[0].plugins, (_, p) => p.name),
+  'u updated more than the plugin under the cursor')
+simpleplug#UIClose()
+
+# A daemon that predates the feature is told apart from a broken one, and the
+# message names the fix. The handshake is asynchronous, so this also pins that
+# the gate waits for it instead of refusing a daemon that has not answered yet.
+$FAKE_PLUG_DROP_CAPS = 'check'
+simpleplug#Stop()
+messages clear
+PlugCheck
+assert_match('too old for :PlugCheck', execute('messages'))
+assert_true(empty(filter(getbufinfo(), (_, b) => getbufvar(b.bufnr, '&filetype') ==# 'simpleplug')),
+  'a refused check still opened the progress window')
+$FAKE_PLUG_DROP_CAPS = ''
+$FAKE_PLUG_DUMP = ''
+$FAKE_PLUG_BEHIND = ''
+$FAKE_PLUG_FROZEN = 'batch-frozen'
+simpleplug#Stop()
+
 # ── the progress UI's selection model ───────────────────────────────────────
 var sp_script = getscriptinfo({name: 'autoload/simpleplug.vim'})[0]
 var NameAtCursor = function(printf('<SNR>%d_PluginNameAtCursor', sp_script.sid))

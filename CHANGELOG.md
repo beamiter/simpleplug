@@ -2,6 +2,29 @@
 
 ## Unreleased - 2026-08-08
 
+### :PlugCheck：只问"有没有更新"，不真的更新
+
+- 新增 `:PlugCheck [name ...]`：只读的更新检查。唯一写盘的是 `git fetch` 往 `.git` 里
+  放的对象和远端引用——不 checkout、不 merge、不跑 `do` hook。在此之前想知道
+  "有没有东西要更新"的唯一办法是真的更新一遍：作者自己的配置里那意味着二十多个
+  checkout 被改写、每个 `do: './install.sh'` 重新 cargo build 一次，几分钟 CPU 换来
+  一句"其实没变"。
+- 有更新的插件排在最前面，报出新提交条数与最新的几条主题；行内按 `u` 只更新这一个
+  ——检查的全部意义就在于之后不必全量更新。`:PlugHealth` 会带上最近一次检查的结果。
+- `frozen` 与 tag/commit 锁定的插件直接报出来，不联网：`:PlugUpdate` 本来也不会把
+  它们挪到别处去，问上游没有意义。
+- fetch **不带** `--depth`：在完整克隆上加 `--depth` 会把取回来的引用变成浅的，
+  一次只读的提问没有任何理由去改仓库的形状。浅克隆自己的 fetch 默认沿用原来的深度
+  边界，两边都不用特别处理。
+- daemon 新增 `check` 请求与 `check_result` 事件（capability `check`）。daemon 不宣告
+  这个能力时 `:PlugCheck` 明说"太旧了，跑 ./install.sh 再 :PlugRestart"，而不是发一个
+  它答不上来的请求。能力协商是异步的，所以这个判断会先等握手回来——不然 daemon 刚
+  被拉起来的那一次会把一个完全正常的 daemon 误判成旧的。
+- 回归：Rust 端断言检查报出 behind 数与主题、不移动 checkout、**检查之后的真实
+  update 仍然能 fast-forward**（浅克隆被 `--depth` 弄坏的正是这一条），以及 pinned /
+  frozen / 未安装三种收尾。Vim 端断言检查全程没发出任何会改动 checkout 的请求、
+  有更新的行排在最前、`u` 只更新光标那一个，以及缺 capability 时的降级。
+
 ### 快照变成一个能 review 的锁文件
 
 - 修复：`:PlugSnapshot` 之前是 `json_encode(snap)`，一行到底、键序取决于 Vim 字典的

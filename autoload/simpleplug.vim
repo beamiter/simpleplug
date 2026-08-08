@@ -594,6 +594,17 @@ def IsRunning(): bool
   return simpleplug#core#IsRunning()
 enddef
 
+# 握手完成了吗？`sleep` 是让 Vim 跑那个投递 pong 的 channel 回调的东西。
+# 返回 false 表示"还不知道"，调用方据此选择乐观放行而不是拒绝。
+def WaitForHandshake(limit: float = 2.0): bool
+  var since = reltime()
+  while !simpleplug#core#Ready() && simpleplug#core#IsRunning()
+      && reltimefloat(reltime(since)) < limit
+    sleep 10m
+  endwhile
+  return simpleplug#core#Ready()
+enddef
+
 def EnsureBackend(): bool
   SetupCore()
   # Timeouts are read fresh on every start so :PlugInstall picks up a change
@@ -674,6 +685,10 @@ export def Health()
     executable('git') ? exepath('git') : 'not found in $PATH'))
   add(lines, printf('[INFO] plugin directory: %s', get(g:, 'simpleplug_dir', '(unset)')))
   add(lines, printf('[INFO] registered plugins: %d', len(s_plugins)))
+  if s_check_behind >= 0
+    add(lines, printf('[INFO] %d plugin%s had updates at the last :PlugCheck',
+      s_check_behind, s_check_behind == 1 ? '' : 's'))
+  endif
   add(lines, printf('[INFO] git timeout: %ds, hook timeout: %ds',
     get(g:, 'simpleplug_git_timeout', 300), get(g:, 'simpleplug_hook_timeout', 600)))
   for line in lines
@@ -740,6 +755,11 @@ def OnDaemonEvent(ev: dict<any>)
     if has_key(s_cbs, id)
       remove(s_cbs, id)
     endif
+  elseif ev.type ==# 'check_result'
+    OnCheckResult(ev)
+    if has_key(s_cbs, id)
+      remove(s_cbs, id)
+    endif
   elseif ev.type ==# 'hook_done'
     OnHookDone(ev)
     if has_key(s_cbs, id)
@@ -753,7 +773,7 @@ def OnDaemonEvent(ev: dict<any>)
   endif
 
   if ev.type ==# 'done' || ev.type ==# 'error' || ev.type ==# 'status_result'
-      || ev.type ==# 'hook_done' || ev.type ==# 'clean_done'
+      || ev.type ==# 'check_result' || ev.type ==# 'hook_done' || ev.type ==# 'clean_done'
     s_active_id = 0
   endif
 enddef
@@ -987,6 +1007,7 @@ def PublishResult()
     ok: counts.ok,
     frozen: counts.frozen,
     removed: counts.removed,
+    behind: counts.behind,
     errors: len(failed),
     failed: failed,
     elapsed: empty(s_ui_start_time) ? 0.0 : reltimefloat(reltime(s_ui_start_time)),
@@ -1771,6 +1792,52 @@ export def Status()
   Send({type: 'status', id: id, plugins: PluginSpecs(s_plugins), jobs: JobCount()})
 enddef
 
+# 只读的更新检查：唯一联网、但绝不改工作区、绝不跑 hook 的操作。
+#
+# 在此之前，想知道"有没有东西要更新"的唯一办法是真的更新一遍——在作者自己的
+# 配置里那意味着二十多个 checkout 被改写、每个 `do: './install.sh'` 重新
+# cargo build 一次，几分钟 CPU 只为了得到一个"其实没变"。
+export def Check(names: list<string> = [])
+  if !EnsureBackend()
+    return
+  endif
+  # 能力协商是异步的：daemon 刚被 EnsureBackend() 拉起来时 pong 还没回来，
+  # 这时问 HasCap() 会得到 false，于是一个完全正常的 daemon 被当成旧的挡掉。
+  # 等一小会儿握手；真等不到就照发不误，让正常的错误路径去报——把一次误判
+  # 变成一句"这个 daemon 太旧了"是最坏的处理方式。
+  if WaitForHandshake() && !simpleplug#core#HasCap('check')
+    echohl WarningMsg
+    echom '[SimplePlug] this daemon is too old for :PlugCheck — run ./install.sh, then :PlugRestart'
+    echohl None
+    return
+  endif
+  var plugs = SelectPlugins(names)
+  if empty(plugs)
+    return
+  endif
+  var id = StartRequest('check')
+  if id == 0
+    return
+  endif
+  s_ui_total = len(plugs)
+  s_ui_finished = 0
+  s_ui_start_time = reltime()
+  InitPlugStates(plugs, 'waiting', '·')
+  UIOpen()
+  Send({type: 'check', id: id, plugins: PluginSpecs(plugs), jobs: JobCount()})
+enddef
+
+# 光标所在插件的 u：只更新这一个。检查的意义就在于之后不必全量更新。
+export def UIUpdateSelected()
+  var name = PluginNameAtCursor()
+  if name ==# ''
+    echom '[SimplePlug] put the cursor on a plugin row'
+    return
+  endif
+  s_ui_cursor_name = name
+  Update([name])
+enddef
+
 export def RunHook(name: string)
   if !EnsureBackend()
     return
@@ -1975,6 +2042,59 @@ def OnStatusResult(ev: dict<any>)
   UIBuildAndRender()
 enddef
 
+# 上游有新东西的排在最前面：一次检查过后真正要看的就是那几行。
+var s_check_behind: number = -1
+
+def OnCheckResult(ev: dict<any>)
+  StopSpinner()
+  var items = get(ev, 'items', [])
+  var behind_total = 0
+  var ordered: list<string> = []
+  var rest: list<string> = []
+  for item in items
+    var name = get(item, 'name', '')
+    if name ==# ''
+      continue
+    endif
+    var state = get(item, 'state', 'error')
+    var behind = get(item, 'behind', 0)
+    var subjects = get(item, 'subjects', [])
+    var msg = get(item, 'message', '')
+    if !empty(subjects)
+      msg ..= ': ' .. join(subjects, ' | ')
+    endif
+    if get(item, 'dirty', false)
+      msg ..= ' (dirty)'
+    endif
+    var st = {status: 'done', msg: msg, icon: '●', action: 'current',
+      branch: '', commit: '', dirty: get(item, 'dirty', false)}
+    if state ==# 'behind'
+      behind_total += 1
+      st.icon = '↓'
+      st.action = 'behind'
+    elseif state ==# 'pinned'
+      st.icon = '◆'
+      st.action = 'pinned'
+    elseif state ==# 'frozen'
+      st.status = 'skipped'
+      st.icon = '○'
+      st.action = 'frozen'
+    elseif state ==# 'error'
+      st.status = 'error'
+      st.icon = '✘'
+      st.action = 'error'
+    endif
+    s_ui_plug_state[name] = st
+    add(state ==# 'behind' ? ordered : rest, name)
+  endfor
+  s_ui_targets = ordered + rest
+  s_ui_finished = len(items)
+  s_check_behind = behind_total
+  s_ui_mode = 'check_done'
+  PublishResult()
+  UIBuildAndRender()
+enddef
+
 def OnHookDone(ev: dict<any>)
   StopSpinner()
   var name = get(ev, 'name', '')
@@ -2059,6 +2179,10 @@ def ModeTitle(): string
     return 'Update Complete'
   elseif s_ui_mode ==# 'status' || s_ui_mode ==# 'status_done'
     return 'Plugin Status'
+  elseif s_ui_mode ==# 'check'
+    return 'Checking for Updates'
+  elseif s_ui_mode ==# 'check_done'
+    return 'Update Check'
   elseif s_ui_mode ==# 'clean' || s_ui_mode ==# 'clean_done'
     return 'Clean Plugins'
   elseif s_ui_mode ==# 'hook' || s_ui_mode ==# 'hook_done'
@@ -2223,6 +2347,10 @@ def UiIcon(st: dict<any>, is_done: bool): string
     return '◆'
   elseif action ==# 'error' || action ==# 'missing'
     return '✘'
+  elseif action ==# 'behind'
+    return '↓'
+  elseif action ==# 'current'
+    return '●'
   elseif action ==# 'frozen'
     return '○'
   elseif action ==# 'dirty'
@@ -2234,14 +2362,17 @@ def UiIcon(st: dict<any>, is_done: bool): string
 enddef
 
 def SummaryCounts(): dict<number>
-  var counts = {installed: 0, updated: 0, ok: 0, frozen: 0, dirty: 0, errors: 0, removed: 0, missing: 0}
+  var counts = {installed: 0, updated: 0, ok: 0, frozen: 0, dirty: 0, errors: 0, removed: 0,
+    missing: 0, behind: 0}
   for [_, st] in items(s_ui_plug_state)
     var action = UiAction(st)
     if action ==# 'installed'
       counts.installed += 1
     elseif action ==# 'updated'
       counts.updated += 1
-    elseif action ==# 'ok' || action ==# 'hook' || action ==# 'pinned'
+    elseif action ==# 'behind'
+      counts.behind += 1
+    elseif action ==# 'ok' || action ==# 'hook' || action ==# 'pinned' || action ==# 'current'
       counts.ok += 1
     elseif action ==# 'frozen'
       counts.frozen += 1
@@ -2301,6 +2432,9 @@ def UIBuildAndRender(move_cursor: bool = false)
     s_ui_total, counts.installed, counts.updated, counts.ok, counts.frozen, counts.errors + counts.missing + counts.dirty)
   if counts.removed > 0
     stats ..= printf('  removed %d', counts.removed)
+  endif
+  if counts.behind > 0
+    stats ..= printf('  behind %d', counts.behind)
   endif
   AddUiLine(lines, stats, W)
 
@@ -2391,7 +2525,7 @@ def UIBuildAndRender(move_cursor: bool = false)
 
   add(lines, DividerLine(W))
   AddUiLine(lines, '  ' .. SummaryLine(), W)
-  AddUiLine(lines, '  q close  j/k move  <CR> open  d log  D diff  / filter  ? help  R retry  S status', W)
+  AddUiLine(lines, '  q close  j/k move  <CR> open  d log  D diff  u update  / filter  ? help  R retry  S status', W)
 
   s_ui_lines = lines
   UIRender(move_cursor)
@@ -2405,6 +2539,9 @@ def SummaryLine(): string
   endif
   if counts.updated > 0
     add(parts, printf('%d updated', counts.updated))
+  endif
+  if counts.behind > 0
+    add(parts, printf('%d behind', counts.behind))
   endif
   if counts.ok > 0
     add(parts, printf('%d ok', counts.ok))
@@ -2464,6 +2601,7 @@ def UIOpen()
   nnoremap <buffer><silent> <CR> <Cmd>call simpleplug#OpenPluginDir()<CR>
   nnoremap <buffer><silent> d <Cmd>call simpleplug#ViewPluginDiff()<CR>
   nnoremap <buffer><silent> D <Cmd>call simpleplug#ViewIncomingDiff()<CR>
+  nnoremap <buffer><silent> u <Cmd>call simpleplug#UIUpdateSelected()<CR>
   nnoremap <buffer><silent> h <Cmd>call simpleplug#ToggleHelp()<CR>
   nnoremap <buffer><silent> ? <Cmd>call simpleplug#ToggleHelp()<CR>
   nnoremap <buffer><silent> / <Cmd>call simpleplug#StartFilterSplit()<CR>
@@ -2578,6 +2716,7 @@ def DoToggleHelp()
     '    Enter       打开插件目录',
     '    d           查看 git log',
     '    D           查看这次 update 带进来的提交（可回滚）',
+    '    u           只更新光标所在的插件',
     '    /           搜索过滤插件',
     '    R           重试失败的插件',
     '    S           查看状态',
@@ -2670,6 +2809,8 @@ def SetupSyntax()
   win_execute(w, 'syntax match SPlugIconSkip /○/')
   win_execute(w, 'syntax match SPlugIconWait /·/')
   win_execute(w, 'syntax match SPlugIconRemove /-/')
+  win_execute(w, 'syntax match SPlugIconBehind /↓/')
+  win_execute(w, 'syntax match SPlugStateBehind /\<behind\>/')
   # 时间
   win_execute(w, 'syntax match SPlugTime /\d\+\.\d\+s/')
   # spinner
@@ -2734,6 +2875,8 @@ def SetupSyntax()
   win_execute(w, 'highlight default SPlugIconSkip ctermfg=245 guifg=#8a8a8a')
   win_execute(w, 'highlight default SPlugIconWait ctermfg=240 guifg=#585858')
   win_execute(w, 'highlight default SPlugIconRemove ctermfg=204 guifg=#ff5f87')
+  win_execute(w, 'highlight default SPlugIconBehind ctermfg=180 guifg=#d7af87 cterm=bold gui=bold')
+  win_execute(w, 'highlight default SPlugStateBehind ctermfg=180 guifg=#d7af87 cterm=bold gui=bold')
   # 其他
   win_execute(w, 'highlight default SPlugTime ctermfg=245 guifg=#8a8a8a')
   win_execute(w, 'highlight default SPlugSpinner ctermfg=75 guifg=#5fafff')
