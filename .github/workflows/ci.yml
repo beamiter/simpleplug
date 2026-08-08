@@ -13,14 +13,35 @@ jobs:
   # newly used language feature can quietly break it, because every other job
   # runs on stable.  This is the check that caught `ignore` pulling in
   # let-chains and two crates whose own sources had outgrown their declared
-  # MSRV.  Keep the toolchain here in step with rust-version in Cargo.toml.
+  # MSRV.  The toolchain pinned here and rust-version in Cargo.toml drifted
+  # apart once already — the pin sat at 1.85 while the crate declared 1.88, so
+  # cargo hard-errored before compiling anything and CI was red on every push
+  # for as long as nobody looked.  The assertion below is why that cannot
+  # happen silently again: keep the two in step or this job says so.
   msrv:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - name: The pinned toolchain must be the declared MSRV
+        run: |
+          declared="$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)"
+          installed="$(rustc --version | cut -d' ' -f2)"
+          echo "Cargo.toml declares $declared; this job runs rustc $installed"
+          if [ -z "$declared" ]; then
+            echo "::error::Cargo.toml declares no rust-version"
+            exit 1
+          fi
+          case "$installed" in
+            "$declared"|"$declared".*) ;;
+            *)
+              echo "::error::this job pins rustc $installed but Cargo.toml declares $declared"
+              exit 1
+              ;;
+          esac
       - name: Build on the declared minimum supported Rust
         run: cargo check --all-targets --locked
+
   test:
     runs-on: ubuntu-latest
     steps:
@@ -37,18 +58,23 @@ jobs:
           rustup update stable
           rustup default stable
 
+      # The Makefile is the single source of truth for what the gate is:
+      # core-verify, fmt, clippy, cargo test, :defcompile, the simplecore
+      # supervisor suite and both Vim suites.  Hand-listing a subset here only
+      # teaches CI to disagree with `make check` run locally.
       - name: Run quality gate
         run: make check
 
       - name: Verify installer and daemon handshake
         run: |
           ./install.sh
+          protocol="$(sed -n 's/^const PROTOCOL_VERSION: u32 = \([0-9]\+\);/\1/p' \
+            src/simpleplug/simpleplug_daemon.rs)"
+          if [ -z "$protocol" ]; then
+            echo "::error::could not read PROTOCOL_VERSION from the daemon source"
+            exit 1
+          fi
+          echo "daemon source declares protocol version $protocol"
           response="$(printf '%s\n' '{"type":"ping","id":1}' | ./lib/simpleplug-daemon)"
           grep -F '"type":"pong"' <<<"$response"
-          grep -F '"protocol_version":2' <<<"$response"
-
-      - name: Compile every Vim9 def (lazy compilation hides cold-branch errors)
-        run: make defcompile
-
-      - name: simplecore supervisor regression suite
-        run: make vim-core
+          grep -F "\"protocol_version\":$protocol" <<<"$response"

@@ -2,6 +2,19 @@
 
 ## Unreleased - 2026-08-08
 
+### CI 重新变绿
+
+- 修复：workflow 把 MSRV job 钉在 `dtolnay/rust-toolchain@1.85.0`，而 Cargo.toml
+  早已声明 `rust-version = "1.88"`。cargo 把更高的 rust-version 当硬错误，于是
+  这个 job 在编译任何东西之前就失败——每一次 push 都是红的。改钉 1.88.0，并加一步
+  从 Cargo.toml 读出 `rust-version` 与实际 `rustc --version` 比对，两者再分家会
+  直接报错，不会又悄悄躺红。
+- handshake 检查不再硬编码 `"protocol_version":2`，改为从
+  `src/simpleplug/simpleplug_daemon.rs` 的 `PROTOCOL_VERSION` 推导，协议号改动时
+  不用记得同步改 CI（隔壁 simplemarkdown 正是死在这条上）。
+- 删掉 CI 里重复列出的 `make defcompile` / `make vim-core`：门禁是什么由 Makefile
+  一处说了算，`make check` 已经包含它们，也顺带把新的 `make vim-batch` 带进 CI。
+
 ### 装好的插件当场生效
 
 - `g:simpleplug_auto_install` 默认开着，可首次启动的实际体验是：Vim 起来，克隆
