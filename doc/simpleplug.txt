@@ -216,6 +216,11 @@ mid-flight — SimplePlug sets |g:simpleplug_last_result| and then fires the
     autocmd User SimplePlugComplete
       \ if g:simpleplug_last_result.errors > 0 | PlugLog | endif
 <
+The event is fired even when |g:simpleplug_activate_on_install| activation or
+helptag generation throws, so a broken plugin — or a typo in your own
+|simpleplug#Plug()| options — cannot leave |:PlugInstall!| returning silently
+with the previous run's dictionary.
+
                                                  *g:simpleplug_last_result*
 The result of the most recent operation, a dictionary with these keys:
 
@@ -283,8 +288,13 @@ ftdetect/ files are sourced too and already-open buffers are re-detected, so a
 filetype the plugin introduces takes effect immediately. A plugin declared
 with `for` or `on` only gets its triggers armed — it stays unloaded until one
 of them fires, as usual. A plugin whose directory did not actually appear is
-reported and left unloaded, and a script that throws is reported on that
-plugin's row without stopping the rest of the batch.
+reported and left unloaded.
+
+Anything that goes wrong while a plugin is being activated — a script that
+throws, a `for`/`on` trigger that is not a usable command name or mapping, a
+runtime directory Vim will not take — is reported on that plugin's row and
+goes no further. It does not stop the rest of the batch, and it never
+suppresses helptag generation or |SimplePlugComplete|.
 
 Set it to 0 if you would rather restart Vim: sourcing third-party code at an
 unusual moment can upset a plugin that assumes it loads before |VimEnter|.

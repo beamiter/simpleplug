@@ -16,6 +16,22 @@
   退也不读，把那个窗口稳定地撑开；测试在 `simpleplug#Stop()` 之后立刻
   `:PlugInstall!`，断言结果里没有错误。修复前必然失败。
 
+### 完成事件不再被激活时的异常带走
+
+- 修复：`ActivateInstalled()` 里只有 source 插件脚本那一步有 try/catch，
+  `SetupLazyLoad()` 没有——`{on: 'fzf'}` 这类小写触发器（不是合法命令名）会让
+  `:command!` 抛 E183，异常一路冲出 `ActivateInstalled()`，被 `OnDaemonEvent`
+  里那个空 catch 吞掉，`GenerateHelptags()` 和 `PublishResult()` 全都没跑：
+  `User SimplePlugComplete` 不触发，`g:simpleplug_last_result` 停在上一次的值，
+  `:PlugInstall!` 悄无声息地返回一份过期字典。
+- 现在整个 per-plugin 循环体都在 try 里，失败记在那个插件自己的行上；
+  `OnDone` 里的激活与 helptags 另加一层 try/finally，`PublishResult()` 放在
+  finally 里，文档承诺的"操作结束——包括失败——都会触发 SimplePlugComplete"
+  不会被第三方代码或用户配置里的一个笔误作废。
+- `OnDaemonEvent` 的两个空 catch 现在会 `Log()` 吞掉的是什么。
+- 回归：注册一个 `on: 'fzf'` 的插件后 `:PlugInstall!`，断言事件照常触发一次、
+  结果字典是这一次的、并且失败写在该插件自己的进度行上。
+
 ### 进度窗口的选择模型
 
 - 修复：光标所在行是拿每个已注册插件名去子串匹配行文本解析的，于是前缀名会盖住

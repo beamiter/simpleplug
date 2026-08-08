@@ -713,6 +713,8 @@ def OnDaemonEvent(ev: dict<any>)
       try
         s_cbs[id].OnDone(ev)
       catch
+        # 一个静默的 catch 曾经把整条完成路径的失败藏了起来；至少留个痕迹。
+        Log('done callback for request ' .. id .. ' threw: ' .. v:exception, 'WarningMsg')
       endtry
       remove(s_cbs, id)
     endif
@@ -722,6 +724,7 @@ def OnDaemonEvent(ev: dict<any>)
       try
         s_cbs[id].OnError(ev)
       catch
+        Log('error callback for request ' .. id .. ' threw: ' .. v:exception, 'WarningMsg')
       endtry
       remove(s_cbs, id)
     endif
@@ -856,10 +859,19 @@ def RunBatch(mode: string, plugs: list<dict<any>>, specs: list<dict<any>>)
       StopSpinner()
       s_ui_mode = mode .. '_done'
       RecountFinished()
-      ActivateInstalled()
-      GenerateHelptags()
-      PublishResult()
-      UIBuildAndRender()
+      # 激活和 helptags 都在跑别人的代码。:help simpleplug 承诺“操作结束——
+      # 包括失败——都会设好 g:simpleplug_last_result 并触发
+      # User SimplePlugComplete”，这个承诺不能被第三方插件或用户配置里的一个
+      # 异常作废，否则 :PlugInstall! 会悄悄返回一份上一次的结果字典。
+      try
+        ActivateInstalled()
+        GenerateHelptags()
+      catch
+        Log('post-batch activation failed: ' .. v:exception, 'WarningMsg')
+      finally
+        PublishResult()
+        UIBuildAndRender()
+      endtry
     },
     OnError: (ev) => {
       StopSpinner()
@@ -890,27 +902,39 @@ def ActivateInstalled()
     endif
     # 第三方代码在一个不寻常的时刻运行：单个插件失败只记在它自己那一行上，
     # 不影响这一批里的其他插件。
-    var dir = CheckedRuntimeDir(plug, true)
-    if empty(dir)
-      st.msg = get(st, 'msg', '') .. ' | not activated'
-      s_ui_plug_state[name] = st
-      continue
-    endif
-    if !empty(get(plug, 'on_ft', '')) || !empty(get(plug, 'on_cmd', ''))
-      # End() 当时整个跳过了这个插件（目录还不存在），触发器是第一次装上。
-      s_loaded_plugins[name] = false
-      SetupLazyLoad(plug, dir)
-    else
-      s_loaded_plugins[name] = true
-      AddRuntimePath(dir)
-      var failures = SourcePluginScripts(name, dir)
-      SourceFtdetect(dir)
-      if !empty(failures)
-        st.msg = get(st, 'msg', '') .. ' | activate: ' .. failures[0]
+    #
+    # 整个循环体都在 try 里，不只是 source 插件脚本那一步。SetupLazyLoad 对一个
+    # 不是合法命令名的触发器（{on: 'fzf'} 这类笔误）会抛 E183，AddRuntimePath
+    # 和 for-pattern autocmd 也各有抛法；这些异常会被 OnDaemonEvent 的 catch
+    # 吞掉，顺带把 GenerateHelptags() 和 PublishResult() 一起带走——
+    # User SimplePlugComplete 不再触发，g:simpleplug_last_result 停在上一次的值。
+    try
+      var dir = CheckedRuntimeDir(plug, true)
+      if empty(dir)
+        st.msg = get(st, 'msg', '') .. ' | not activated'
         s_ui_plug_state[name] = st
+        continue
       endif
-    endif
-    activated += 1
+      if !empty(get(plug, 'on_ft', '')) || !empty(get(plug, 'on_cmd', ''))
+        # End() 当时整个跳过了这个插件（目录还不存在），触发器是第一次装上。
+        s_loaded_plugins[name] = false
+        SetupLazyLoad(plug, dir)
+      else
+        s_loaded_plugins[name] = true
+        AddRuntimePath(dir)
+        var failures = SourcePluginScripts(name, dir)
+        SourceFtdetect(dir)
+        if !empty(failures)
+          st.msg = get(st, 'msg', '') .. ' | activate: ' .. failures[0]
+          s_ui_plug_state[name] = st
+        endif
+      endif
+      activated += 1
+    catch
+      st.msg = get(st, 'msg', '') .. ' | activate: ' .. v:exception
+      s_ui_plug_state[name] = st
+      Log('activation of ' .. name .. ' failed: ' .. v:exception, 'WarningMsg')
+    endtry
   endfor
   if activated > 0
     # 已经打开的 buffer 也该认出新插件带来的 filetype。

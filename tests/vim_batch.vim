@@ -159,6 +159,40 @@ assert_false(exists('g:simpleplug_batch_optout_loaded'),
   'g:simpleplug_activate_on_install = 0 still activated the plugin')
 g:simpleplug_activate_on_install = 1
 
+# ── activation must not be able to void the completion contract ─────────────
+# `on: 'fzf'` is a plausible typo: a lazy trigger has to be a valid user
+# command name, so :command! throws E183 from inside ActivateInstalled. That
+# exception used to take the rest of OnDone with it and land in a bare catch —
+# no helptags, no fresh g:simpleplug_last_result and no SimplePlugComplete, so
+# `:PlugInstall!` returned silently carrying the previous run's dictionary.
+var bad_dir = home .. '/batch-badlazy'
+PlantTemplate(bad_dir, [
+  'vim9script',
+  'g:simpleplug_batch_badlazy_loaded = 1',
+])
+var events_before = g:simpleplug_batch_events
+simpleplug#Stop()
+simpleplug#Begin(home)
+simpleplug#Plug('local/batch-badlazy', {as: 'batch-badlazy', dir: bad_dir, on: 'fzf'})
+simpleplug#End()
+g:simpleplug_last_result = {'sentinel': 'STALE'}
+PlugInstall!
+assert_equal(events_before + 1, g:simpleplug_batch_events,
+  'a throw inside activation swallowed the completion event')
+result = simpleplug#LastResult()
+assert_equal('install', get(result, 'mode', ''),
+  'the completion result was left stale: ' .. string(result))
+assert_equal(1, get(result, 'installed', -1),
+  'the completion result was left stale: ' .. string(result))
+# And the plugin that could not be activated says so on its own row (the
+# Details column is truncated to the window, so only its beginning is visible).
+var bad_bufs = filter(getbufinfo(), (_, b) => getbufvar(b.bufnr, '&filetype') ==# 'simpleplug')
+assert_equal(1, len(bad_bufs), 'expected exactly one progress buffer')
+var bad_rows = filter(getbufline(bad_bufs[0].bufnr, 1, '$'), (_, l) => l =~# 'batch-badlazy')
+assert_equal(1, len(bad_rows), 'the progress UI did not render the plugin')
+assert_match('activate: Vim', bad_rows[0],
+  'a failed activation was not reported on the plugin row')
+
 # ── :PlugRestore must move a frozen plugin ──────────────────────────────────
 # The daemon tests `frozen` before it looks at the commit pin, so a restore
 # that forwards frozen:true has the plugin reported as skipped and the checkout
