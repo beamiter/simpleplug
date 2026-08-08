@@ -180,13 +180,24 @@ See |simpleplug-daemon| for :PlugHealth, :PlugRestart and :PlugLog.
 
 Inside the progress window:
 
-  q       close
-  R       retry the failed plugins
-  S       show status
-  <CR>    open the plugin directory under the cursor
-  d       view the plugin's incoming diff
-  /       filter the list
-  h, ?    toggle the key help
+  j, k        move the selection to the next/previous plugin
+  <CR>        open the directory of the plugin under the cursor
+  d           show that plugin's recent git log in a scratch buffer
+  R           retry only the plugins that failed
+  S           show status
+  /           filter the list
+  h, ?        toggle the key help
+  q, <Esc>    close
+
+The row under the cursor is resolved from the map built while rendering, so a
+plugin whose name is a prefix of another (simpletree and simpletreesitter, say)
+resolves to the row you are actually on.
+
+While an operation runs the list is ordered working, then finished, then
+waiting, and the spinner redraws it every |g:simpleplug_spinner_interval|
+milliseconds. Redraws no longer move the cursor, and once you have selected a
+row with j/k the ordering is frozen, so the plugin you are reading stays where
+it is until the operation ends.
 
 ==============================================================================
 6. SCRIPTING                                            *simpleplug-scripting*

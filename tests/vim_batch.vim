@@ -115,9 +115,13 @@ assert_true(index(split(&runtimepath, ','), eager_dir) >= 0,
 
 # Its ftdetect has to be sourced by hand: Vim only walks runtimepath for
 # ftdetect at startup, which for a first-run install has long since happened.
-set filetype=
+# In its own scratch buffer — the current window here is the progress window,
+# and setting a filetype on that buffer would break every later UI assertion.
+new
+setlocal buftype=nofile bufhidden=wipe noswapfile
 doautocmd BufRead example.batchfixture
 assert_equal('batchfixture', &filetype, 'activated plugin ftdetect did not run')
+bwipeout!
 
 # A lazy plugin gets its triggers armed, not its body sourced.
 assert_false(exists('g:simpleplug_batch_lazy_loaded'), 'lazy plugin was activated eagerly')
@@ -177,6 +181,58 @@ assert_equal(1, len(sent), 'restore did not send exactly one update request')
 assert_equal(pinned_oid, sent[0].plugins[0].commit, 'restore did not pin the snapshot commit')
 assert_false(sent[0].plugins[0].frozen, 'restore asked the daemon to skip a frozen plugin')
 $FAKE_PLUG_DUMP = ''
+
+# ── the progress UI's selection model ───────────────────────────────────────
+var sp_script = getscriptinfo({name: 'autoload/simpleplug.vim'})[0]
+var NameAtCursor = function(printf('<SNR>%d_PluginNameAtCursor', sp_script.sid))
+var SpinnerTick = function(printf('<SNR>%d_SpinnerTick', sp_script.sid))
+
+var ui_dump = home .. '/ui-requests.jsonl'
+$FAKE_PLUG_DUMP = ui_dump
+$FAKE_PLUG_FAIL = 'ui-plug-extra'
+simpleplug#Stop()
+simpleplug#Begin(home)
+# A prefix pair, exactly like the author's own simpletree / simpletreesitter.
+simpleplug#Plug('local/ui-plug', {as: 'ui-plug', dir: home .. '/ui-plug'})
+simpleplug#Plug('local/ui-plug-extra', {as: 'ui-plug-extra', dir: home .. '/ui-plug-extra'})
+simpleplug#End()
+PlugInstall!
+var ui_bufs = filter(getbufinfo(), (_, b) => getbufvar(b.bufnr, '&filetype') ==# 'simpleplug')
+assert_equal(1, len(ui_bufs), 'expected exactly one progress buffer')
+assert_true(win_gotoid(win_findbuf(ui_bufs[0].bufnr)[0]), 'the progress window is gone')
+
+var rows = filter(range(1, line('$')), (_, l) => getline(l) =~# 'ui-plug')
+assert_equal(2, len(rows), 'the progress UI did not render both plugins: ' .. string(rows))
+var extra_row = getline(rows[0]) =~# 'ui-plug-extra' ? rows[0] : rows[1]
+cursor(extra_row, 1)
+assert_equal('ui-plug-extra', call(NameAtCursor, []),
+  'a plugin name that is a prefix of another shadowed it')
+
+# j/k are advertised in the footer and in `?`; they have to actually move.
+cursor(rows[0], 1)
+feedkeys('j', 'x')
+assert_equal(rows[1], line('.'), 'j did not move to the next plugin row')
+assert_match('▸', getline(rows[1]), 'the selection marker did not follow the cursor')
+feedkeys('k', 'x')
+assert_equal(rows[0], line('.'), 'k did not move back to the previous plugin row')
+
+# A spinner tick renders; it must not drag the cursor back to the first row.
+cursor(rows[1], 1)
+call(SpinnerTick, [0])
+assert_equal(rows[1], line('.'), 'a spinner tick dragged the cursor away')
+
+# R retries the failed plugins, which is what the footer and :help promise.
+delete(ui_dump)
+feedkeys('R', 'x')
+simpleplug#Await(30)
+var retried = filter(mapnew(readfile(ui_dump), (_, l) => json_decode(l)),
+  (_, r) => get(r, 'type', '') ==# 'install')
+assert_equal(1, len(retried), 'R did not send exactly one install request')
+assert_equal(['ui-plug-extra'], mapnew(retried[0].plugins, (_, p) => p.name),
+  'R retried every plugin instead of only the failed ones')
+$FAKE_PLUG_DUMP = ''
+$FAKE_PLUG_FAIL = ''
+simpleplug#UIClose()
 
 # ── a silent daemon must not wedge Vim forever ──────────────────────────────
 simpleplug#Stop()

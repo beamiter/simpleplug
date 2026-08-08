@@ -132,7 +132,13 @@ enddef
 
 # ─────────────────── UI 交互状态 ───────────────────
 
-var s_ui_cursor_line: number = 0
+# The selected plugin is tracked by name, not by row index: the list re-sorts
+# while an operation runs, and an index would silently point at a different
+# plugin after every 200ms spinner tick.
+var s_ui_cursor_name: string = ''
+# Rendered buffer line (as a string key) -> plugin name.  Built while
+# rendering, so resolving the row under the cursor is exact.
+var s_ui_line_map: dict<string> = {}
 var s_ui_show_help: bool = false
 var s_ui_filter_text: string = ''
 var s_ui_filter_active: bool = false
@@ -1385,7 +1391,7 @@ def InitPlugStates(plugs: list<dict<any>>, status: string, icon: string)
   s_ui_plug_state = {}
   s_ui_plug_timings = {}
   s_ui_plug_start_times = {}
-  s_ui_cursor_line = 0
+  s_ui_cursor_name = ''
   s_ui_filter_text = ''
   s_ui_filter_active = false
   s_ui_targets = mapnew(plugs, (_, p) => p.name)
@@ -1676,7 +1682,10 @@ enddef
 
 def SortedPluginNames(): list<string>
   # install/update 进行中: working > done/error > waiting
-  if IsInstallUpdateRunning()
+  #
+  # 但只在用户还没选中任何一行之前。一旦选了，顺序就冻住：否则他刚翻到的
+  # 那一行会在下一次 spinner tick 里被重新排走。
+  if IsInstallUpdateRunning() && s_ui_cursor_name ==# ''
     var working: list<string> = []
     var finished: list<string> = []
     var waiting: list<string> = []
@@ -1841,7 +1850,7 @@ def SetUiBufferLines()
   setbufvar(s_ui_bufnr, '&modifiable', 0)
 enddef
 
-def UIBuildAndRender()
+def UIBuildAndRender(move_cursor: bool = false)
   var lines: list<string> = []
   var title = ModeTitle()
   var is_done = IsDone()
@@ -1850,6 +1859,7 @@ def UIBuildAndRender()
 
   s_ui_sorted_names = SortedPluginNames()
   s_ui_cursor_buf_line = 0
+  s_ui_line_map = {}
   var display_plugins = GetDisplayPlugins()
 
   var shown_finished = s_ui_finished > s_ui_total ? s_ui_total : s_ui_finished
@@ -1884,13 +1894,11 @@ def UIBuildAndRender()
   if s_ui_mode =~# 'clean'
     sorted = []
   endif
-  if empty(sorted)
-    s_ui_cursor_line = 0
-  elseif s_ui_cursor_line >= len(sorted)
-    s_ui_cursor_line = len(sorted) - 1
+  if index(sorted, s_ui_cursor_name) < 0
+    # 选中的插件被过滤掉或已经不在这一批里了。
+    s_ui_cursor_name = ''
   endif
 
-  var plug_line_idx = 0
   for pname in sorted
     var p = FindPlugin(pname)
     if p == {}
@@ -1902,8 +1910,9 @@ def UIBuildAndRender()
     var msg = get(st, 'msg', '')
     var action = UiAction(st)
 
-    var is_cursor = (plug_line_idx == s_ui_cursor_line)
+    var is_cursor = (name ==# s_ui_cursor_name)
     var cursor_mark = is_cursor ? '▸' : ' '
+    s_ui_line_map[string(len(lines) + 1)] = name
     if is_cursor
       s_ui_cursor_buf_line = len(lines) + 1
     endif
@@ -1933,7 +1942,6 @@ def UIBuildAndRender()
     var content = printf('%s %s %-30s %-12s %-10s %s',
       cursor_mark, icon, display_name, action, version, ShortLine(msg, details_width))
     AddUiLine(lines, content, W)
-    plug_line_idx += 1
   endfor
 
   if s_ui_mode =~# 'clean'
@@ -1955,10 +1963,10 @@ def UIBuildAndRender()
 
   add(lines, DividerLine(W))
   AddUiLine(lines, '  ' .. SummaryLine(), W)
-  AddUiLine(lines, '  q close   j/k move   <CR> open   d log   / filter   ? help   R retry   S status', W)
+  AddUiLine(lines, '  q close   j/k move   <CR> open   d log   / filter   ? help   R retry failed   S status', W)
 
   s_ui_lines = lines
-  UIRender()
+  UIRender(move_cursor)
 enddef
 
 def SummaryLine(): string
@@ -2001,7 +2009,7 @@ def UIOpen()
     if !empty(wins)
       win_gotoid(wins[0])
       s_ui_winid = wins[0]
-      UIBuildAndRender()
+      UIBuildAndRender(true)
       StartSpinner()
       return
     endif
@@ -2020,6 +2028,9 @@ def UIOpen()
 
   # 按键映射
   nnoremap <buffer><silent> q <Cmd>call simpleplug#UIClose()<CR>
+  nnoremap <buffer><silent> <Esc> <Cmd>call simpleplug#UIClose()<CR>
+  nnoremap <buffer><silent> j <Cmd>call simpleplug#UIMove(1)<CR>
+  nnoremap <buffer><silent> k <Cmd>call simpleplug#UIMove(-1)<CR>
   nnoremap <buffer><silent> R <Cmd>call simpleplug#UIRetry()<CR>
   nnoremap <buffer><silent> S <Cmd>call simpleplug#Status()<CR>
   nnoremap <buffer><silent> <CR> <Cmd>call simpleplug#OpenPluginDir()<CR>
@@ -2028,7 +2039,7 @@ def UIOpen()
   nnoremap <buffer><silent> ? <Cmd>call simpleplug#ToggleHelp()<CR>
   nnoremap <buffer><silent> / <Cmd>call simpleplug#StartFilterSplit()<CR>
 
-  UIBuildAndRender()
+  UIBuildAndRender(true)
   SetupSyntax()
   StartSpinner()
 enddef
@@ -2045,14 +2056,25 @@ export def UIClose()
 enddef
 
 export def UIRetry()
+  var failed: list<string> = []
+  for name in s_ui_targets
+    var action = UiAction(get(s_ui_plug_state, name, {}))
+    if action ==# 'error' || action ==# 'missing' || action ==# 'dirty'
+      add(failed, name)
+    endif
+  endfor
+  if empty(failed)
+    echom '[SimplePlug] nothing to retry'
+    return
+  endif
   if s_ui_mode =~# 'install'
-    Install()
+    Install(failed)
   elseif s_ui_mode =~# 'update'
-    Update()
+    Update(failed)
   endif
 enddef
 
-def UIRender()
+def UIRender(move_cursor: bool = false)
   if s_ui_bufnr < 0 || !bufexists(s_ui_bufnr)
     return
   endif
@@ -2062,52 +2084,41 @@ def UIRender()
   endif
   SetUiBufferLines()
   win_execute(wins[0], ':vertical resize ' .. UiWidth())
-  # 将光标移动到选中行
-  if s_ui_cursor_buf_line > 0
+  # 只有在选择本身发生变化时才动光标。以前每次渲染都动，于是 200ms 的
+  # spinner tick 会把光标一次次拽回去，翻到出错的那个插件根本不可能。
+  if move_cursor && s_ui_cursor_buf_line > 0
     win_execute(wins[0], 'normal! ' .. s_ui_cursor_buf_line .. 'G')
   endif
 enddef
 
 # ─────────────────── 交互功能 ───────────────────
 
-def ScrollDown()
-  var max_line = len(s_ui_sorted_names) - 1
-  if s_ui_cursor_line < max_line
-    s_ui_cursor_line += 1
-  endif
-  UIBuildAndRender()
+# Buffer lines that carry a plugin, in display order.
+def PluginRows(): list<number>
+  return sort(mapnew(keys(s_ui_line_map), (_, k) => str2nr(k)), 'N')
 enddef
 
-def ScrollUp()
-  if s_ui_cursor_line > 0
-    s_ui_cursor_line -= 1
-  endif
-  UIBuildAndRender()
+# The row the user is actually on.  Resolved from the line map built during
+# rendering, never by matching plugin names against the rendered text: doing
+# that made a name that is a prefix of another shadow it, so pressing <CR> on
+# the simpletreesitter row opened simpletree.
+def PluginNameAtCursor(): string
+  var name = get(s_ui_line_map, string(line('.')), '')
+  return name !=# '' ? name : s_ui_cursor_name
 enddef
 
-def GetCurrentPluginName(): string
-  if s_ui_cursor_line < 0 || s_ui_cursor_line >= len(s_ui_sorted_names)
-    return ''
-  endif
-  return s_ui_sorted_names[s_ui_cursor_line]
-enddef
-
-def DoOpenPluginDir()
-  var name = GetCurrentPluginName()
-  if name ==# ''
+export def UIMove(delta: number)
+  var rows = PluginRows()
+  if empty(rows)
     return
   endif
-  var plug = FindPlugin(name)
-  if plug == {} || !isdirectory(plug.dir)
-    return
-  endif
-  var dir = plug.dir
-  UIClose()
-  execute 'edit ' .. fnameescape(dir)
+  var idx = index(rows, line('.'))
+  idx = idx < 0 ? 0 : max([0, min([idx + delta, len(rows) - 1])])
+  s_ui_cursor_name = get(s_ui_line_map, string(rows[idx]), '')
+  UIBuildAndRender(true)
 enddef
 
-def DoViewPluginDiff()
-  var name = GetCurrentPluginName()
+def DoViewPluginDiff(name: string)
   if name ==# ''
     return
   endif
@@ -2138,7 +2149,7 @@ def DoToggleHelp()
     '    Enter       打开插件目录',
     '    d           查看 git log',
     '    /           搜索过滤插件',
-    '    R           重试操作',
+    '    R           重试失败的插件',
     '    S           查看状态',
     '    q / Esc     关闭窗口',
     '    ? / h       切换帮助',
@@ -2153,21 +2164,8 @@ def DoToggleHelp()
   nnoremap <buffer><silent> q <Cmd>bwipeout<CR>
 enddef
 
-# Split 模式下的交互导出 (从光标行解析插件名)
-
-def SplitGetPluginNameFromCursor(): string
-  var lnum = line('.')
-  var ltext = getline(lnum)
-  for p in s_plugins
-    if ltext =~# '\V' .. escape(p.name, '\')
-      return p.name
-    endif
-  endfor
-  return ''
-enddef
-
 export def OpenPluginDir()
-  var name = SplitGetPluginNameFromCursor()
+  var name = PluginNameAtCursor()
   if name ==# ''
     return
   endif
@@ -2181,17 +2179,12 @@ export def OpenPluginDir()
 enddef
 
 export def ViewPluginDiff()
-  var name = SplitGetPluginNameFromCursor()
+  var name = PluginNameAtCursor()
   if name ==# ''
     return
   endif
-  for i in range(len(s_ui_sorted_names))
-    if s_ui_sorted_names[i] ==# name
-      s_ui_cursor_line = i
-      break
-    endif
-  endfor
-  DoViewPluginDiff()
+  s_ui_cursor_name = name
+  DoViewPluginDiff(name)
 enddef
 
 export def ToggleHelp()
