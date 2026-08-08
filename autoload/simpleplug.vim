@@ -16,6 +16,17 @@ var s_loaded_plugins: dict<bool> = {}
 var s_lazy_commands: list<string> = []
 var s_lazy_maps: list<string> = []
 
+# name -> the runtime directory whose plugin scripts were actually sourced.
+# Deliberately NOT cleared by Begin(): re-sourcing a vimrc resets SimplePlug's
+# own bookkeeping, but it does not reset the `if exists('g:loaded_x') | finish`
+# guard inside a plugin that already ran.  Anything we tear down here can
+# therefore never be rebuilt by sourcing that plugin a second time.
+var s_sourced_runtime: dict<string> = {}
+
+def AlreadySourced(name: string, runtime_dir: string): bool
+  return get(s_sourced_runtime, name, '') ==# runtime_dir
+enddef
+
 # ─────────────────── 后端状态 ───────────────────
 
 var s_next_id: number = 0
@@ -206,7 +217,7 @@ def LoadPlugin(plug: dict<any>, runtime_dir: string)
   s_loaded_plugins[plug.name] = true
   # End() 也可能由用户在 VimEnter 之后调用，此时 Vim 不会再自动扫描 plugin/。
   if v:vim_did_enter
-    SourcePluginScripts(runtime_dir)
+    SourcePluginScripts(plug.name, runtime_dir)
   endif
 enddef
 
@@ -235,6 +246,12 @@ enddef
 
 def SetupLazyLoad(plug: dict<any>, pdir: string)
   var pname = plug.name
+  # A vimrc re-source runs Begin()/End() again over a plugin that has already
+  # been lazy-loaded.  Re-arming its triggers would put a stub back on top of
+  # the real command/mapping and pull the runtime out of 'runtimepath'; the
+  # stub would then source a script that its own reload guard finishes
+  # immediately, and the command would be gone for the rest of the session.
+  var sourced = AlreadySourced(pname, pdir)
 
   # on_ft 延迟加载
   var ft = get(plug, 'on_ft', '')
@@ -249,7 +266,10 @@ def SetupLazyLoad(plug: dict<any>, pdir: string)
   # on_cmd 延迟加载：普通命令走 command stub，<Plug>/按键序列走 mapping stub
   for c in LazyTriggers(plug)
     if c =~# '^<'
-      SetupLazyMap(pname, c)
+      SetupLazyMap(pname, c, sourced)
+    elseif sourced && exists(':' .. c) == 2
+      # The loaded plugin's own definition is already in place: leave it be.
+      continue
     else
       add(s_lazy_commands, c)
       DefineLazyCommand(pname, c)
@@ -268,12 +288,19 @@ def SetupLazyLoad(plug: dict<any>, pdir: string)
   endfor
   augroup END
 
-  # 从 rtp 里暂时移除
-  RemoveRuntimePath(pdir)
+  # 从 rtp 里暂时移除。已经加载过的插件必须留下：它的 autoload/ftplugin/
+  # syntax 仍在被使用，而重新 source 本体已经被 reload guard 挡住了。
+  if !sourced
+    RemoveRuntimePath(pdir)
+  endif
 enddef
 
 # <Plug> 映射延迟加载：先注册 stub，触发时卸载 stub、加载插件、重放按键。
-def SetupLazyMap(pname: string, keys: string)
+def SetupLazyMap(pname: string, keys: string, sourced: bool = false)
+  if sourced && (maparg(keys, 'n') !=# '' || maparg(keys, 'x') !=# '' || maparg(keys, 'o') !=# '')
+    # The loaded plugin already answers these keys; a stub would shadow it.
+    return
+  endif
   add(s_lazy_maps, keys)
   # <lt> 转义参数里的 '<'，避免映射定义时被翻译成键码。
   var keys_arg = substitute(string(keys), '<', '<lt>', 'g')
@@ -320,14 +347,21 @@ export def LazyLoadCommand(
 enddef
 
 
+# Forget the trigger as well as unhooking it.  Once the real plugin has
+# replaced a stub, the name in s_lazy_commands/s_lazy_maps no longer refers to
+# anything of ours — and Begin() deletes everything those lists name.
 def RemoveLazyStubs(plug: dict<any>)
   for trigger in LazyTriggers(plug)
     if trigger =~# '^<'
       for md in ['n', 'x', 'o']
         execute 'silent! ' .. md .. 'unmap ' .. trigger
       endfor
-    elseif exists(':' .. trigger) == 2
-      execute 'silent! delcommand ' .. trigger
+      filter(s_lazy_maps, (_, keys) => keys !=# trigger)
+    else
+      if exists(':' .. trigger) == 2
+        execute 'silent! delcommand ' .. trigger
+      endif
+      filter(s_lazy_commands, (_, cmd) => cmd !=# trigger)
     endif
   endfor
 enddef
@@ -358,11 +392,12 @@ export def LazyLoad(name: string): bool
   # 重新加入 runtimepath
   AddRuntimePath(dir)
 
-  SourcePluginScripts(dir)
+  SourcePluginScripts(name, dir)
   return true
 enddef
 
-def SourcePluginScripts(dir: string)
+def SourcePluginScripts(name: string, dir: string)
+  s_sourced_runtime[name] = dir
   for f in globpath(dir, 'plugin/**/*.vim', 0, 1)
     try
       execute 'source ' .. fnameescape(f)

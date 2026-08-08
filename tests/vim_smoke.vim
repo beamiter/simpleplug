@@ -39,7 +39,11 @@ assert_equal(1, get(g:, 'simpleplug_lazy_fixture_loaded', 0), 'command-lazy plug
 assert_equal('hello', get(g:, 'simpleplug_lazy_fixture_args', ''), 'lazy command arguments were not replayed')
 
 # <Plug> mappings listed in `on` must lazy-load the plugin, then replay the keys.
+# Drop the real mapping the previous section's load installed, exactly as that
+# section drops the real command: a stub is only installed over a key the
+# loaded plugin does not already answer.
 unlet g:simpleplug_lazy_fixture_loaded
+nunmap <Plug>(LazyFixture)
 simpleplug#Begin('/tmp/simpleplug-vim-smoke')
 simpleplug#Plug('local/lazy-plugin', {
   as: 'lazy-fixture',
@@ -188,6 +192,53 @@ assert_equal(1, get(g:, 'simpleplug_retry_fixture_loaded', 0),
   'restored runtime was not retried')
 assert_equal('recovered', get(g:, 'simpleplug_retry_fixture_args', ''),
   'retried command was not replayed')
+
+# Re-sourcing a vimrc must not disarm a lazy plugin that has already loaded.
+# Its plugin script carries the usual reload guard, so anything torn down here
+# can never be rebuilt: sourcing the script again finishes immediately.
+var guard_checkout = tempname()
+mkdir(guard_checkout .. '/plugin', 'p')
+writefile([
+  'vim9script',
+  "if exists('g:simpleplug_guard_fixture_loaded')",
+  '  finish',
+  'endif',
+  'g:simpleplug_guard_fixture_loaded = 1',
+  "command! -nargs=* GuardFixtureCommand g:simpleplug_guard_fixture_args = '<args>'",
+  'nnoremap <Plug>(GuardFixtureMap) <Cmd>g:simpleplug_guard_fixture_mapped = 1<CR>',
+], guard_checkout .. '/plugin/guard.vim')
+var guard_opts = {
+  as: 'guard-fixture',
+  dir: guard_checkout,
+  on: ['GuardFixtureCommand', '<Plug>(GuardFixtureMap)'],
+}
+simpleplug#Begin('/tmp/simpleplug-vim-smoke')
+simpleplug#Plug('local/guard-plugin', guard_opts)
+simpleplug#End()
+assert_false(exists('g:simpleplug_guard_fixture_loaded'), 'guarded plugin loaded eagerly')
+GuardFixtureCommand first
+assert_equal(1, get(g:, 'simpleplug_guard_fixture_loaded', 0), 'guarded plugin did not load')
+assert_equal('first', get(g:, 'simpleplug_guard_fixture_args', ''),
+  'guarded lazy command was not replayed')
+
+simpleplug#Begin('/tmp/simpleplug-vim-smoke')
+simpleplug#Plug('local/guard-plugin', guard_opts)
+simpleplug#End()
+assert_equal(2, exists(':GuardFixtureCommand'), 'reinitializing deleted the real command')
+assert_notmatch('simpleplug#LazyLoadMap', maparg('<Plug>(GuardFixtureMap)', 'n'),
+  'reinitializing shadowed the real mapping with a stub')
+assert_true(index(split(&runtimepath, ','), guard_checkout) >= 0,
+  'reinitializing dropped a loaded plugin from runtimepath')
+GuardFixtureCommand second
+assert_equal('second', get(g:, 'simpleplug_guard_fixture_args', ''),
+  'the real command did not survive reinitialization')
+assert_equal(1, get(g:, 'simpleplug_guard_fixture_loaded', 0),
+  'the guarded plugin was sourced a second time')
+delcommand GuardFixtureCommand
+nunmap <Plug>(GuardFixtureMap)
+&runtimepath = join(filter(split(&runtimepath, ','), (_, entry) =>
+  entry !=# guard_checkout && entry !=# guard_checkout .. '/after'), ',')
+delete(guard_checkout, 'rf')
 
 # Lexical option separators/traversal are rejected before registration.
 simpleplug#Begin('/tmp/simpleplug-vim-smoke')

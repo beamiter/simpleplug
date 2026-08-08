@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased - 2026-08-08
+
+### 重新 source vimrc 不再拆掉已加载的延迟插件
+
+- 修复：`Begin()` 会 `delcommand` 掉 `s_lazy_commands` 里的每个名字，但延迟加载
+  成功后这个名字指向的已经是插件自己定义的真实命令，不再是 stub。插件加载时
+  一并把触发器从 stub 列表里移除，`Begin()` 只删自己还欠着的那些。
+- 修复：`End()` 会给已经加载过的延迟插件重新装回 stub，并把它的 runtime 从
+  `runtimepath` 里摘掉。再次触发只会 source 一个被 reload guard 拦下的脚本，
+  命令、映射和 autoload/ftplugin/syntax 就此在本次会话中消失。现在记录本会话
+  真正 source 过的插件与目录：真实命令/映射已在时不再覆盖，runtime 也不再摘除。
+- Vim smoke 新增带 reload guard 的 fixture：加载 → 重新 `Begin()`/`End()` →
+  命令仍可用、映射未被 stub 顶掉、runtime 仍在 rtp、插件没有被二次 source。
+
 ## Unreleased - 2026-08-05
 
 ### 快照漂移审计
