@@ -24,11 +24,14 @@ assert_equal(1, get(g:, 'simpleplug_lazy_fixture_loaded', 0), 'lazy plugin did n
 assert_true(index(split(&runtimepath, ','), fixture) >= 0, 'lazy plugin missing from runtimepath')
 
 # Command-based lazy loading must source the plugin, then replay the command.
+# Each section registers the shared fixture under its own name: a runtime that
+# has already been sourced is treated as loaded for the rest of the session,
+# so re-registering the *same* plugin deliberately arms no new trigger.
 delcommand LazyFixtureCommand
 unlet g:simpleplug_lazy_fixture_loaded
 simpleplug#Begin('/tmp/simpleplug-vim-smoke')
 simpleplug#Plug('local/lazy-plugin', {
-  as: 'lazy-fixture',
+  as: 'lazy-fixture-cmd',
   dir: fixture,
   on: 'LazyFixtureCommand',
 })
@@ -39,14 +42,11 @@ assert_equal(1, get(g:, 'simpleplug_lazy_fixture_loaded', 0), 'command-lazy plug
 assert_equal('hello', get(g:, 'simpleplug_lazy_fixture_args', ''), 'lazy command arguments were not replayed')
 
 # <Plug> mappings listed in `on` must lazy-load the plugin, then replay the keys.
-# Drop the real mapping the previous section's load installed, exactly as that
-# section drops the real command: a stub is only installed over a key the
-# loaded plugin does not already answer.
 unlet g:simpleplug_lazy_fixture_loaded
 nunmap <Plug>(LazyFixture)
 simpleplug#Begin('/tmp/simpleplug-vim-smoke')
 simpleplug#Plug('local/lazy-plugin', {
-  as: 'lazy-fixture',
+  as: 'lazy-fixture-map',
   dir: fixture,
   on: '<Plug>(LazyFixture)',
 })
@@ -239,6 +239,58 @@ nunmap <Plug>(GuardFixtureMap)
 &runtimepath = join(filter(split(&runtimepath, ','), (_, entry) =>
   entry !=# guard_checkout && entry !=# guard_checkout .. '/after'), ',')
 delete(guard_checkout, 'rf')
+
+# The same re-source, for a plugin declared with BOTH `for` and `on`.  The
+# FileType half hides: every check above still passes immediately after End(),
+# and the damage lands on the first matching FileType event — which re-runs
+# LazyLoad over an already-loaded plugin and deletes the real command and
+# mapping it installed.
+var ftguard_checkout = tempname()
+mkdir(ftguard_checkout .. '/plugin', 'p')
+writefile([
+  'vim9script',
+  "if exists('g:simpleplug_ftguard_fixture_loaded')",
+  '  finish',
+  'endif',
+  'g:simpleplug_ftguard_fixture_loaded = 1',
+  "command! -nargs=* FtGuardFixtureCommand g:simpleplug_ftguard_fixture_args = '<args>'",
+  'nnoremap <Plug>(FtGuardFixtureMap) <Cmd>g:simpleplug_ftguard_fixture_mapped = 1<CR>',
+], ftguard_checkout .. '/plugin/ftguard.vim')
+var ftguard_opts = {
+  as: 'ftguard-fixture',
+  dir: ftguard_checkout,
+  for: 'simpleplugftguard',
+  on: ['FtGuardFixtureCommand', '<Plug>(FtGuardFixtureMap)'],
+}
+simpleplug#Begin('/tmp/simpleplug-vim-smoke')
+simpleplug#Plug('local/ftguard-plugin', ftguard_opts)
+simpleplug#End()
+assert_false(exists('g:simpleplug_ftguard_fixture_loaded'), 'for+on plugin loaded eagerly')
+FtGuardFixtureCommand first
+assert_equal(1, get(g:, 'simpleplug_ftguard_fixture_loaded', 0), 'for+on plugin did not load')
+
+simpleplug#Begin('/tmp/simpleplug-vim-smoke')
+simpleplug#Plug('local/ftguard-plugin', ftguard_opts)
+simpleplug#End()
+doautocmd FileType simpleplugftguard
+assert_equal(2, exists(':FtGuardFixtureCommand'),
+  'a FileType event after reinitializing deleted the real command')
+assert_notmatch('simpleplug#LazyLoadMap', maparg('<Plug>(FtGuardFixtureMap)', 'n'),
+  'a FileType event after reinitializing replaced the real mapping with a stub')
+assert_true(index(split(&runtimepath, ','), ftguard_checkout) >= 0,
+  'a FileType event after reinitializing dropped the plugin from runtimepath')
+if exists(':FtGuardFixtureCommand') == 2
+  FtGuardFixtureCommand second
+endif
+assert_equal('second', get(g:, 'simpleplug_ftguard_fixture_args', ''),
+  'the real command did not survive a post-reinitialization FileType event')
+assert_equal(1, get(g:, 'simpleplug_ftguard_fixture_loaded', 0),
+  'the for+on plugin was sourced a second time')
+silent! delcommand FtGuardFixtureCommand
+silent! nunmap <Plug>(FtGuardFixtureMap)
+&runtimepath = join(filter(split(&runtimepath, ','), (_, entry) =>
+  entry !=# ftguard_checkout && entry !=# ftguard_checkout .. '/after'), ',')
+delete(ftguard_checkout, 'rf')
 
 # Lexical option separators/traversal are rejected before registration.
 simpleplug#Begin('/tmp/simpleplug-vim-smoke')

@@ -188,7 +188,8 @@ git clone / pull / status
 回归、Vim smoke，以及跑在脚本化 daemon 上的 install/update 批处理端到端测试）。
 
 测试包含 Rust 协议/并发/安全清理/脏工作区/版本锁定/浅克隆分支切换/中断 clone 修复回归，
-Vim9 延迟加载（filetype、命令、`<Plug>` 映射、ftdetect、重新 source vimrc）smoke test，
+Vim9 延迟加载（filetype、命令、`<Plug>` 映射、ftdetect、重新 source vimrc——包括同时
+声明 `for` 与 `on` 的插件）smoke test，
 以及完成事件、同步等待与安装后激活的端到端断言。
 
 ## License

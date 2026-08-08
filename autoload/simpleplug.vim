@@ -256,11 +256,26 @@ enddef
 def SetupLazyLoad(plug: dict<any>, pdir: string)
   var pname = plug.name
   # A vimrc re-source runs Begin()/End() again over a plugin that has already
-  # been lazy-loaded.  Re-arming its triggers would put a stub back on top of
-  # the real command/mapping and pull the runtime out of 'runtimepath'; the
-  # stub would then source a script that its own reload guard finishes
-  # immediately, and the command would be gone for the rest of the session.
-  var sourced = AlreadySourced(pname, pdir)
+  # been lazy-loaded.  Not one of its triggers may be re-armed: whichever one
+  # fires first calls LazyLoad, which removes the "stub" — by then the real
+  # command and mapping the plugin installed — and re-sources a script that
+  # its own reload guard finishes immediately.  The command and the mapping
+  # are then gone for the rest of the session.
+  #
+  # Skipping only the triggers whose real definition is already visible is not
+  # enough, and that is what this used to do: a plugin declared with both
+  # `for` and `on` still had its FileType autocmd re-armed, so everything
+  # looked correct until the first matching FileType event — arbitrarily later
+  # in the session — took the command and the mapping down.  The plugin is
+  # loaded; the only correct number of triggers to arm is zero.
+  #
+  # 'runtimepath' is deliberately left as End() just set it: the plugin's
+  # autoload/ftplugin/syntax directories are in use, and re-sourcing its
+  # plugin/ scripts can never put back what removing them would break.
+  if AlreadySourced(pname, pdir)
+    s_loaded_plugins[pname] = true
+    return
+  endif
 
   # on_ft 延迟加载
   var ft = get(plug, 'on_ft', '')
@@ -275,10 +290,7 @@ def SetupLazyLoad(plug: dict<any>, pdir: string)
   # on_cmd 延迟加载：普通命令走 command stub，<Plug>/按键序列走 mapping stub
   for c in LazyTriggers(plug)
     if c =~# '^<'
-      SetupLazyMap(pname, c, sourced)
-    elseif sourced && exists(':' .. c) == 2
-      # The loaded plugin's own definition is already in place: leave it be.
-      continue
+      SetupLazyMap(pname, c)
     else
       add(s_lazy_commands, c)
       DefineLazyCommand(pname, c)
@@ -289,19 +301,12 @@ def SetupLazyLoad(plug: dict<any>, pdir: string)
   # for 延迟加载也就永远不会触发。
   SourceFtdetect(pdir)
 
-  # 从 rtp 里暂时移除。已经加载过的插件必须留下：它的 autoload/ftplugin/
-  # syntax 仍在被使用，而重新 source 本体已经被 reload guard 挡住了。
-  if !sourced
-    RemoveRuntimePath(pdir)
-  endif
+  # 从 rtp 里暂时移除，触发时再加回来。
+  RemoveRuntimePath(pdir)
 enddef
 
 # <Plug> 映射延迟加载：先注册 stub，触发时卸载 stub、加载插件、重放按键。
-def SetupLazyMap(pname: string, keys: string, sourced: bool = false)
-  if sourced && (maparg(keys, 'n') !=# '' || maparg(keys, 'x') !=# '' || maparg(keys, 'o') !=# '')
-    # The loaded plugin already answers these keys; a stub would shadow it.
-    return
-  endif
+def SetupLazyMap(pname: string, keys: string)
   add(s_lazy_maps, keys)
   # <lt> 转义参数里的 '<'，避免映射定义时被翻译成键码。
   var keys_arg = substitute(string(keys), '<', '<lt>', 'g')

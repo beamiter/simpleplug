@@ -38,10 +38,13 @@ Wrap declarations between simpleplug#Begin() and simpleplug#End(): >
 simpleplug#Begin() takes an optional directory; without one it uses
 |g:simpleplug_dir|. It also clears any lazy-load state from a previous run, so
 re-sourcing your vimrc is safe. Plugins already lazy-loaded in this Vim session
-are left alone: their stubs are not reinstalled over the real command and
-mapping the plugin defined, and their runtime directory stays on
+are left alone: not one of their triggers is re-armed — no command stub, no
+mapping stub and no `for` autocmd — and their runtime directory stays on
 'runtimepath'. Sourcing such a plugin again would only hit its own reload
 guard and define nothing, so anything torn down here could never be rebuilt.
+The `for` autocmd matters as much as the stubs do: re-arming it takes the
+plugin's real command and mapping down on the first matching |FileType| event,
+arbitrarily later in the session.
 
 simpleplug#End() adds every installed plugin to 'runtimepath' (including its
 after/ directory), sources non-lazy plugins, and enables filetype and syntax.

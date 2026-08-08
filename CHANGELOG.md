@@ -2,6 +2,25 @@
 
 ## Unreleased - 2026-08-08
 
+### 同时声明 for 和 on 的插件也能挺过重新 source
+
+- 修复：上一轮"重新 source vimrc 不再拆掉已加载的延迟插件"只挡住了看得见的那一半。
+  `SetupLazyLoad()` 逐个触发器地判断"真实定义已经在了就别装 stub"，却照旧把
+  `for` 的 FileType autocmd 重新挂上，`LoadPlugin()` 也照旧把
+  `s_loaded_plugins[name]` 重置成 false。于是 `{for: 'rust', on: ['T1Cmd',
+  '<Plug>(T1Map)']}` 这样的插件在重新 source 之后一切看起来正常——直到会话里
+  某个时刻第一次进 rust 文件：FileType 触发 `LazyLoad()` →
+  `RemoveLazyStubs()` 把插件自己定义的**真实**命令和映射删掉 → 重新 source 一个
+  被 reload guard 拦下的脚本。`:T1Cmd` 从此报 E492，本次会话再也回不来。
+- 现在规则只有一条，也只有一处：本会话已经 source 过这个 runtime，就说明插件已经
+  加载，需要重新挂上的触发器数量是零——命令 stub、映射 stub、`for` autocmd 一个
+  都不挂，`runtimepath` 保持 `End()` 刚设好的样子。逐触发器的三处半吊子判断
+  （`SetupLazyLoad` 的 `sourced &&`、`SetupLazyMap` 的 `maparg` 检查、
+  `RemoveRuntimePath` 的条件）随之删掉。
+- 回归：Vim smoke 新增同时带 `for` 与 `on`、并且带 reload guard 的 fixture：
+  加载 → 重新 `Begin()`/`End()` → `doautocmd FileType` → 断言真实命令还在、映射
+  没被 stub 顶掉、runtime 还在 rtp、插件没有被二次 source。修复前必然失败。
+
 ### 重新 clone 不再吃掉未提交的工作
 
 - 修复（数据丢失）：`git_checkout_is_valid()` 把"git 说这不是个能用的 checkout"和
