@@ -2,6 +2,24 @@
 
 ## Unreleased - 2026-08-08
 
+### :PlugProfile：启动时间到底花在谁身上
+
+- 新增 `:PlugProfile[!]`：按插件报出加载耗时（墙钟毫秒，大的在前）、加载方式
+  （eager / lazy / install / ftdetect）以及延迟插件是被哪个触发器叫起来的；`!` 展开到
+  每个被 source 的文件。`for` / `on` 的全部理由是启动时间，而在此之前这个数字从来
+  没人看见过，于是每一条延迟加载标注都是猜的。
+- SimplePlug 恰好是唯一有资格测的：`source` 是它调的，`SourcePluginScripts()` 是所有
+  eager、lazy、装完即用三条路径共同的收口。
+- `for` 插件的 `ftdetect/` 是被急切 source 的（否则它自带的文件类型永远认不出来，
+  触发器也就永远不会响），这笔开销照样算在启动上，并且单独列出来——它常常正是
+  "延迟加载"底下藏着的真实成本。
+- 报告末尾直接给出超过 `g:simpleplug_profile_threshold_ms`（默认 5ms）的 eager 插件，
+  建议改成 `{for: ...}` 或 `{on: ...}`。
+- 列头写的是 `wall ms` 不是 CPU：`reltime()` 量的是墙钟，插件加载时做的 I/O 都算在
+  里面。那通常正是你想知道的，但不能被读成 CPU 时间。
+- 回归：smoke 里延迟加载一个 fixture 后 `:PlugProfile`，断言它被归因到了自己名下、
+  标着 lazy、记下了触发器、并且带着一个真实的毫秒数。
+
 ### :PlugCheck：只问"有没有更新"，不真的更新
 
 - 新增 `:PlugCheck [name ...]`：只读的更新检查。唯一写盘的是 `git fetch` 往 `.git` 里

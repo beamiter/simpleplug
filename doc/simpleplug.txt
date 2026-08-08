@@ -288,6 +288,30 @@ restoring the directory and repeating the trigger retries the load.
         a request handed to a daemon that is still on its way out is a request
         nobody answers.
 
+                                                                *:PlugProfile*
+:PlugProfile[!]
+        Attribute startup cost to the plugin that spent it: every plugin
+        SimplePlug has sourced, sorted by descending wall milliseconds, with
+        how it was loaded (eager, lazy, install, ftdetect) and, for a lazy
+        plugin, the trigger that loaded it. With [!] each sourced file is
+        listed with its own measurement.
+
+        The whole justification for `for` and `on` is startup time, so
+        annotating plugins without a measurement is guesswork. SimplePlug is
+        the thing that calls :source, which is why it can measure this at all.
+
+        A `for` plugin's ftdetect/ files are sourced eagerly — otherwise its
+        filetype could never be detected and the trigger could never fire — so
+        that cost is charged to startup and reported on its own. It is often
+        what a lazy plugin still costs you.
+
+        The report ends with the eager plugins that cost at least
+        |g:simpleplug_profile_threshold_ms|, as candidates for `for` or `on`.
+
+        The numbers are wall clock, not CPU: any I/O a plugin does while
+        loading is counted, which is usually what you want to know and never
+        what a CPU figure would tell you.
+
 See |simpleplug-daemon| for :PlugHealth, :PlugRestart and :PlugLog.
 
 ==============================================================================
@@ -420,6 +444,10 @@ will wait before giving up. Default: 1800. The operation itself keeps running.
 
                                               *g:simpleplug_spinner_interval*
 Progress window refresh interval in milliseconds. Default: 200
+
+                                        *g:simpleplug_profile_threshold_ms*
+Wall milliseconds at or above which |:PlugProfile| lists an eagerly loaded
+plugin as a lazy-loading candidate. Default: 5
 
                                               *g:simpleplug_snapshot_format*
 Shape used for a snapshot file that does not exist yet: "v1" (default, records

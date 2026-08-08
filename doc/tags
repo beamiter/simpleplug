@@ -5,6 +5,7 @@
 :PlugHook	simpleplug.txt	/*:PlugHook*
 :PlugInstall	simpleplug.txt	/*:PlugInstall*
 :PlugLog	simpleplug.txt	/*:PlugLog*
+:PlugProfile	simpleplug.txt	/*:PlugProfile*
 :PlugRestart	simpleplug.txt	/*:PlugRestart*
 :PlugRestore	simpleplug.txt	/*:PlugRestore*
 :PlugRollback	simpleplug.txt	/*:PlugRollback*
@@ -23,6 +24,7 @@ g:simpleplug_git_timeout	simpleplug.txt	/*g:simpleplug_git_timeout*
 g:simpleplug_hook_timeout	simpleplug.txt	/*g:simpleplug_hook_timeout*
 g:simpleplug_jobs	simpleplug.txt	/*g:simpleplug_jobs*
 g:simpleplug_last_result	simpleplug.txt	/*g:simpleplug_last_result*
+g:simpleplug_profile_threshold_ms	simpleplug.txt	/*g:simpleplug_profile_threshold_ms*
 g:simpleplug_snapshot_format	simpleplug.txt	/*g:simpleplug_snapshot_format*
 g:simpleplug_spinner_interval	simpleplug.txt	/*g:simpleplug_spinner_interval*
 g:simpleplug_sync_timeout	simpleplug.txt	/*g:simpleplug_sync_timeout*

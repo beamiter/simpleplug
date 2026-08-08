@@ -280,10 +280,12 @@ def SetupLazyLoad(plug: dict<any>, pdir: string)
   # on_ft 延迟加载
   var ft = get(plug, 'on_ft', '')
   if type(ft) == v:t_string && ft !=# ''
-    execute printf('autocmd SimplePlugLazy FileType %s call simpleplug#LazyLoad(%s)', ft, string(pname))
+    execute printf('autocmd SimplePlugLazy FileType %s call simpleplug#LazyLoad(%s, %s)',
+      ft, string(pname), string('FileType ' .. ft))
   elseif type(ft) == v:t_list
     for f in ft
-      execute printf('autocmd SimplePlugLazy FileType %s call simpleplug#LazyLoad(%s)', f, string(pname))
+      execute printf('autocmd SimplePlugLazy FileType %s call simpleplug#LazyLoad(%s, %s)',
+        f, string(pname), string('FileType ' .. f))
     endfor
   endif
 
@@ -299,7 +301,7 @@ def SetupLazyLoad(plug: dict<any>, pdir: string)
 
   # ftdetect 必须立即生效，否则插件自带的文件类型永远不会被识别，
   # for 延迟加载也就永远不会触发。
-  SourceFtdetect(pdir)
+  SourceFtdetect(pname, pdir)
 
   # 从 rtp 里暂时移除，触发时再加回来。
   RemoveRuntimePath(pdir)
@@ -317,7 +319,7 @@ def SetupLazyMap(pname: string, keys: string)
 enddef
 
 export def LazyLoadMap(name: string, keys: string, mode: string)
-  if !LazyLoad(name)
+  if !LazyLoad(name, keys)
     return
   endif
   if mode ==# 'x'
@@ -335,7 +337,7 @@ export def LazyLoadCommand(
     line2: number,
     range_count: number,
     args: string)
-  if !LazyLoad(name)
+  if !LazyLoad(name, ':' .. command)
     return
   endif
   if exists(':' .. command) != 2
@@ -373,7 +375,7 @@ def RemoveLazyStubs(plug: dict<any>)
 enddef
 
 
-export def LazyLoad(name: string): bool
+export def LazyLoad(name: string, trigger: string = ''): bool
   var plug = FindPlugin(name)
   if plug == {}
     echohl ErrorMsg
@@ -398,41 +400,79 @@ export def LazyLoad(name: string): bool
   # 重新加入 runtimepath
   AddRuntimePath(dir)
 
-  SourcePluginScripts(name, dir)
+  SourcePluginScripts(name, dir, 'lazy', trigger)
   return true
+enddef
+
+# ─────────────────── 启动开销归因 ───────────────────
+
+# `for`/`on` 的全部理由是启动时间，可这个插件从来没让人看见过那个数字，于是
+# 每一条延迟加载标注都是猜的。SimplePlug 恰好是唯一有资格测的：source 是它调的。
+#
+# name -> {total_ms, files: [{path, ms}], when, trigger}
+var s_load_times: dict<dict<any>> = {}
+
+def RecordLoad(name: string, when: string, trigger: string, files: list<dict<any>>, ms: float)
+  var entry = get(s_load_times, name, {total_ms: 0.0, files: [], when: when, trigger: ''})
+  entry.total_ms = entry.total_ms + ms
+  extend(entry.files, files)
+  entry.when = when
+  if trigger !=# ''
+    entry.trigger = trigger
+  endif
+  s_load_times[name] = entry
 enddef
 
 # Returns one message per file that threw.  Sourcing third-party code is
 # best-effort by design — one broken script must not stop the rest of a plugin
 # from loading — but the caller may still want to say so.
-def SourcePluginScripts(name: string, dir: string): list<string>
+def SourcePluginScripts(
+    name: string,
+    dir: string,
+    when: string = 'eager',
+    trigger: string = ''): list<string>
   s_sourced_runtime[name] = dir
   var failures: list<string> = []
+  var files: list<dict<any>> = []
+  var started = reltime()
   for pattern in ['plugin/**/*.vim', 'after/plugin/**/*.vim']
     for f in globpath(dir, pattern, 0, 1)
+      var file_started = reltime()
       try
         execute 'source ' .. fnameescape(f)
       catch
         Log('source error: ' .. v:exception, 'ErrorMsg')
         add(failures, fnamemodify(f, ':t') .. ': ' .. v:exception)
       endtry
+      add(files, {path: f, ms: reltimefloat(reltime(file_started)) * 1000.0})
     endfor
   endfor
+  RecordLoad(name, when, trigger, files, reltimefloat(reltime(started)) * 1000.0)
   return failures
 enddef
 
 # ftdetect must be sourced by hand whenever a runtime directory appears after
 # Vim's own startup scan: 'runtimepath' is only walked for it at startup.
-def SourceFtdetect(dir: string)
+#
+# 这一步对 `for` 插件是必须的，也因此**照样计在启动开销里**——它常常是延迟
+# 加载省下来的那部分底下藏着的真实成本，所以要单独记一笔。
+def SourceFtdetect(name: string, dir: string, when: string = 'ftdetect')
+  var files: list<dict<any>> = []
+  var started = reltime()
   augroup filetypedetect
   for f in globpath(dir, 'ftdetect/*.vim', 0, 1)
+    var file_started = reltime()
     try
       execute 'source ' .. fnameescape(f)
     catch
       Log('ftdetect source error: ' .. v:exception, 'ErrorMsg')
     endtry
+    add(files, {path: f, ms: reltimefloat(reltime(file_started)) * 1000.0})
   endfor
   augroup END
+  if !empty(files)
+    RecordLoad(name, when, '', files, reltimefloat(reltime(started)) * 1000.0)
+  endif
 enddef
 
 def FindPlugin(name: string): dict<any>
@@ -951,8 +991,8 @@ def ActivateInstalled()
       else
         s_loaded_plugins[name] = true
         AddRuntimePath(dir)
-        var failures = SourcePluginScripts(name, dir)
-        SourceFtdetect(dir)
+        var failures = SourcePluginScripts(name, dir, 'install')
+        SourceFtdetect(name, dir, 'install')
         if !empty(failures)
           st.msg = get(st, 'msg', '') .. ' | activate: ' .. failures[0]
           s_ui_plug_state[name] = st
@@ -1743,6 +1783,105 @@ def RollbackTo(name: string, entry: dict<any>, force: bool)
   specs[0].tag = ''
   specs[0].frozen = false
   RunBatch('update', [plug], specs)
+enddef
+
+# =============================================================
+# :PlugProfile — 谁花掉了启动时间
+# =============================================================
+
+def ProfileThreshold(): float
+  var configured = get(g:, 'simpleplug_profile_threshold_ms', 5)
+  return type(configured) == v:t_number || type(configured) == v:t_float
+    ? 0.0 + configured : 5.0
+enddef
+
+def ProfileBar(ms: float, peak: float, width: number): string
+  if peak <= 0.0
+    return ''
+  endif
+  var filled = float2nr(round(ms / peak * width))
+  return repeat('█', max([filled, ms > 0.0 ? 1 : 0]))
+enddef
+
+export def Profile(detailed: bool = false)
+  if empty(s_load_times)
+    echom '[SimplePlug] nothing has been loaded through SimplePlug yet'
+    return
+  endif
+  var names = keys(s_load_times)
+  # 大的在前：找的就是那几个最贵的。
+  sort(names, (left, right) => {
+    var a: float = s_load_times[left].total_ms
+    var b: float = s_load_times[right].total_ms
+    return a ==# b ? (left <# right ? -1 : 1) : (a > b ? -1 : 1)
+  })
+  var peak: float = s_load_times[names[0]].total_ms
+
+  var eager_total = 0.0
+  var total = 0.0
+  var candidates: list<string> = []
+  var threshold = ProfileThreshold()
+  for name in names
+    var entry = s_load_times[name]
+    var ms: float = entry.total_ms
+    total += ms
+    # ftdetect 也算启动开销：它是延迟加载省下来的那部分底下藏着的成本。
+    if entry.when ==# 'eager' || entry.when ==# 'ftdetect'
+      eager_total += ms
+      if entry.when ==# 'eager' && ms >= threshold
+        add(candidates, printf('    %-30s %7.1f', ShortLine(name, 30), ms))
+      endif
+    endif
+  endfor
+
+  var lines = [
+    printf('  SimplePlug profile — %d plugins, %.1f wall ms (%.1f of it at startup)',
+      len(names), total, eager_total),
+    repeat('─', 78),
+    printf('  %8s  %-14s %-9s %-24s %s', 'wall ms', '', 'when', 'plugin', 'trigger'),
+    repeat('─', 78),
+  ]
+  for name in names
+    var entry = s_load_times[name]
+    var ms: float = entry.total_ms
+    var when: string = entry.when
+    var trigger: string = entry.trigger
+    add(lines, printf('  %8.1f  %-14s %-9s %-24s %s',
+      ms, ProfileBar(ms, peak, 14), when, ShortLine(name, 24), trigger))
+    if detailed
+      for file in entry.files
+        add(lines, printf('  %8.1f    %s', file.ms, fnamemodify(file.path, ':t')))
+      endfor
+    endif
+  endfor
+
+  add(lines, repeat('─', 78))
+  if empty(candidates)
+    add(lines, printf('  No eager plugin costs %.1f ms or more.', threshold))
+  else
+    add(lines, printf('  Eager and over %.1f ms — consider {for: ...} or {on: ...}:', threshold))
+    extend(lines, candidates)
+  endif
+  # reltime() 量的是墙钟：插件在加载时做的任何 I/O 都算在里面。列头写的是
+  # "wall ms" 而不是 CPU，就是这个意思。
+  add(lines, '  Wall clock, not CPU: I/O a plugin does while loading counts.')
+  add(lines, '  q close' .. (detailed ? '' : '   :PlugProfile! for a per-file breakdown'))
+
+  botright new
+  setlocal buftype=nofile bufhidden=wipe noswapfile nobuflisted
+  setlocal nowrap nonumber norelativenumber signcolumn=no cursorline
+  setlocal filetype=simpleplugprofile
+  setline(1, lines)
+  setlocal nomodifiable
+  nnoremap <buffer><silent> q <Cmd>bwipeout<CR>
+  syntax clear
+  syntax match SPlugBorder /─\+/
+  syntax match SPlugTitle /SimplePlug profile/
+  syntax match SPlugBarFill /█/
+  syntax match SPlugWaiting /\<eager\>/
+  syntax match SPlugStateOk /\<lazy\>/
+  syntax match SPlugStateNew /\<install\>/
+  syntax match SPlugHelp /^  q close.*$/
 enddef
 
 export def Clean(force: bool = false)

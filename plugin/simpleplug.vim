@@ -25,6 +25,8 @@ g:simpleplug_spinner_interval = get(g:, 'simpleplug_spinner_interval', 200)
 # 新建快照文件的格式：'v1'（默认，带 url/branch）或 'legacy'（{名字: OID}）。
 # 覆盖已有文件时永远保持该文件原来的格式，这个选项管不着。
 g:simpleplug_snapshot_format = get(g:, 'simpleplug_snapshot_format', 'v1')
+# :PlugProfile 里，多少毫秒起算"值得考虑改成延迟加载"
+g:simpleplug_profile_threshold_ms = get(g:, 'simpleplug_profile_threshold_ms', 5)
 
 # =============== 命令 ===============
 command! -bang -nargs=* -complete=customlist,simpleplug#CompletePluginNames PlugInstall simpleplug#Install([<f-args>], <bang>0)
@@ -39,6 +41,7 @@ command! -nargs=? -complete=file PlugSnapshot simpleplug#Snapshot(<q-args>)
 command! -nargs=? -complete=file PlugSnapshotDiff simpleplug#SnapshotDiff(<q-args>)
 command! -nargs=? -complete=file PlugRestore simpleplug#Restore(<q-args>)
 command! -nargs=1 -complete=customlist,simpleplug#CompletePluginNames PlugHook simpleplug#RunHook(<q-args>)
+command! -bang PlugProfile simpleplug#Profile(<bang>0)
 command! PlugHealth   simpleplug#Health()
 command! PlugRestart  simpleplug#Restart()
 command! PlugLog      simpleplug#ShowLog()

@@ -580,6 +580,29 @@ simpleplug#Plug('local/absent', {as: 'absent', dir: checkout_home .. '/absent'})
 assert_equal(2, call(MissingCount, []), 'an absent checkout was counted as installed')
 delete(checkout_home, 'rf')
 
+# :PlugProfile attributes startup cost to the plugin that spent it. Loading is
+# the one thing SimplePlug is always in the middle of, so SourcePluginScripts
+# and the eager ftdetect sourcing are where the numbers come from.
+simpleplug#Begin('/tmp/simpleplug-vim-smoke')
+simpleplug#Plug('local/lazy-plugin', {
+  as: 'profile-fixture',
+  dir: fixture,
+  on: 'ProfileFixtureCommand',
+})
+simpleplug#End()
+silent! call simpleplug#LazyLoad('profile-fixture', ':ProfileFixtureCommand')
+PlugProfile
+var profile_lines = getline(1, '$')
+assert_match('SimplePlug profile', profile_lines[0])
+assert_match('wall ms', profile_lines[2], 'the profile did not label its unit as wall clock')
+var profile_row = filter(copy(profile_lines), (_, l) => l =~# 'profile-fixture')
+assert_equal(1, len(profile_row), 'the profile did not attribute the load: ' .. string(profile_lines))
+assert_match('\<lazy\>', profile_row[0], 'a lazily loaded plugin was not labelled lazy')
+assert_match(':ProfileFixtureCommand', profile_row[0], 'the profile did not record the trigger')
+assert_match('^\s\+\d\+\.\d', profile_row[0], 'the profile row carries no measurement')
+assert_match('q close', profile_lines[-1])
+bwipeout!
+
 # Reinitializing must clear generated lazy-load state without errors.
 simpleplug#Begin('/tmp/simpleplug-vim-smoke')
 simpleplug#Plug('owner/one')

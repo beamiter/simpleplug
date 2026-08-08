@@ -10,6 +10,7 @@
 - 支持 `for`（按文件类型延迟加载）、`on`（按命令或 `<Plug>` 映射延迟加载）
 - 快照与恢复：`:PlugSnapshot` 记录全部插件的精确 commit，`:PlugRestore` 一键回滚
 - `:PlugCheck` 只读地问"有没有更新"：只 fetch，不动工作区、不跑 hook
+- `:PlugProfile` 按插件报出启动开销，直接告诉你哪几个值得改成 `for` / `on`
 - `:PlugDiff` 审阅一次更新带进来的每条提交，`X` 单独把某个插件退回更新前的 commit
 - 快照漂移审计：`:PlugSnapshotDiff` 只读检查 checkout 与锁文件是否一致
 - `:PlugInstall` / `:PlugUpdate` 可指定插件名（带补全），只操作选中的插件
@@ -77,6 +78,7 @@ simpleplug#End()
 | `:PlugSnapshot [file]` | 把所有插件的精确 commit 写入快照文件 |
 | `:PlugSnapshotDiff [file]` | 只读比较当前 checkout 与快照，报告漂移及缺失项 |
 | `:PlugRestore [file]` | 将插件恢复到快照中记录的 commit |
+| `:PlugProfile[!]` | 按插件归因启动开销（墙钟毫秒、加载方式、触发器）；`!` 展开到每个文件 |
 | `:PlugHook {name}` | 对指定插件执行 post-install hook |
 | `:PlugStop` | 停止当前后端任务 |
 
@@ -151,6 +153,7 @@ g:simpleplug_activate_on_install  " 安装后立即在当前会话生效 (默认
 g:simpleplug_sync_timeout  " :PlugInstall! / :PlugUpdate! 最长等待秒数 (默认 1800)
 g:simpleplug_spinner_interval     " 进度窗口刷新间隔毫秒 (默认 200)
 g:simpleplug_snapshot_format      " 新建快照的格式: 'v1' (默认) 或 'legacy'
+g:simpleplug_profile_threshold_ms " :PlugProfile 里多少毫秒起算延迟加载候选 (默认 5)
 ```
 
 ## Plug() 选项
