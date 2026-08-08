@@ -438,6 +438,26 @@ endif
 delete(retry_checkout, 'rf')
 delete(snapshot_home, 'rf')
 
+# A `.git` directory is not proof of an installed plugin. A clone interrupted
+# mid-transfer leaves the destination and its .git behind but never writes the
+# index, and auto-install has to keep seeing it as missing rather than skipping
+# it for the rest of time.
+var checkout_home = tempname()
+mkdir(checkout_home .. '/interrupted/.git/refs/heads', 'p')
+writefile(['ref: refs/heads/main'], checkout_home .. '/interrupted/.git/HEAD')
+mkdir(checkout_home .. '/finished/.git', 'p')
+writefile([''], checkout_home .. '/finished/.git/index')
+simpleplug#Begin(checkout_home)
+simpleplug#Plug('local/finished', {as: 'finished', dir: checkout_home .. '/finished'})
+simpleplug#End()
+var MissingCount = function(printf('<SNR>%d_MissingPluginCount', simpleplug_script.sid))
+assert_equal(0, call(MissingCount, []), 'a finished checkout was counted as missing')
+simpleplug#Plug('local/interrupted', {as: 'interrupted', dir: checkout_home .. '/interrupted'})
+assert_equal(1, call(MissingCount, []), 'an interrupted clone was counted as installed')
+simpleplug#Plug('local/absent', {as: 'absent', dir: checkout_home .. '/absent'})
+assert_equal(2, call(MissingCount, []), 'an absent checkout was counted as installed')
+delete(checkout_home, 'rf')
+
 # Reinitializing must clear generated lazy-load state without errors.
 simpleplug#Begin('/tmp/simpleplug-vim-smoke')
 simpleplug#Plug('owner/one')

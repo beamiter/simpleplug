@@ -95,9 +95,19 @@ restoring the directory and repeating the trigger retries the load.
         Install missing plugins. With names (completed from the registry),
         only those are installed.
 
+        A checkout left behind by an interrupted clone counts as missing. git
+        creates the destination and its .git before the objects finish
+        transferring, so quitting Vim or running |:PlugStop| during an install
+        leaves a directory that is not a usable repository. SimplePlug detects
+        it — the daemon requires a resolvable HEAD, not merely a .git — and
+        removes and re-clones it instead of reporting "already installed"
+        forever.
+
                                                                  *:PlugUpdate*
 :PlugUpdate [name ...]
-        Update plugins, skipping frozen and pinned ones.
+        Update plugins, skipping frozen and pinned ones. A plugin whose
+        directory is missing, or left half-written by an interrupted clone, is
+        cloned rather than pulled.
 
                                                                   *:PlugClean*
 :PlugClean[!]

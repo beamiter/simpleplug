@@ -418,6 +418,36 @@ async fn git_clone(url: &str, dir: &str, refname: &str) -> Result<(), String> {
     }
 }
 
+/// Does this directory hold a checkout we can actually use?
+///
+/// A `.git` entry is not proof of one.  `git clone` creates the target and its
+/// `.git` before the objects finish transferring, and the partial-directory
+/// cleanup below only runs on `clone_plugin`'s Err path — which never executes
+/// when the process is killed instead of failing.  `:PlugStop` and VimLeavePre
+/// both send SIGTERM, so an install interrupted by quitting Vim leaves exactly
+/// that: a directory every later `:PlugInstall` calls "already installed" and
+/// every `:PlugUpdate` trips over with an obscure git error.
+///
+/// `--resolve-git-dir` comes first because a `.git` that is not a valid
+/// repository makes git's discovery walk *up*: without it, a plugged/ tree
+/// inside a dotfiles repository would answer with that repository's HEAD and
+/// the broken checkout would still look healthy.
+async fn git_checkout_is_valid(dir: &str) -> bool {
+    let gitdir = Path::new(dir).join(".git");
+    let Some(gitdir) = gitdir.to_str() else {
+        return false;
+    };
+    if run_git(dir, &["rev-parse", "--resolve-git-dir", gitdir])
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    run_git(dir, &["rev-parse", "--verify", "HEAD"])
+        .await
+        .is_ok()
+}
+
 fn short_commit(commit: &str) -> &str {
     if commit.len() > 10 {
         &commit[..10]
@@ -800,17 +830,45 @@ async fn handle_install(
 
             let dir_path = PathBuf::from(&p.dir);
             if dir_path.join(".git").exists() {
+                if git_checkout_is_valid(&p.dir).await {
+                    send_event(
+                        &tx,
+                        &Event::Progress {
+                            id,
+                            name: p.name.clone(),
+                            status: "already".into(),
+                            message: "already installed".into(),
+                        },
+                    )
+                    .await;
+                    return OperationResult::Already;
+                }
+                // An interrupted clone. Nothing here is salvageable — the
+                // objects that would let `git fetch` resume are the ones that
+                // never arrived — so start over from an empty directory.
                 send_event(
                     &tx,
                     &Event::Progress {
                         id,
                         name: p.name.clone(),
-                        status: "already".into(),
-                        message: "already installed".into(),
+                        status: "working".into(),
+                        message: "incomplete checkout; re-cloning".into(),
                     },
                 )
                 .await;
-                return OperationResult::Already;
+                if let Err(e) = tokio::fs::remove_dir_all(&dir_path).await {
+                    send_event(
+                        &tx,
+                        &Event::Progress {
+                            id,
+                            name: p.name.clone(),
+                            status: "error".into(),
+                            message: format!("cannot remove incomplete checkout: {e}"),
+                        },
+                    )
+                    .await;
+                    return OperationResult::Error;
+                }
             }
 
             // 克隆
@@ -921,7 +979,36 @@ async fn handle_update(
             let _guard = lock.lock().await;
 
             let dir_path = PathBuf::from(&p.dir);
-            if !dir_path.join(".git").exists() {
+            if !git_checkout_is_valid(&p.dir).await {
+                // A .git without a resolvable HEAD is an interrupted clone, not
+                // a repository to pull into: every git command below would fail
+                // with something the user cannot act on. Re-clone it instead.
+                let interrupted = dir_path.join(".git").exists();
+                if interrupted {
+                    send_event(
+                        &tx,
+                        &Event::Progress {
+                            id,
+                            name: p.name.clone(),
+                            status: "working".into(),
+                            message: "incomplete checkout; re-cloning".into(),
+                        },
+                    )
+                    .await;
+                    if let Err(e) = tokio::fs::remove_dir_all(&dir_path).await {
+                        send_event(
+                            &tx,
+                            &Event::Progress {
+                                id,
+                                name: p.name.clone(),
+                                status: "error".into(),
+                                message: format!("cannot remove incomplete checkout: {e}"),
+                            },
+                        )
+                        .await;
+                        return OperationResult::Error;
+                    }
+                }
                 let existed_before = dir_path.exists();
                 return match clone_plugin(&p, existed_before, id, &tx).await {
                     Ok(cloned_msg) => {
@@ -931,9 +1018,11 @@ async fn handle_update(
                                 id,
                                 name: p.name.clone(),
                                 status: "installed".into(),
-                                message: format!(
-                                    "missing plugin cloned during update ({cloned_msg})"
-                                ),
+                                message: if interrupted {
+                                    format!("incomplete checkout re-cloned ({cloned_msg})")
+                                } else {
+                                    format!("missing plugin cloned during update ({cloned_msg})")
+                                },
                             },
                         )
                         .await;
@@ -1723,5 +1812,107 @@ mod tests {
             std::fs::read_to_string(temp.0.join("plugin.txt")).unwrap(),
             "local changes\n"
         );
+    }
+
+    /// What a clone killed mid-transfer leaves behind: the destination and a
+    /// `.git` that no HEAD resolves against.  Nothing else has been written.
+    fn make_interrupted_clone(label: &str) -> TestDir {
+        let workdir = TestDir::new(label);
+        std::fs::create_dir_all(workdir.0.join("plugin/.git/objects")).unwrap();
+        std::fs::create_dir_all(workdir.0.join("plugin/.git/refs/heads")).unwrap();
+        std::fs::write(workdir.0.join("plugin/.git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        workdir
+    }
+
+    #[tokio::test]
+    async fn install_recovers_an_interrupted_clone() {
+        let origin = make_origin("interrupted-install-origin");
+        let workdir = make_interrupted_clone("interrupted-install");
+        let dest = workdir.0.join("plugin");
+        assert!(dest.join(".git").exists());
+        assert!(!git_checkout_is_valid(dest.to_str().unwrap()).await);
+
+        let plugin = spec(
+            "interrupted-plugin",
+            origin.0.to_str().unwrap(),
+            dest.to_str().unwrap(),
+        );
+        let locks = Arc::new(RwLock::new(HashMap::new()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        handle_install(21, vec![plugin], 1, &tx, &locks).await;
+
+        let events = drain_events(&mut rx).await;
+        assert!(
+            !events.iter().any(|e| e["status"] == "already"),
+            "an interrupted clone was reported as already installed"
+        );
+        assert!(events.iter().any(|e| e["status"] == "installed"));
+        assert!(dest.join("plugin.txt").exists());
+        assert!(git_checkout_is_valid(dest.to_str().unwrap()).await);
+    }
+
+    #[tokio::test]
+    async fn update_recovers_an_interrupted_clone() {
+        let origin = make_origin("interrupted-update-origin");
+        let workdir = make_interrupted_clone("interrupted-update");
+        let dest = workdir.0.join("plugin");
+
+        let plugin = spec(
+            "interrupted-plugin",
+            origin.0.to_str().unwrap(),
+            dest.to_str().unwrap(),
+        );
+        let locks = Arc::new(RwLock::new(HashMap::new()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        handle_update(22, vec![plugin], 1, &tx, &locks).await;
+
+        let events = drain_events(&mut rx).await;
+        assert!(
+            !events.iter().any(|e| e["status"] == "error"),
+            "update failed on an interrupted clone instead of repairing it: {events:?}"
+        );
+        assert!(events.iter().any(|e| e["status"] == "installed"));
+        assert!(dest.join("plugin.txt").exists());
+        assert!(git_checkout_is_valid(dest.to_str().unwrap()).await);
+    }
+
+    /// The repair must not fire on a healthy checkout — including one nested
+    /// inside another repository, where a naive HEAD lookup would walk up.
+    #[tokio::test]
+    async fn a_healthy_nested_checkout_is_left_alone() {
+        let outer = make_origin("nested-outer");
+        let origin = make_origin("nested-origin");
+        let dest = outer.0.join("plugged/plugin");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+
+        let plugin = spec(
+            "nested-plugin",
+            origin.0.to_str().unwrap(),
+            dest.to_str().unwrap(),
+        );
+        let locks = Arc::new(RwLock::new(HashMap::new()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        handle_install(23, vec![plugin.clone()], 1, &tx, &locks).await;
+        assert!(
+            drain_events(&mut rx)
+                .await
+                .iter()
+                .any(|e| e["status"] == "installed")
+        );
+
+        let installed_head = git_out(&dest, &["rev-parse", "HEAD"]);
+        handle_install(24, vec![plugin], 1, &tx, &locks).await;
+        let events = drain_events(&mut rx).await;
+        assert!(
+            events.iter().any(|e| e["status"] == "already"),
+            "a healthy checkout was re-cloned: {events:?}"
+        );
+        assert_eq!(git_out(&dest, &["rev-parse", "HEAD"]), installed_head);
+
+        // And the same directory with a hollowed-out .git is still detected as
+        // broken rather than answering with the enclosing repository's HEAD.
+        std::fs::remove_dir_all(dest.join(".git")).unwrap();
+        std::fs::create_dir_all(dest.join(".git")).unwrap();
+        assert!(!git_checkout_is_valid(dest.to_str().unwrap()).await);
     }
 }

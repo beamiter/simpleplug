@@ -745,10 +745,30 @@ def SelectPlugins(names: list<string>): list<dict<any>>
   return out
 enddef
 
+# `.git` on its own does not mean installed: a clone killed mid-transfer (which
+# quitting Vim during the first auto-install does, via VimLeavePre → SIGTERM)
+# leaves the directory and its .git behind.  The index is written only once the
+# checkout completes, so it is the cheapest local proof that the clone finished
+# — one stat() per plugin on every startup.  The daemon repeats the
+# authoritative `git rev-parse --verify HEAD` check before it re-clones.
+def IsInstalledCheckout(dir: string): bool
+  var gitpath = dir .. '/.git'
+  var ftype = getftype(gitpath)
+  if ftype ==# ''
+    return false
+  endif
+  if ftype !=# 'dir'
+    # A .git file (worktree or submodule) points elsewhere; only the daemon can
+    # resolve it, so do not claim it is broken on this evidence.
+    return true
+  endif
+  return filereadable(gitpath .. '/index')
+enddef
+
 def MissingPluginCount(): number
   var missing = 0
   for p in s_plugins
-    if getftype(p.dir .. '/.git') ==# ''
+    if !IsInstalledCheckout(p.dir)
       missing += 1
     endif
   endfor

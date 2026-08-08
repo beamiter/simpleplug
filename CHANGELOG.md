@@ -2,6 +2,21 @@
 
 ## Unreleased - 2026-08-08
 
+### 中断的 clone 能被识别并修复
+
+- 修复：`git clone` 先建好目标目录和 `.git`，对象才慢慢传输；而 `clone_plugin`
+  的残留清理只在 Err 分支上跑，进程被杀时根本不会执行。`:PlugStop` 和
+  VimLeavePre 都是 SIGTERM，所以安装途中退出 Vim 会留下一个永远被当成
+  "already installed" 的目录，`:PlugUpdate` 则报一句看不懂的 git 错误。
+- daemon 现在要求 `git rev-parse --verify HEAD` 解析得出来才算装好；先用
+  `--resolve-git-dir` 钉住这个 `.git` 确实属于本 checkout，免得损坏时 git 的
+  发现逻辑往上走、拿外层 dotfiles 仓库的 HEAD 冒充健康。识别出来后删掉重
+  clone，install 和 update 两条路径都走这个修复。
+- Vim 侧的 `MissingPluginCount` 同步：`.git/index` 只在 checkout 完成时才写出，
+  一次 stat 就能让 auto-install 重新把半成品当作缺失，而不是永远跳过。
+- 新增 Rust 回归：install/update 各修一次中断的 clone；健康的 checkout（包括
+  嵌套在另一个仓库里的）不被重新 clone。Vim smoke 覆盖三种 checkout 计数。
+
 ### 重新 source vimrc 不再拆掉已加载的延迟插件
 
 - 修复：`Begin()` 会 `delcommand` 掉 `s_lazy_commands` 里的每个名字，但延迟加载
