@@ -155,6 +155,29 @@ assert_false(exists('g:simpleplug_batch_optout_loaded'),
   'g:simpleplug_activate_on_install = 0 still activated the plugin')
 g:simpleplug_activate_on_install = 1
 
+# ── :PlugRestore must move a frozen plugin ──────────────────────────────────
+# The daemon tests `frozen` before it looks at the commit pin, so a restore
+# that forwards frozen:true has the plugin reported as skipped and the checkout
+# left where it was — while the UI shows a plain `frozen` row that reads as
+# success. What goes over the wire is the only place this is observable.
+var dump = home .. '/requests.jsonl'
+$FAKE_PLUG_DUMP = dump
+var pinned_oid = repeat('a1b2c3d4', 5)
+var lockfile = home .. '/lock.json'
+writefile([json_encode({'batch-frozen': pinned_oid})], lockfile)
+simpleplug#Stop()
+simpleplug#Begin(home)
+simpleplug#Plug('local/batch-frozen', {as: 'batch-frozen', dir: home .. '/batch-frozen', frozen: 1})
+simpleplug#End()
+simpleplug#Restore(lockfile)
+simpleplug#Await(30)
+var sent = filter(mapnew(readfile(dump), (_, l) => json_decode(l)),
+  (_, r) => get(r, 'type', '') ==# 'update')
+assert_equal(1, len(sent), 'restore did not send exactly one update request')
+assert_equal(pinned_oid, sent[0].plugins[0].commit, 'restore did not pin the snapshot commit')
+assert_false(sent[0].plugins[0].frozen, 'restore asked the daemon to skip a frozen plugin')
+$FAKE_PLUG_DUMP = ''
+
 # ── a silent daemon must not wedge Vim forever ──────────────────────────────
 simpleplug#Stop()
 $FAKE_PLUG_SILENT = '1'

@@ -1279,6 +1279,13 @@ export def Restore(file: string = '')
   var specs = PluginSpecs(plugs)
   for spec in specs
     spec.commit = snap[spec.name]
+    # Restoring a lockfile is an explicit instruction to move this checkout, so
+    # `frozen` must not veto it. The daemon tests frozen before it looks at the
+    # commit pin, and would report the plugin as skipped while leaving it where
+    # it was — rendered as a plain `frozen` row, which reads as success.
+    # Freezing means "an update does not touch this", not "a restore silently
+    # does nothing".
+    spec.frozen = false
   endfor
   RunBatch('update', plugs, specs)
 enddef

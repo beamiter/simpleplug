@@ -162,6 +162,9 @@ restoring the directory and repeating the trigger retries the load.
         Existing snapshots produced by earlier SimplePlug versions use this
         same shape and remain readable.
 
+        A `frozen` plugin is restored like any other: freezing means an update
+        leaves it alone, not that an explicit restore silently does nothing.
+
                                                                    *:PlugHook*
 :PlugHook {name}
         Re-run a single plugin's `do` post-hook.

@@ -2,6 +2,14 @@
 
 ## Unreleased - 2026-08-08
 
+### :PlugRestore 不再对 frozen 插件装死
+
+- 修复：`Restore()` 构造的 spec 原样带着 `frozen: true`，而 daemon 在看 commit pin
+  之前就先判 frozen，于是回复 skipped、checkout 一动没动，UI 上却只是一行普通的
+  `frozen`，看起来像成功了。冻结的含义是"更新不碰它"，不是"显式恢复悄悄失效"。
+- 回归断言实际发出去的 update 请求：commit 是快照里的 OID，frozen 为假。fake
+  daemon 新增 `FAKE_PLUG_DUMP`，把收到的每个请求原样落盘供测试检查。
+
 ### CI 重新变绿
 
 - 修复：workflow 把 MSRV job 钉在 `dtolnay/rust-toolchain@1.85.0`，而 Cargo.toml

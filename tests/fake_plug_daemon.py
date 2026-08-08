@@ -15,6 +15,8 @@ Environment
   FAKE_PLUG_FROZEN    comma-separated plugin names to report as skipped/frozen
   FAKE_PLUG_SILENT    if set, answer the handshake and nothing else
   FAKE_PLUG_DELAY_MS  wait this long before the first progress event
+  FAKE_PLUG_DUMP      append every request to this file, one JSON line each,
+                      so a test can assert on what actually went over the wire
 
 A plugin's checkout is materialised by copying `<dir>.src` to `<dir>` when that
 template exists, which is how a test arranges for a plugin to become loadable
@@ -121,6 +123,10 @@ def main():
             req = json.loads(line)
         except ValueError:
             continue
+        dump = os.environ.get("FAKE_PLUG_DUMP")
+        if dump:
+            with open(dump, "a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
         kind = req.get("type")
         if kind == "ping":
             emit(
