@@ -360,9 +360,13 @@ var occupied_stage = printf('%s/.%s.stage.%d.1', fnamemodify(snapshot_path, ':h'
 mkdir(occupied_stage, '', 0o700)
 simpleplug#Snapshot(snapshot_path)
 var snapshot_json = json_decode(join(readfile(snapshot_path), "\n"))
-assert_equal(v:t_dict, type(snapshot_json), 'snapshot root is not the legacy JSON object')
-assert_match('^\x\{40}\%([0-9a-f]\{24}\)\?$', get(snapshot_json, 'snapshot-fixture', ''),
+assert_equal(v:t_dict, type(snapshot_json), 'snapshot root is not a JSON object')
+assert_equal(1, get(snapshot_json, 'version', 0), 'a new snapshot is not the versioned shape')
+var snapshot_entry = get(get(snapshot_json, 'plugins', {}), 'snapshot-fixture', {})
+assert_match('^\x\{40}\%([0-9a-f]\{24}\)\?$', get(snapshot_entry, 'commit', ''),
   'snapshot did not contain a full Git OID')
+assert_equal('https://github.com/local/snapshot-fixture.git', get(snapshot_entry, 'url', ''),
+  'snapshot did not record where the commit came from')
 assert_equal([], readdir(occupied_stage), 'snapshot used an attacker-occupied staging directory')
 delete(occupied_stage, 'd')
 assert_equal([], globpath(fnamemodify(snapshot_path, ':h'), '.*.stage.*', 0, 1),
@@ -372,11 +376,11 @@ assert_equal([], globpath(fnamemodify(snapshot_path, ':h'), '.*.stage.*', 0, 1),
 # the installed checkout while the registered non-checkout is explicitly
 # reported as unlocked rather than silently folded into another category.
 var clean_diff = execute('PlugSnapshotDiff ' .. fnameescape(snapshot_path))
-assert_match('matched=1 drifted=0 missing=0 non-git=0 unreadable=0 unlocked=2 orphaned=0', clean_diff)
+assert_match('format=v1 matched=1 drifted=0 respecced=0 missing=0 non-git=0 unreadable=0 unlocked=2 orphaned=0', clean_diff)
 assert_match('\[matched\] snapshot-fixture current=', clean_diff)
 assert_match('\[unlocked\] missing-fixture (missing)', clean_diff)
 assert_match('\[unlocked\] plain-fixture (not-git)', clean_diff)
-var current_oid: string = snapshot_json['snapshot-fixture']
+var current_oid: string = snapshot_entry.commit
 var drift_oid = (current_oid[0] ==# '0' ? '1' : '0') .. strpart(current_oid, 1)
 var diff_snapshot = snapshot_home .. '/locks/diff.json'
 writefile([json_encode({
@@ -388,7 +392,7 @@ writefile([json_encode({
 var diff_before = readfile(diff_snapshot)
 var starts_before_diff = simpleplug#core#Health().starts
 var drift_output = execute('PlugSnapshotDiff ' .. fnameescape(diff_snapshot))
-assert_match('matched=0 drifted=1 missing=1 non-git=1 unreadable=0 unlocked=0 orphaned=1', drift_output)
+assert_match('format=legacy matched=0 drifted=1 respecced=0 missing=1 non-git=1 unreadable=0 unlocked=0 orphaned=1', drift_output)
 var missing_pos = match(drift_output, '\[missing\] missing-fixture')
 var plain_pos = match(drift_output, '\[not-git\] plain-fixture')
 var changed_pos = match(drift_output, '\[drifted\] snapshot-fixture')
@@ -489,6 +493,72 @@ endif
   entry !=# retry_runtime && entry !=# retry_runtime .. '/after'), ',')
 delete(retry_checkout, 'rf')
 delete(snapshot_home, 'rf')
+
+# The lockfile is meant to be committed to a dotfiles repo and reviewed, so it
+# is emitted by hand rather than by json_encode: Vim's dictionary order is an
+# implementation detail, and a one-line file whose keys reshuffle on every
+# regeneration produces a diff nobody can read.
+var lock_home = tempname()
+mkdir(lock_home, 'p')
+var lock_path = lock_home .. '/lock.json'
+simpleplug#Begin('/tmp/simpleplug-vim-smoke')
+for alias in ['zeta', 'alpha', 'mike']
+  simpleplug#Plug('local/lock-fixture', {as: alias, dir: root})
+endfor
+simpleplug#End()
+simpleplug#Snapshot(lock_path)
+var lock_lines = readfile(lock_path)
+var lock_names = mapnew(filter(copy(lock_lines), (_, l) => l =~# '"commit"'),
+  (_, l) => matchstr(l, '"\zs[^"]\+\ze": {'))
+assert_equal(['alpha', 'mike', 'zeta'], lock_names,
+  'lockfile entries are not sorted one per line: ' .. string(lock_lines))
+simpleplug#Snapshot(lock_path)
+assert_equal(lock_lines, readfile(lock_path), 'regenerating the lockfile changed it')
+var lock_json = json_decode(join(lock_lines, "\n"))
+assert_equal('https://github.com/local/lock-fixture.git',
+  get(get(get(lock_json, 'plugins', {}), 'alpha', {}), 'url', ''),
+  'the versioned lockfile did not record the source repository')
+
+# The same commit under a different declaration is not a match: a report that
+# only compares commits calls it matched while the spec has moved underneath.
+simpleplug#Begin('/tmp/simpleplug-vim-smoke')
+simpleplug#Plug('other/lock-fixture', {as: 'alpha', dir: root})
+simpleplug#End()
+var respec_output = execute('PlugSnapshotDiff ' .. fnameescape(lock_path))
+assert_match('respecced=1', respec_output)
+assert_match('\[respecced\] alpha current=\x\+ (url .* -> https://github.com/other/lock-fixture.git)',
+  respec_output)
+
+# An existing lockfile keeps the shape it already has. Regenerating a file that
+# is under version control must not rewrite it into another format.
+var legacy_path = lock_home .. '/legacy.json'
+writefile([json_encode({alpha: repeat('a', 40)})], legacy_path)
+simpleplug#Snapshot(legacy_path)
+var legacy_json = json_decode(join(readfile(legacy_path), "\n"))
+assert_false(has_key(legacy_json, 'version'), 'an existing legacy lockfile was upgraded in place')
+assert_match('^\x\{40}$', get(legacy_json, 'alpha', ''),
+  'the legacy shape lost its name -> OID mapping')
+
+# A new lockfile follows g:simpleplug_snapshot_format for people who have to
+# keep feeding the old shape to something else.
+g:simpleplug_snapshot_format = 'legacy'
+var forced_legacy = lock_home .. '/forced.json'
+simpleplug#Snapshot(forced_legacy)
+assert_false(has_key(json_decode(join(readfile(forced_legacy), "\n")), 'version'),
+  'g:simpleplug_snapshot_format = legacy still wrote the versioned shape')
+g:simpleplug_snapshot_format = 'v1'
+
+# Both shapes cross the same OID gate before anything reaches the daemon.
+var starts_before_v1_restore = simpleplug#core#Health().starts
+writefile(['{"version": 1, "plugins": {"alpha": {"commit": "abc1234"}}}'], legacy_path)
+simpleplug#Restore(legacy_path)
+assert_match('alpha.commit must be a full 40- or 64-digit hexadecimal Git OID', execute('messages'))
+writefile(['{"version": 2, "plugins": {}}'], legacy_path)
+simpleplug#Restore(legacy_path)
+assert_match('unsupported snapshot version: 2', execute('messages'))
+assert_equal(starts_before_v1_restore, simpleplug#core#Health().starts,
+  'an invalid versioned snapshot started the daemon')
+delete(lock_home, 'rf')
 
 # A `.git` directory is not proof of an installed plugin. A clone interrupted
 # mid-transfer leaves the destination and its .git behind but never writes the

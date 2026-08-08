@@ -113,15 +113,24 @@ vim -es -u vimrc +'PlugInstall!' +qall
 每次更新是并入而不是覆盖，所以回滚了一个插件不会弄丢其他插件的上一版 commit。
 文件损坏、或者某条记录里的 commit 不是完整 OID 时整条丢弃——那些 commit 是要交回给 git 的。
 
-快照默认路径为 `g:simpleplug_dir .. '/simpleplug.snapshot.json'`。
-文件继续采用兼容旧版本的 `{插件名: 完整 Git OID}` JSON 对象；写入先在目标旁
-原子创建同文件系统的 0700 私有 staging 目录，在其中写完文件后再原子替换
-旧快照；写入或重命名失败不会破坏上一版，预置的同名目录/符号链接也不会被跟随。
-为避免锁文件被当作 Git 参数注入，恢复会在启动后台前校验整个对象：每个值必须
+快照默认路径为 `g:simpleplug_dir .. '/simpleplug.snapshot.json'`。锁文件是拿去提交、
+拿去 review 的，所以不用 `json_encode` 直接倒——Vim 的字典顺序是实现细节，一行到底、
+每次重新生成键序都不一样的文件没人能审。现在按插件名排序、一个插件一行手写输出，
+checkout 没变时重新生成得到逐字节相同的文件。
+
+两种形状都读，写的时候二选一：新文件按 `g:simpleplug_snapshot_format`
+（默认 `v1`：`{"version": 1, "plugins": {名字: {"commit": OID, "url": …, "branch": …}}}`），
+覆盖已有文件时保持它原来的形状——版本控制里的锁文件不该因为跑了一次
+`:PlugSnapshot` 就被改写成另一种格式。旧的 `{插件名: 完整 Git OID}` 永远读得动。
+
+写入先在目标旁原子创建同文件系统的 0700 私有 staging 目录，在其中写完文件后再原子
+替换旧快照；写入或重命名失败不会破坏上一版，预置的同名目录/符号链接也不会被跟随。
+为避免锁文件被当作 Git 参数注入，恢复会在启动后台前校验整个文件：每个 commit 必须
 是 40 位 SHA-1 或 64 位 SHA-256 十六进制 OID。快照目标本身若是符号链接会被拒绝。
 
 `:PlugSnapshotDiff` 使用同一套完整校验，但只读取本地 Git HEAD，不启动后台、
 不访问网络也不改动快照。结果按插件名排序并严格区分：已匹配、commit 漂移、
+commit 没动但声明变了（respecced，只有 v1 快照记了 url/branch 才判得出来）、
 已锁定但 checkout 缺失、目录非 Git、HEAD 不可读、已注册但未锁定，以及快照中
 已不再注册的孤儿项；matched 项也会逐项输出，结果可直接保存作审计记录。
 
@@ -139,6 +148,7 @@ g:simpleplug_hook_timeout  " post-hook 超时秒数 (默认 600)
 g:simpleplug_activate_on_install  " 安装后立即在当前会话生效 (默认 1)
 g:simpleplug_sync_timeout  " :PlugInstall! / :PlugUpdate! 最长等待秒数 (默认 1800)
 g:simpleplug_spinner_interval     " 进度窗口刷新间隔毫秒 (默认 200)
+g:simpleplug_snapshot_format      " 新建快照的格式: 'v1' (默认) 或 'legacy'
 ```
 
 ## Plug() 选项

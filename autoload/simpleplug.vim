@@ -1096,25 +1096,124 @@ def IsFullGitOid(value: any): bool
 enddef
 
 
-# Snapshot files deliberately keep the original {name: oid} shape. Strictly
-# validating that small format before starting the daemon both preserves old
-# lockfiles and prevents arbitrary revision/option strings from reaching Git.
-def ReadSnapshot(path: string): dict<string>
+# 快照有两种形状，读的时候都认，写的时候二选一：
+#
+#   legacy  {name: oid}
+#   v1      {"version": 1, "plugins": {name: {"commit": oid, "url": …, "branch": …}}}
+#
+# legacy 是最早的格式，必须永远读得动：磁盘上的旧锁文件不该因为升级插件而作废。
+# v1 多记 url 和 branch，因为一个只有 commit 的锁文件说不出这个 commit 是从哪个
+# 仓库、哪个分支来的，也就没法回答"这次锁文件变动到底改了什么"。
+#
+# 两条路径共用同一个 IsFullGitOid 闸门：commit 会作为 revision 原样交给 git，
+# 这个"启动 daemon 之前先校验整个文件"的安全性质只证明一次。
+def ValidateSnapshotName(name: string)
+  if name !~# '^[A-Za-z0-9._-]\+$'
+    throw 'invalid plugin name: ' .. string(name)
+  endif
+enddef
+
+
+def ValidateSnapshotText(name: string, field: string, value: any): string
+  if type(value) != v:t_string
+    throw printf('%s: %s must be a string', name, field)
+  endif
+  # url/branch 只用于展示与审计，从不作为参数交给 git（那是注册表说了算的）；
+  # 但一条能换行的记录会让锁文件本身变得不可读，所以还是挡掉。
+  if value =~# "[\n\r]"
+    throw printf('%s: %s must be a single line', name, field)
+  endif
+  return value
+enddef
+
+
+# 返回 {format: 'legacy'|'v1', plugins: {name: {commit, url, branch}}}。
+def ReadSnapshotFile(path: string): dict<any>
   var decoded: any = json_decode(join(readfile(path), "\n"))
   if type(decoded) != v:t_dict
     throw 'snapshot root must be a JSON object'
   endif
-  var result: dict<string> = {}
-  for [name, oid] in items(decoded)
-    if name !~# '^[A-Za-z0-9._-]\+$'
-      throw 'invalid plugin name: ' .. string(name)
+  var plugins: dict<dict<string>> = {}
+
+  if !has_key(decoded, 'version')
+    for [name, oid] in items(decoded)
+      ValidateSnapshotName(name)
+      if !IsFullGitOid(oid)
+        throw printf('%s must map to a full 40- or 64-digit hexadecimal Git OID', name)
+      endif
+      plugins[name] = {commit: tolower(oid), url: '', branch: ''}
+    endfor
+    return {format: 'legacy', plugins: plugins}
+  endif
+
+  if decoded.version != 1
+    throw printf('unsupported snapshot version: %s', string(decoded.version))
+  endif
+  if type(get(decoded, 'plugins', 0)) != v:t_dict
+    throw 'snapshot "plugins" must be a JSON object'
+  endif
+  for [name, entry] in items(decoded.plugins)
+    ValidateSnapshotName(name)
+    if type(entry) != v:t_dict
+      throw printf('%s must map to an object', name)
     endif
-    if !IsFullGitOid(oid)
-      throw printf('%s must map to a full 40- or 64-digit hexadecimal Git OID', name)
+    if !IsFullGitOid(get(entry, 'commit', 0))
+      throw printf('%s.commit must be a full 40- or 64-digit hexadecimal Git OID', name)
     endif
-    result[name] = tolower(oid)
+    plugins[name] = {
+      commit: tolower(entry.commit),
+      url: ValidateSnapshotText(name, 'url', get(entry, 'url', '')),
+      branch: ValidateSnapshotText(name, 'branch', get(entry, 'branch', '')),
+    }
   endfor
-  return result
+  return {format: 'v1', plugins: plugins}
+enddef
+
+
+def ReadSnapshot(path: string): dict<string>
+  var plugins: dict<dict<string>> = ReadSnapshotFile(path).plugins
+  return mapnew(plugins, (_, entry) => entry.commit)
+enddef
+
+
+# 手写的发射器，不是 json_encode：Vim 的字典顺序是内部实现细节，把它提交进
+# dotfiles 仓库的结果是每次重新生成都得到一份整行重排的 diff，没人能审。
+# 排好序、一个插件一行，`git diff` 才说得出到底哪几个插件动了。
+def EncodeSnapshotLegacy(plugins: dict<dict<string>>): list<string>
+  var names = sort(keys(plugins))
+  var lines = ['{']
+  for i in range(len(names))
+    add(lines, printf('  %s: %s%s', json_encode(names[i]),
+      json_encode(plugins[names[i]].commit), i < len(names) - 1 ? ',' : ''))
+  endfor
+  add(lines, '}')
+  return lines
+enddef
+
+
+def EncodeSnapshotV1(plugins: dict<dict<string>>): list<string>
+  var names = sort(keys(plugins))
+  var lines = ['{', '  "version": 1,', '  "plugins": {']
+  for i in range(len(names))
+    var entry = plugins[names[i]]
+    var fields = [printf('"commit": %s', json_encode(entry.commit))]
+    if entry.url !=# ''
+      add(fields, printf('"url": %s', json_encode(entry.url)))
+    endif
+    if entry.branch !=# ''
+      add(fields, printf('"branch": %s', json_encode(entry.branch)))
+    endif
+    add(lines, printf('    %s: {%s}%s', json_encode(names[i]),
+      join(fields, ', '), i < len(names) - 1 ? ',' : ''))
+  endfor
+  extend(lines, ['  }', '}'])
+  return lines
+enddef
+
+
+def SnapshotFormat(): string
+  var configured = get(g:, 'simpleplug_snapshot_format', 'v1')
+  return configured ==# 'legacy' ? 'legacy' : 'v1'
 enddef
 
 
@@ -1146,7 +1245,7 @@ enddef
 # child inside that 0700 boundary, then rename the completed file. Unlike a
 # getftype()->writefile() sequence, a planted symlink can only make mkdir fail;
 # it is never opened. Failed write/rename leaves the existing lockfile intact.
-def WriteSnapshotAtomic(path: string, encoded: string, what: string = 'snapshot'): bool
+def WriteSnapshotAtomic(path: string, encoded: list<string>, what: string = 'snapshot'): bool
   var parent = fnamemodify(path, ':h')
   try
     if !isdirectory(parent) && mkdir(parent, 'p') == 0 && !isdirectory(parent)
@@ -1171,7 +1270,7 @@ def WriteSnapshotAtomic(path: string, encoded: string, what: string = 'snapshot'
   try
     stage_dir = CreateSnapshotStageDir(path)
     temporary = stage_dir .. '/snapshot'
-    if writefile([encoded], temporary) != 0
+    if writefile(encoded, temporary) != 0
       throw 'temporary write failed'
     endif
     if rename(temporary, path) != 0
@@ -1213,17 +1312,31 @@ enddef
 
 export def Snapshot(file: string = '')
   var path = SnapshotPath(file)
-  var snap: dict<string> = {}
+  var snap: dict<dict<string>> = {}
   for p in s_plugins
     var checkout = PluginCheckoutState(p)
     if checkout.status ==# 'ok'
-      snap[p.name] = checkout.oid
+      snap[p.name] = {commit: checkout.oid, url: p.url, branch: get(p, 'branch', '')}
     endif
   endfor
-  if !WriteSnapshotAtomic(path, json_encode(snap))
+
+  # 覆盖一个已经存在的锁文件时保持它原来的格式：这个文件多半在版本控制里，
+  # 一次 :PlugSnapshot 不该顺手把它整个改写成另一种形状。
+  var format = SnapshotFormat()
+  if filereadable(path)
+    try
+      format = ReadSnapshotFile(path).format
+    catch
+      # 读不动就按配置写：反正它已经没法当锁文件用了。
+    endtry
+  endif
+
+  if !WriteSnapshotAtomic(path,
+      format ==# 'legacy' ? EncodeSnapshotLegacy(snap) : EncodeSnapshotV1(snap))
     return
   endif
-  echom printf('[SimplePlug] snapshot of %d plugins written to %s', len(snap), path)
+  echom printf('[SimplePlug] snapshot of %d plugins written to %s (%s)',
+    len(snap), path, format)
 enddef
 
 
@@ -1239,20 +1352,22 @@ export def SnapshotDiff(file: string = '')
   # Parse and validate the complete file before reading a checkout or printing
   # a partial report. This shares Restore's strict legacy-format boundary and
   # keeps a malformed lockfile completely side-effect free.
-  var snap: dict<string>
+  var record: dict<any>
   try
-    snap = ReadSnapshot(path)
+    record = ReadSnapshotFile(path)
   catch
     echohl ErrorMsg
     echom printf('[SimplePlug] invalid snapshot file %s: %s', path, v:exception)
     echohl None
     return
   endtry
+  var snap: dict<dict<string>> = record.plugins
 
   var registered: dict<bool> = {}
   var rows: list<dict<string>> = []
   var matched = 0
   var drifted = 0
+  var respecced = 0
   var missing = 0
   var non_git = 0
   var unreadable = 0
@@ -1262,40 +1377,60 @@ export def SnapshotDiff(file: string = '')
     registered[plugin.name] = true
     var checkout = PluginCheckoutState(plugin)
     var actual = checkout.oid
-    if !has_key(snap, plugin.name)
+    var locked = get(snap, plugin.name, {})
+    if empty(locked)
       unlocked += 1
       rows->add({name: plugin.name, status: 'unlocked', expected: '', actual: actual,
         reason: checkout.status})
     elseif checkout.status ==# 'missing'
       missing += 1
-      rows->add({name: plugin.name, status: 'missing', expected: snap[plugin.name], actual: '', reason: ''})
+      rows->add({name: plugin.name, status: 'missing', expected: locked.commit, actual: '', reason: ''})
     elseif checkout.status ==# 'not-git'
       non_git += 1
-      rows->add({name: plugin.name, status: 'not-git', expected: snap[plugin.name], actual: '', reason: ''})
+      rows->add({name: plugin.name, status: 'not-git', expected: locked.commit, actual: '', reason: ''})
     elseif checkout.status ==# 'unreadable'
       unreadable += 1
-      rows->add({name: plugin.name, status: 'unreadable', expected: snap[plugin.name], actual: '', reason: ''})
-    elseif actual ==# snap[plugin.name]
-      matched += 1
-      rows->add({name: plugin.name, status: 'matched', expected: snap[plugin.name], actual: actual, reason: ''})
-    else
+      rows->add({name: plugin.name, status: 'unreadable', expected: locked.commit, actual: '', reason: ''})
+    elseif actual !=# locked.commit
       drifted += 1
-      rows->add({name: plugin.name, status: 'drifted', expected: snap[plugin.name], actual: actual, reason: ''})
+      rows->add({name: plugin.name, status: 'drifted', expected: locked.commit, actual: actual, reason: ''})
+    else
+      # 同一个 commit，却不再是同一个仓库或同一条分支：一个只比对 commit 的
+      # 报告会说 matched，而声明其实已经变了。legacy 快照没记这两个字段，
+      # 所以那里永远不会走到这一支。
+      var respec: list<string> = []
+      if locked.url !=# '' && locked.url !=# plugin.url
+        add(respec, printf('url %s -> %s', locked.url, plugin.url))
+      endif
+      if locked.branch !=# '' && locked.branch !=# get(plugin, 'branch', '')
+        add(respec, printf('branch %s -> %s', locked.branch,
+          get(plugin, 'branch', '') ==# '' ? '(default)' : plugin.branch))
+      endif
+      if empty(respec)
+        matched += 1
+        rows->add({name: plugin.name, status: 'matched', expected: locked.commit, actual: actual, reason: ''})
+      else
+        respecced += 1
+        rows->add({name: plugin.name, status: 'respecced', expected: locked.commit,
+          actual: actual, reason: join(respec, ', ')})
+      endif
     endif
   endfor
   for name in keys(snap)
     if !has_key(registered, name)
       orphaned += 1
-      rows->add({name: name, status: 'orphaned', expected: snap[name], actual: '', reason: ''})
+      rows->add({name: name, status: 'orphaned', expected: snap[name].commit, actual: '', reason: ''})
     endif
   endfor
   rows->sort((left, right) => left.name ==# right.name ? 0 : (left.name <# right.name ? -1 : 1))
 
-  echom printf('[SimplePlug] snapshot diff: matched=%d drifted=%d missing=%d non-git=%d unreadable=%d unlocked=%d orphaned=%d',
-    matched, drifted, missing, non_git, unreadable, unlocked, orphaned)
+  echom printf('[SimplePlug] snapshot diff: format=%s matched=%d drifted=%d respecced=%d missing=%d non-git=%d unreadable=%d unlocked=%d orphaned=%d',
+    record.format, matched, drifted, respecced, missing, non_git, unreadable, unlocked, orphaned)
   for row in rows
     if row.status ==# 'matched'
       echom printf('  [matched] %s current=%s', row.name, row.actual)
+    elseif row.status ==# 'respecced'
+      echom printf('  [respecced] %s current=%s (%s)', row.name, row.actual, row.reason)
     elseif row.status ==# 'drifted'
       echom printf('  [drifted] %s expected=%s current=%s', row.name, row.expected, row.actual)
     elseif row.status ==# 'missing'
@@ -1448,7 +1583,7 @@ def SaveUpdateDetail()
   # 已经从 vimrc 里删掉的插件没法回滚，留着只会让这个文件无限长大。
   filter(plugins, (name, _) => FindPlugin(name) != {})
   WriteSnapshotAtomic(LastUpdatePath(),
-    json_encode({version: 1, when: strftime('%Y-%m-%d %H:%M:%S'), plugins: plugins}),
+    [json_encode({version: 1, when: strftime('%Y-%m-%d %H:%M:%S'), plugins: plugins})],
     'update record')
 enddef
 

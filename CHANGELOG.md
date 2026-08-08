@@ -2,6 +2,27 @@
 
 ## Unreleased - 2026-08-08
 
+### 快照变成一个能 review 的锁文件
+
+- 修复：`:PlugSnapshot` 之前是 `json_encode(snap)`，一行到底、键序取决于 Vim 字典的
+  内部顺序。把它提交进 dotfiles 仓库的结果是每次重新生成都得到一份整行重排的 diff，
+  "这次到底哪几个插件动了"根本看不出来。现在按插件名排序、一个插件一行手写输出，
+  checkout 没变时重新生成得到逐字节相同的文件。
+- 新增 v1 形状：`{"version": 1, "plugins": {名字: {"commit": OID, "url": …, "branch": …}}}`。
+  只有 commit 的锁文件说不出这个 commit 是从哪个仓库、哪条分支来的，也就回答不了
+  "锁文件这次变动改了什么"。旧的 `{名字: OID}` 永远读得动——磁盘上的旧锁文件不该
+  因为升级插件而作废。
+- 新文件按 `g:simpleplug_snapshot_format`（默认 `v1`）；**覆盖已有文件时保持它原来的
+  形状**，版本控制里的锁文件不该因为跑了一次 `:PlugSnapshot` 就被换成另一种格式。
+- `:PlugSnapshotDiff` 新增 `respecced` 一类：commit 还停在锁定的那个，但 url 或 branch
+  的声明已经变了。只比 commit 的报告会把它算成 matched，而声明其实已经不是一回事。
+  legacy 快照没记这两个字段，那里永远不会出现这一类。汇总行也报出文件是按哪种形状读的。
+- 两条读取路径共用同一个 `IsFullGitOid` 闸门与同一套校验：commit 是要作为 revision
+  原样交给 git 的，"启动 daemon 之前先校验整个文件"这条安全性质只证明一次。
+- 回归：断言锁文件排序、逐字节可重现、v1 记下了来源 url；已有 legacy 文件不被就地
+  升级；`g:simpleplug_snapshot_format = 'legacy'` 生效；v1 里的短 commit 与未知
+  version 都在启动 daemon 之前被拒；以及 `respecced` 行的判定。
+
 ### :PlugDiff：一次更新到底带进来了什么，以及把它退回去
 
 - 新增 `:PlugDiff [name ...]`：按插件列出上一次更新从哪个 commit 走到哪个 commit、

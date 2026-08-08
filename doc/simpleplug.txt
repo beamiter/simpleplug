@@ -196,32 +196,58 @@ restoring the directory and repeating the trigger retries the load.
                                                                *:PlugSnapshot*
 :PlugSnapshot [file]
         Write the exact commit of every plugin to a snapshot file. Defaults to
-        g:simpleplug_dir/simpleplug.snapshot.json. The legacy JSON object shape
-        ({plugin-name: full-oid}) is retained. A private 0700 staging directory
-        is atomically claimed beside the target on the same filesystem; the
-        complete file is written inside it and atomically renamed, so a failed
-        write leaves the previous snapshot intact. Pre-existing staging names
-        are skipped without following them. A snapshot target that is itself a
-        symbolic link is refused.
+        g:simpleplug_dir/simpleplug.snapshot.json.
+
+        The file is meant to be committed to your dotfiles and read in a diff,
+        so it is emitted by hand rather than by |json_encode()|: plugins are
+        sorted by name and written one per line. Vim's dictionary order is an
+        implementation detail, and a one-line file whose keys reshuffle on
+        every regeneration cannot be reviewed. Regenerating an unchanged
+        checkout produces a byte-identical file.
+
+        Two shapes are written, both read: >
+
+            {"version": 1, "plugins": {
+                "name": {"commit": <full-oid>, "url": ..., "branch": ...}}}
+            {"name": <full-oid>}
+<
+        The versioned shape also records where the commit came from, which is
+        what lets |:PlugSnapshotDiff| tell a changed declaration from a moved
+        checkout. The second is the original shape and stays readable forever.
+        A new file uses |g:simpleplug_snapshot_format|; a file being
+        overwritten keeps whatever shape it already has, so regenerating a
+        lockfile under version control never rewrites it into another format.
+
+        A private 0700 staging directory is atomically claimed beside the
+        target on the same filesystem; the complete file is written inside it
+        and atomically renamed, so a failed write leaves the previous snapshot
+        intact. Pre-existing staging names are skipped without following them.
+        A snapshot target that is itself a symbolic link is refused.
 
                                                            *:PlugSnapshotDiff*
 :PlugSnapshotDiff [file]
         Compare registered local checkouts with a snapshot without starting
         the daemon, accessing the network, or changing the snapshot. The
-        complete legacy object is validated before any checkout is inspected
-        or output is printed. Results are sorted by plugin name and distinguish
-        matched entries, commit drift, a missing checkout, a non-Git directory,
-        an unreadable HEAD, a registered plugin absent from the snapshot
-        (unlocked), and an unregistered snapshot entry (orphaned).
+        complete file is validated before any checkout is inspected or output
+        is printed. Results are sorted by plugin name and distinguish matched
+        entries, commit drift, a plugin sitting on the locked commit but no
+        longer declared with the locked url or branch (respecced), a missing
+        checkout, a non-Git directory, an unreadable HEAD, a registered plugin
+        absent from the snapshot (unlocked), and an unregistered snapshot entry
+        (orphaned). The summary line names the shape the file was read as.
+
+        `respecced` needs the url and branch a versioned snapshot records, so a
+        legacy snapshot never produces one.
 
                                                                 *:PlugRestore*
 :PlugRestore [file]
-        Check every plugin out to the commit recorded in a snapshot.
-        Validation happens before the daemon starts: the root must be an
-        object, every entry must have the expected type, and each commit must
-        be a full 40-digit SHA-1 or 64-digit SHA-256 hexadecimal object ID.
-        Existing snapshots produced by earlier SimplePlug versions use this
-        same shape and remain readable.
+        Check every plugin out to the commit recorded in a snapshot. Both
+        snapshot shapes are accepted. Validation happens before the daemon
+        starts: the root must be an object, every entry must have the expected
+        type, and each commit must be a full 40-digit SHA-1 or 64-digit
+        SHA-256 hexadecimal object ID — a commit reaches git as a revision, so
+        one bad entry rejects the whole file rather than part of it. Snapshots
+        produced by earlier SimplePlug versions remain readable.
 
         A `frozen` plugin is restored like any other: freezing means an update
         leaves it alone, not that an explicit restore silently does nothing.
@@ -368,6 +394,12 @@ will wait before giving up. Default: 1800. The operation itself keeps running.
 
                                               *g:simpleplug_spinner_interval*
 Progress window refresh interval in milliseconds. Default: 200
+
+                                              *g:simpleplug_snapshot_format*
+Shape used for a snapshot file that does not exist yet: "v1" (default, records
+url and branch beside the commit) or "legacy" ({plugin-name: full-oid}). A file
+being overwritten keeps the shape it already has, whatever this is set to; see
+|:PlugSnapshot|.
 
 ==============================================================================
 8. DAEMON SUPERVISION                                      *simpleplug-daemon*

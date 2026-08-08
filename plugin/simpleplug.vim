@@ -22,6 +22,9 @@ g:simpleplug_activate_on_install = get(g:, 'simpleplug_activate_on_install', 1)
 g:simpleplug_sync_timeout = get(g:, 'simpleplug_sync_timeout', 1800)
 # 进度窗口 spinner 的刷新间隔（毫秒）
 g:simpleplug_spinner_interval = get(g:, 'simpleplug_spinner_interval', 200)
+# 新建快照文件的格式：'v1'（默认，带 url/branch）或 'legacy'（{名字: OID}）。
+# 覆盖已有文件时永远保持该文件原来的格式，这个选项管不着。
+g:simpleplug_snapshot_format = get(g:, 'simpleplug_snapshot_format', 'v1')
 
 # =============== 命令 ===============
 command! -bang -nargs=* -complete=customlist,simpleplug#CompletePluginNames PlugInstall simpleplug#Install([<f-args>], <bang>0)
