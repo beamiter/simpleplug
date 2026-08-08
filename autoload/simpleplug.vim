@@ -712,6 +712,8 @@ def OnDaemonEvent(ev: dict<any>)
 
   if ev.type ==# 'progress'
     OnProgress(ev)
+  elseif ev.type ==# 'update_detail'
+    OnUpdateDetail(ev)
   elseif ev.type ==# 'done'
     OnDone(ev)
     if has_key(s_cbs, id)
@@ -857,6 +859,7 @@ def RunBatch(mode: string, plugs: list<dict<any>>, specs: list<dict<any>>)
   s_ui_total = len(plugs)
   s_ui_finished = 0
   s_ui_start_time = reltime()
+  s_update_detail = {}
   InitPlugStates(plugs, 'waiting', '·')
   UIOpen()
   s_cbs[id] = {
@@ -871,6 +874,7 @@ def RunBatch(mode: string, plugs: list<dict<any>>, specs: list<dict<any>>)
       try
         ActivateInstalled()
         GenerateHelptags()
+        SaveUpdateDetail()
       catch
         Log('post-batch activation failed: ' .. v:exception, 'WarningMsg')
       finally
@@ -1142,7 +1146,7 @@ enddef
 # child inside that 0700 boundary, then rename the completed file. Unlike a
 # getftype()->writefile() sequence, a planted symlink can only make mkdir fail;
 # it is never opened. Failed write/rename leaves the existing lockfile intact.
-def WriteSnapshotAtomic(path: string, encoded: string): bool
+def WriteSnapshotAtomic(path: string, encoded: string, what: string = 'snapshot'): bool
   var parent = fnamemodify(path, ':h')
   try
     if !isdirectory(parent) && mkdir(parent, 'p') == 0 && !isdirectory(parent)
@@ -1150,13 +1154,13 @@ def WriteSnapshotAtomic(path: string, encoded: string): bool
     endif
   catch
     echohl ErrorMsg
-    echom printf('[SimplePlug] failed to prepare snapshot directory %s: %s', parent, v:exception)
+    echom printf('[SimplePlug] failed to prepare %s directory %s: %s', what, parent, v:exception)
     echohl None
     return false
   endtry
   if getftype(path) ==# 'link'
     echohl ErrorMsg
-    echom '[SimplePlug] refusing to replace snapshot symlink: ' .. path
+    echom printf('[SimplePlug] refusing to replace %s symlink: %s', what, path)
     echohl None
     return false
   endif
@@ -1176,7 +1180,7 @@ def WriteSnapshotAtomic(path: string, encoded: string): bool
     ok = true
   catch
     echohl ErrorMsg
-    echom printf('[SimplePlug] failed to write snapshot %s: %s', path, v:exception)
+    echom printf('[SimplePlug] failed to write %s %s: %s', what, path, v:exception)
     echohl None
   finally
     if temporary !=# '' && getftype(temporary) ==# 'file'
@@ -1351,6 +1355,238 @@ export def Restore(file: string = '')
     spec.frozen = false
   endfor
   RunBatch('update', plugs, specs)
+enddef
+
+# =============================================================
+# :PlugDiff — 这次 update 到底带进来了什么，以及把它退回去
+# =============================================================
+
+# name -> {from, to, subjects}，由 daemon 的 update_detail 事件填。
+var s_update_detail: dict<dict<any>> = {}
+
+# :PlugDiff 打开时定格的那一份，加上渲染出来的行号 -> 插件名。
+# 定格是必要的：X 回滚会跑一个新的批次，那个批次会改写 s_update_detail，
+# 而用户手里的这个缓冲区还停在原来的画面上——回滚第二个插件时依据的必须
+# 是他正在看的那份，不是被覆盖之后的。
+var s_diff_entries: dict<dict<any>> = {}
+var s_diff_line_map: dict<string> = {}
+var s_diff_bufnr: number = -1
+
+def LastUpdatePath(): string
+  return g:simpleplug_dir .. '/.simpleplug-lastupdate.json'
+enddef
+
+# `from` 会作为 commit pin 原样发回 daemon，所以它跨过的是和快照文件同一条
+# 安全边界：只接受完整 OID，别的一律丢弃整条记录。
+def ValidUpdateEntry(name: string, entry: any): bool
+  if name !~# '^[A-Za-z0-9._-]\+$' || type(entry) != v:t_dict
+    return false
+  endif
+  if !IsFullGitOid(get(entry, 'from', '')) || !IsFullGitOid(get(entry, 'to', ''))
+    return false
+  endif
+  var subjects = get(entry, 'subjects', [])
+  if type(subjects) != v:t_list
+    return false
+  endif
+  return indexof(subjects, (_, s) => type(s) != v:t_string) < 0
+enddef
+
+def NormalizeUpdateEntry(entry: dict<any>): dict<any>
+  return {
+    from: tolower(entry.from),
+    to: tolower(entry.to),
+    subjects: copy(get(entry, 'subjects', [])),
+  }
+enddef
+
+def OnUpdateDetail(ev: dict<any>)
+  var name = get(ev, 'name', '')
+  if !ValidUpdateEntry(name, ev)
+    Log('ignoring malformed update detail for ' .. string(name), 'WarningMsg')
+    return
+  endif
+  s_update_detail[name] = NormalizeUpdateEntry(ev)
+enddef
+
+# 磁盘上的记录，坏了就当没有：这是个方便文件，不是权威来源。
+def LoadUpdateRecord(): dict<any>
+  var path = LastUpdatePath()
+  if !filereadable(path)
+    return {when: '', plugins: {}}
+  endif
+  try
+    var decoded: any = json_decode(join(readfile(path), "\n"))
+    if type(decoded) != v:t_dict || type(get(decoded, 'plugins', 0)) != v:t_dict
+      throw 'update record must be a JSON object with a plugins map'
+    endif
+    var plugins: dict<dict<any>> = {}
+    for [name, entry] in items(decoded.plugins)
+      if ValidUpdateEntry(name, entry)
+        plugins[name] = NormalizeUpdateEntry(entry)
+      endif
+    endfor
+    var when = get(decoded, 'when', '')
+    return {when: type(when) == v:t_string ? when : '', plugins: plugins}
+  catch
+    Log('unreadable update record ' .. path .. ': ' .. v:exception, 'WarningMsg')
+    return {when: '', plugins: {}}
+  endtry
+enddef
+
+# 合并而不是覆盖：回滚本身也是一次 update，会记下自己那一条。如果这里直接
+# 覆盖，把三个插件回滚掉的第一步就会把另外两个的记录抹掉，:PlugDiff 再也
+# 找不到它们的 from。
+def SaveUpdateDetail()
+  if empty(s_update_detail)
+    return
+  endif
+  var plugins = LoadUpdateRecord().plugins
+  for [name, entry] in items(s_update_detail)
+    plugins[name] = entry
+  endfor
+  # 已经从 vimrc 里删掉的插件没法回滚，留着只会让这个文件无限长大。
+  filter(plugins, (name, _) => FindPlugin(name) != {})
+  WriteSnapshotAtomic(LastUpdatePath(),
+    json_encode({version: 1, when: strftime('%Y-%m-%d %H:%M:%S'), plugins: plugins}),
+    'update record')
+enddef
+
+def DiffEntries(names: list<string>): dict<any>
+  var record = LoadUpdateRecord()
+  var plugins: dict<dict<any>> = record.plugins
+  # 本次会话记下的永远比磁盘新（写盘可能刚刚失败了）。
+  for [name, entry] in items(s_update_detail)
+    plugins[name] = entry
+  endfor
+  if !empty(names)
+    filter(plugins, (name, _) => index(names, name) >= 0)
+  endif
+  return {when: record.when, plugins: plugins}
+enddef
+
+def DiffRenderLines(record: dict<any>): list<string>
+  var plugins: dict<dict<any>> = record.plugins
+  var when: string = record.when
+  var lines = [
+    printf('  SimplePlug diff — %d plugin%s moved%s',
+      len(plugins), len(plugins) == 1 ? '' : 's',
+      when ==# '' ? '' : '  (recorded ' .. when .. ')'),
+    repeat('─', 78),
+  ]
+  s_diff_line_map = {}
+  for name in sort(keys(plugins))
+    var entry = plugins[name]
+    var from_oid: string = entry.from
+    var to_oid: string = entry.to
+    var subjects: list<string> = get(entry, 'subjects', [])
+    # subjects 是空的不代表"没变化"：回滚（新 HEAD 是旧 HEAD 的祖先）就是这样，
+    # from..to 里一条提交都没有，但 checkout 确实动了。
+    var count_text = empty(subjects)
+      ? 'no commits added'
+      : printf('%d commit%s', len(subjects), len(subjects) == 1 ? '' : 's')
+    s_diff_line_map[string(len(lines) + 1)] = name
+    add(lines, printf('  %-30s %s → %s  (%s)',
+      ShortLine(name, 30), from_oid[: 9], to_oid[: 9], count_text))
+    for subject in subjects
+      add(lines, '      ' .. subject)
+    endfor
+    add(lines, '')
+  endfor
+  add(lines, repeat('─', 78))
+  add(lines, '  X roll the plugin under the cursor back to its previous commit   q close')
+  return lines
+enddef
+
+export def Diff(names: list<string> = [])
+  var record = DiffEntries(names)
+  if empty(record.plugins)
+    echom empty(names)
+      ? '[SimplePlug] no update has been recorded yet; run :PlugUpdate'
+      : '[SimplePlug] no recorded update for: ' .. join(names, ' ')
+    return
+  endif
+  s_diff_entries = record.plugins
+  var lines = DiffRenderLines(record)
+
+  if s_diff_bufnr > 0 && bufexists(s_diff_bufnr)
+    execute 'bwipeout ' .. s_diff_bufnr
+  endif
+  botright new
+  s_diff_bufnr = bufnr()
+  setlocal buftype=nofile bufhidden=wipe noswapfile nobuflisted
+  setlocal nowrap nonumber norelativenumber signcolumn=no cursorline
+  setlocal filetype=simpleplugdiff
+  setline(1, lines)
+  setlocal nomodifiable
+  nnoremap <buffer><silent> q <Cmd>bwipeout<CR>
+  nnoremap <buffer><silent> X <Cmd>call simpleplug#DiffRollback()<CR>
+  SetupDiffSyntax()
+enddef
+
+def SetupDiffSyntax()
+  syntax clear
+  syntax match SPlugBorder /─\+/
+  syntax match SPlugTitle /SimplePlug diff/
+  syntax match SPlugIconUp /→/
+  syntax match SPlugCount /(\d\+ commits\?)/
+  syntax match SPlugWaiting /(no commits added)/
+  syntax match SPlugHelp /^  X roll.*$/
+enddef
+
+# X 回滚：把这一行的插件退回它这次 update 之前的那个 commit。
+#
+# 不需要新的 daemon 请求——一次带 commit pin 的普通 update 走的就是
+# git_pin_commit，浅克隆的 deepen/unshallow 升级、脏工作区拒绝、submodule
+# 同步全都已经在那条路径上了。
+export def DiffRollback()
+  var name = get(s_diff_line_map, string(line('.')), '')
+  if name ==# ''
+    echom '[SimplePlug] put the cursor on a plugin line to roll it back'
+    return
+  endif
+  var entry = get(s_diff_entries, name, {})
+  if !empty(entry)
+    RollbackTo(name, entry, false)
+  endif
+enddef
+
+# :PlugRollback[!] {name} — 同一件事，不必先开 :PlugDiff。[!] 跳过确认，
+# 和 :PlugClean! 是一个意思。
+export def Rollback(name: string, force: bool = false)
+  var entry = get(DiffEntries([name]).plugins, name, {})
+  if empty(entry)
+    echohl ErrorMsg
+    echom '[SimplePlug] no recorded update to roll back for: ' .. name
+    echohl None
+    return
+  endif
+  RollbackTo(name, entry, force)
+enddef
+
+def RollbackTo(name: string, entry: dict<any>, force: bool)
+  var target: string = entry.from
+  var plug = FindPlugin(name)
+  if plug == {}
+    echohl ErrorMsg
+    echom '[SimplePlug] no longer registered, cannot roll back: ' .. name
+    echohl None
+    return
+  endif
+  if !force && confirm(printf('[SimplePlug] roll %s back to %s?', name, target[: 9]),
+      "&Yes\n&No", 2) != 1
+    return
+  endif
+  if !EnsureBackend()
+    return
+  endif
+  var specs = PluginSpecs([plug])
+  specs[0].commit = target
+  # 和 :PlugRestore 同样的道理：显式的回滚指令不能被 frozen 或者一个 tag pin
+  # 否决——daemon 在看 commit 之前先看 frozen，会把这个插件报成 skipped。
+  specs[0].tag = ''
+  specs[0].frozen = false
+  RunBatch('update', [plug], specs)
 enddef
 
 export def Clean(force: bool = false)
@@ -2020,7 +2256,7 @@ def UIBuildAndRender(move_cursor: bool = false)
 
   add(lines, DividerLine(W))
   AddUiLine(lines, '  ' .. SummaryLine(), W)
-  AddUiLine(lines, '  q close   j/k move   <CR> open   d log   / filter   ? help   R retry failed   S status', W)
+  AddUiLine(lines, '  q close  j/k move  <CR> open  d log  D diff  / filter  ? help  R retry  S status', W)
 
   s_ui_lines = lines
   UIRender(move_cursor)
@@ -2092,6 +2328,7 @@ def UIOpen()
   nnoremap <buffer><silent> S <Cmd>call simpleplug#Status()<CR>
   nnoremap <buffer><silent> <CR> <Cmd>call simpleplug#OpenPluginDir()<CR>
   nnoremap <buffer><silent> d <Cmd>call simpleplug#ViewPluginDiff()<CR>
+  nnoremap <buffer><silent> D <Cmd>call simpleplug#ViewIncomingDiff()<CR>
   nnoremap <buffer><silent> h <Cmd>call simpleplug#ToggleHelp()<CR>
   nnoremap <buffer><silent> ? <Cmd>call simpleplug#ToggleHelp()<CR>
   nnoremap <buffer><silent> / <Cmd>call simpleplug#StartFilterSplit()<CR>
@@ -2205,6 +2442,7 @@ def DoToggleHelp()
     '    j / k       上下滚动',
     '    Enter       打开插件目录',
     '    d           查看 git log',
+    '    D           查看这次 update 带进来的提交（可回滚）',
     '    /           搜索过滤插件',
     '    R           重试失败的插件',
     '    S           查看状态',
@@ -2233,6 +2471,16 @@ export def OpenPluginDir()
   var dir = plug.dir
   UIClose()
   execute 'edit ' .. fnameescape(dir)
+enddef
+
+# 进度窗口里的 D：直接跳到这一行插件在 :PlugDiff 里的那一段。
+export def ViewIncomingDiff()
+  var name = PluginNameAtCursor()
+  if name ==# ''
+    return
+  endif
+  s_ui_cursor_name = name
+  Diff([name])
 enddef
 
 export def ViewPluginDiff()

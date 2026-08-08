@@ -157,6 +157,42 @@ restoring the directory and repeating the trigger retries the load.
         Show every plugin with its state and the date and subject of its most
         recent commit.
 
+                                                                   *:PlugDiff*
+:PlugDiff [name ...]
+        Review what the last update brought in. One section per plugin that
+        moved: the commit it moved from, the commit it moved to, and the
+        subjects of the commits in between (newest first, at most 50). Merge
+        commits are left out. With plugin names, only those are shown.
+
+        Press X on a plugin's header line to roll that plugin back to the
+        commit it moved from; q closes the window. An empty subject list does
+        not mean nothing happened — a rollback moves HEAD to an ancestor, so
+        no commit came in — and the line says so.
+
+        The record is written to g:simpleplug_dir/.simpleplug-lastupdate.json
+        when an update finishes, so :PlugDiff still works in the next Vim
+        session. Each update merges into that file rather than replacing it:
+        rolling one plugin back must not lose the other plugins' previous
+        commits. Entries for plugins you no longer declare are dropped. A
+        malformed record, or an entry whose commits are not full object IDs,
+        is ignored rather than trusted — those commits are handed back to git.
+
+        Requires a daemon that announces the `update_detail` capability
+        (protocol 2 and later). After updating SimplePlug itself, run
+        ./install.sh and |:PlugRestart| if the record stays empty.
+
+                                                               *:PlugRollback*
+:PlugRollback[!] {name}
+        Roll one plugin back to the commit its last recorded update moved it
+        from — the same thing X does in |:PlugDiff|, without opening the
+        window. With [!] it does not ask for confirmation.
+
+        This is an ordinary commit-pinned update, so it inherits that path
+        whole: a shallow clone is deepened to reach the commit, submodules are
+        re-synced, and a plugin with uncommitted changes is reported `dirty`
+        and left alone. A `frozen` plugin is rolled back like any other, for
+        the reason given under |:PlugRestore|.
+
                                                                *:PlugSnapshot*
 :PlugSnapshot [file]
         Write the exact commit of every plugin to a snapshot file. Defaults to
@@ -211,6 +247,8 @@ Inside the progress window:
   j, k        move the selection to the next/previous plugin
   <CR>        open the directory of the plugin under the cursor
   d           show that plugin's recent git log in a scratch buffer
+  D           open |:PlugDiff| for that plugin: the commits its last update
+              brought in, with X to roll it back
   R           retry only the plugins that failed
   S           show status
   /           filter the list

@@ -2,6 +2,27 @@
 
 ## Unreleased - 2026-08-08
 
+### :PlugDiff：一次更新到底带进来了什么，以及把它退回去
+
+- 新增 `:PlugDiff [name ...]`：按插件列出上一次更新从哪个 commit 走到哪个 commit、
+  中间是哪些提交（最新在前，最多 50 条，不含 merge）。在插件那一行按 `X` 把它退回
+  更新前的 commit；`q` 关窗。进度窗口新增 `D`，直接跳到光标所在插件的那一段。
+- 新增 `:PlugRollback[!] {name}`：同一件事的命令形式，`!` 跳过确认。回滚**不是**新的
+  daemon 请求，就是一次带 commit pin 的普通 update——浅克隆的 deepen/unshallow 升级、
+  脏工作区拒绝、submodule 同步全都已经在那条路径上，而且都有回归测试。
+- daemon 新增 `update_detail` 事件（capability `update_detail`）：`name`、完整的
+  `from`/`to` OID、以及 `from..to` 的提交主题。刻意不往 `progress` 上加字段——
+  它有三十来个构造点，其中绝大多数永远没有 diff 可报。
+- 记录并入 `g:simpleplug_dir/.simpleplug-lastupdate.json`，重启 Vim 之后 `:PlugDiff`
+  仍然能用。**并入而不是覆盖**：回滚本身也是一次 update，覆盖的话，回滚三个插件里的
+  第一个就会把另外两个的 `from` 抹掉，剩下两个再也回不去。已经不再注册的插件会被清掉。
+- `from` 会作为 commit pin 原样发回 daemon，所以它跨的是和快照文件同一条边界：
+  只接受完整 40/64 位十六进制 OID，记录损坏就整条丢弃，不"尽力而为"。
+- 回归：Rust 端断言一次真实 update 报出正确的 from/to 与主题顺序、up-to-date 时
+  不报、回滚报空主题列表且 HEAD 真的回去了；Vim 端（脚本化 daemon）断言记录文件
+  的版本与内容、`:PlugDiff` 的渲染、`X` 的绑定，以及回滚请求的线格式——插件名唯一、
+  commit 等于记录里的 `from`、`frozen` 被清掉。
+
 ### 同时声明 for 和 on 的插件也能挺过重新 source
 
 - 修复：上一轮"重新 source vimrc 不再拆掉已加载的延迟插件"只挡住了看得见的那一半。

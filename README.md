@@ -9,6 +9,7 @@
 - 支持 `branch`、`tag`、`commit`（版本锁定）、`do`（post-install hook）、`frozen`（锁定不更新）
 - 支持 `for`（按文件类型延迟加载）、`on`（按命令或 `<Plug>` 映射延迟加载）
 - 快照与恢复：`:PlugSnapshot` 记录全部插件的精确 commit，`:PlugRestore` 一键回滚
+- `:PlugDiff` 审阅一次更新带进来的每条提交，`X` 单独把某个插件退回更新前的 commit
 - 快照漂移审计：`:PlugSnapshotDiff` 只读检查 checkout 与锁文件是否一致
 - `:PlugInstall` / `:PlugUpdate` 可指定插件名（带补全），只操作选中的插件
 - 装好的插件当场生效：新安装的插件直接进 `runtimepath` 并被 source，不必重启 Vim
@@ -69,6 +70,8 @@ simpleplug#End()
 | `:PlugClean` | 确认后清理未注册的 Git 插件目录 |
 | `:PlugClean!` | 跳过确认并执行安全清理 |
 | `:PlugStatus` | 查看所有插件状态（分支、commit、最近提交、是否有修改） |
+| `:PlugDiff [name ...]` | 查看上一次更新带进来的提交，`X` 把光标所在插件回滚到更新前的 commit |
+| `:PlugRollback[!] {name}` | 直接把某个插件回滚到上一次更新前的 commit；`!` 跳过确认 |
 | `:PlugSnapshot [file]` | 把所有插件的精确 commit 写入快照文件 |
 | `:PlugSnapshotDiff [file]` | 只读比较当前 checkout 与快照，报告漂移及缺失项 |
 | `:PlugRestore [file]` | 将插件恢复到快照中记录的 commit |
@@ -101,6 +104,14 @@ vim -es -u vimrc +'PlugInstall!' +qall
 每次操作结束都会写入 `g:simpleplug_last_result`（`mode` / `installed` / `updated` /
 `ok` / `frozen` / `errors` / `failed` / `elapsed`）并触发 `User SimplePlugComplete`，
 `simpleplug#Await()` 与 `simpleplug#LastResult()` 提供同样的结果，不必再去正则解析进度窗口。
+
+`:PlugDiff` 展示上一次更新每个插件从哪个 commit 走到哪个 commit、中间带进来了哪些提交
+（最新的在前，最多 50 条，不含 merge）；在插件那一行按 `X` 就把它退回更新前的 commit，
+`:PlugRollback[!] {name}` 是同一件事的命令形式。回滚走的是普通的 commit pin 更新，
+因此浅克隆会自动加深、submodule 会重新同步、工作区脏的插件仍旧报 `dirty` 并跳过。
+记录写在 `g:simpleplug_dir .. '/.simpleplug-lastupdate.json'`，下次启动 Vim 仍然可用；
+每次更新是并入而不是覆盖，所以回滚了一个插件不会弄丢其他插件的上一版 commit。
+文件损坏、或者某条记录里的 commit 不是完整 OID 时整条丢弃——那些 commit 是要交回给 git 的。
 
 快照默认路径为 `g:simpleplug_dir .. '/simpleplug.snapshot.json'`。
 文件继续采用兼容旧版本的 `{插件名: 完整 Git OID}` JSON 对象；写入先在目标旁
@@ -190,7 +201,7 @@ git clone / pull / status
 测试包含 Rust 协议/并发/安全清理/脏工作区/版本锁定/浅克隆分支切换/中断 clone 修复回归，
 Vim9 延迟加载（filetype、命令、`<Plug>` 映射、ftdetect、重新 source vimrc——包括同时
 声明 `for` 与 `on` 的插件）smoke test，
-以及完成事件、同步等待与安装后激活的端到端断言。
+以及完成事件、同步等待、安装后激活、`:PlugDiff` 渲染与回滚线格式的端到端断言。
 
 ## License
 

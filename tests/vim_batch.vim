@@ -216,6 +216,59 @@ assert_equal(pinned_oid, sent[0].plugins[0].commit, 'restore did not pin the sna
 assert_false(sent[0].plugins[0].frozen, 'restore asked the daemon to skip a frozen plugin')
 $FAKE_PLUG_DUMP = ''
 
+# ── :PlugDiff and per-plugin rollback ───────────────────────────────────────
+# An update used to be a formatted string and nothing else: no way to see which
+# commits landed, and no way to undo them.
+var diff_dump = home .. '/diff-requests.jsonl'
+$FAKE_PLUG_DUMP = diff_dump
+simpleplug#Stop()
+simpleplug#Begin(home)
+simpleplug#Plug('local/diff-one', {as: 'diff-one', dir: home .. '/diff-one'})
+simpleplug#Plug('local/diff-two', {as: 'diff-two', dir: home .. '/diff-two'})
+simpleplug#End()
+PlugUpdate!
+simpleplug#UIClose()
+
+# The record outlives the session that made it, and carries only plugins that
+# are still registered — the earlier sections' updates are not in it.
+var record_path = home .. '/.simpleplug-lastupdate.json'
+assert_true(filereadable(record_path), 'an update wrote no diff record')
+var record = json_decode(join(readfile(record_path), "\n"))
+assert_equal(1, get(record, 'version', 0), 'diff record is not versioned')
+assert_equal(['diff-one', 'diff-two'], sort(keys(record.plugins)),
+  'diff record kept plugins that are no longer registered: ' .. string(keys(record.plugins)))
+
+PlugDiff
+assert_match('SimplePlug diff', getline(1), ':PlugDiff rendered no header')
+var diff_rows = filter(range(1, line('$')), (_, l) => getline(l) =~# '^  diff-one\s')
+assert_equal(1, len(diff_rows), ':PlugDiff did not render one header per plugin')
+assert_match('→', getline(diff_rows[0]), ':PlugDiff header shows no commit range')
+assert_match('(2 commits)', getline(diff_rows[0]), ':PlugDiff did not count the incoming commits')
+assert_true(index(getline(1, '$'), '      1111111 diff-one newer') >= 0,
+  ':PlugDiff listed no commit subjects')
+assert_match('simpleplug#DiffRollback', maparg('X', 'n'), 'X is not bound to a rollback')
+bwipeout!
+
+# Rolling back is an ordinary commit-pinned update; what goes over the wire is
+# the only place the pin and the frozen override are observable.
+delete(diff_dump)
+simpleplug#Rollback('diff-one', true)
+simpleplug#Await(30)
+var rolled = filter(mapnew(readfile(diff_dump), (_, l) => json_decode(l)),
+  (_, r) => get(r, 'type', '') ==# 'update')
+assert_equal(1, len(rolled), 'rollback did not send exactly one update request')
+assert_equal(['diff-one'], mapnew(rolled[0].plugins, (_, p) => p.name),
+  'rollback touched more than the plugin it was asked about')
+assert_equal(record.plugins['diff-one'].from, rolled[0].plugins[0].commit,
+  'rollback did not pin the commit the plugin was updated from')
+assert_false(rolled[0].plugins[0].frozen, 'rollback asked the daemon to skip a frozen plugin')
+
+# A plugin nobody recorded an update for cannot be rolled back to nothing.
+simpleplug#Rollback('diff-two-missing', true)
+assert_match('no recorded update to roll back for: diff-two-missing', execute('messages'))
+simpleplug#UIClose()
+$FAKE_PLUG_DUMP = ''
+
 # ── the progress UI's selection model ───────────────────────────────────────
 var sp_script = getscriptinfo({name: 'autoload/simpleplug.vim'})[0]
 var NameAtCursor = function(printf('<SNR>%d_PluginNameAtCursor', sp_script.sid))

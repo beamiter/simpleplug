@@ -10,6 +10,10 @@ Requests answered
   {"type":"ping","id":N}                    -> pong (protocol 2, real caps)
   {"type":"install"|"update","id":N,...}    -> progress per plugin, then done
 
+An `update` also emits one `update_detail` per plugin it reports as updated,
+with the full OIDs and commit subjects :PlugDiff renders and its rollback
+pins.  The OIDs are derived from the plugin name so a test can predict them.
+
 Environment
   FAKE_PLUG_FAIL      comma-separated plugin names to report as errors
   FAKE_PLUG_FROZEN    comma-separated plugin names to report as skipped/frozen
@@ -28,6 +32,7 @@ template exists, which is how a test arranges for a plugin to become loadable
 only once the "clone" reports success.
 """
 
+import hashlib
 import json
 import os
 import shutil
@@ -45,7 +50,13 @@ CAPABILITIES = [
     "tag_pin",
     "commit_pin",
     "submodules",
+    "update_detail",
 ]
+
+
+def fake_oid(name, side):
+    """A stable full-length OID for a plugin, so tests can assert on it."""
+    return hashlib.sha1((name + "/" + side).encode("utf-8")).hexdigest()
 
 
 def emit(obj):
@@ -113,6 +124,17 @@ def handle_batch(req):
         if os.path.isdir(template) and not os.path.exists(plugin["dir"]):
             shutil.copytree(template, plugin["dir"])
         status = "installed" if kind == "install" else "updated"
+        if status == "updated":
+            emit(
+                {
+                    "type": "update_detail",
+                    "id": rid,
+                    "name": name,
+                    "from": fake_oid(name, "from"),
+                    "to": fake_oid(name, "to"),
+                    "subjects": ["1111111 " + name + " newer", "0000000 " + name + " older"],
+                }
+            )
         emit(
             {
                 "type": "progress",

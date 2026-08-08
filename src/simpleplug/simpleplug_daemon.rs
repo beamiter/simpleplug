@@ -83,6 +83,7 @@ fn capabilities() -> BTreeMap<&'static str, bool> {
         ("tag_pin", true),
         ("commit_pin", true),
         ("submodules", true),
+        ("update_detail", true),
     ])
 }
 
@@ -113,6 +114,23 @@ enum Event {
         name: String,
         status: String,
         message: String,
+    },
+    /// 一次 update 到底带进来了什么。
+    ///
+    /// 刻意独立于 `progress` 而不是往它身上加字段：`progress` 有三十来个构造
+    /// 点，其中绝大多数（working/error/hook/frozen/dirty）永远没有 diff 可报，
+    /// 给它们全部补上 `from: None, to: None, subjects: None` 只会让噪声淹没
+    /// 真正带信息的那一个。旧的 Vim 端不认识这个事件类型，会照常忽略。
+    ///
+    /// `from`/`to` 是完整 OID：`:PlugDiff` 的回滚要把 `from` 当成 commit pin
+    /// 发回来，而 Vim 端在把任何 revision 交给 git 之前只接受完整 OID。
+    #[serde(rename = "update_detail")]
+    UpdateDetail {
+        id: u64,
+        name: String,
+        from: String,
+        to: String,
+        subjects: Vec<String>,
     },
     /// 整批操作完成
     #[serde(rename = "done")]
@@ -771,6 +789,39 @@ async fn git_current_commit(dir: &str) -> String {
         .unwrap_or_default()
 }
 
+/// 短 OID 对 git 自己够用，但 Vim 端在把任何 revision 交回 git 之前只接受完整
+/// OID（快照文件走的是同一条边界），而 `:PlugDiff` 的回滚正是这么用 `from` 的。
+async fn git_head_oid(dir: &str) -> String {
+    run_git(dir, &["rev-parse", "HEAD"])
+        .await
+        .unwrap_or_default()
+}
+
+/// 一个荒废几年的插件一次能带进来几千条提交；全发过去既没人读，也会让一条
+/// JSON 事件大到没有意义。
+const MAX_SUBJECTS: usize = 50;
+
+/// 这次 update 带进来的提交，最新的在前。
+///
+/// 回滚（`to` 是 `from` 的祖先）时这里是空的，那不是错误：没有任何提交被带
+/// 进来，UI 说的就是这句话。
+async fn incoming_subjects(dir: &str, from: &str, to: &str) -> Vec<String> {
+    if from.is_empty() || to.is_empty() || from == to {
+        return Vec::new();
+    }
+    let range = format!("{from}..{to}");
+    let max = format!("--max-count={MAX_SUBJECTS}");
+    run_git(dir, &["log", "--no-merges", "--format=%h %s", &max, &range])
+        .await
+        .map(|out| {
+            out.lines()
+                .map(|line| line.trim().to_string())
+                .filter(|line| !line.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 async fn git_is_dirty(dir: &str) -> bool {
     run_git(dir, &["status", "--porcelain"])
         .await
@@ -1393,6 +1444,8 @@ async fn handle_update(
             }
 
             let old_commit = git_current_commit(&p.dir).await;
+            // 完整 OID 只为 update_detail 取一次：回滚要把它当 commit pin 发回来。
+            let from_oid = git_head_oid(&p.dir).await;
 
             // commit > tag > branch 优先级：固定版本的插件不做 pull。
             let outcome: Result<(bool, String), String> = if !p.commit.is_empty() {
@@ -1459,6 +1512,22 @@ async fn handle_update(
 
             match outcome {
                 Ok((changed, msg)) => {
+                    // 先于 progress 发：Vim 端按名字归档它，progress 那一行到
+                    // 的时候明细已经在手上了。
+                    if changed {
+                        let to_oid = git_head_oid(&p.dir).await;
+                        send_event(
+                            &tx,
+                            &Event::UpdateDetail {
+                                id,
+                                name: p.name.clone(),
+                                subjects: incoming_subjects(&p.dir, &from_oid, &to_oid).await,
+                                from: from_oid.clone(),
+                                to: to_oid,
+                            },
+                        )
+                        .await;
+                    }
                     send_event(
                         &tx,
                         &Event::Progress {
@@ -2060,6 +2129,82 @@ mod tests {
         assert!(!temp.0.join("stale").exists());
         assert!(temp.0.join("keep").exists());
         assert!(temp.0.join("notes/readme.txt").exists());
+    }
+
+    /// `:PlugDiff` and its rollback are only as good as this event: without the
+    /// full OIDs and the subject list, an update is a formatted string nobody
+    /// can review and nothing can undo.
+    #[tokio::test]
+    async fn update_reports_the_commits_it_brought_in() {
+        let origin = make_origin("detail-origin");
+        let before = git_out(&origin.0, &["rev-parse", "HEAD"]);
+
+        let workdir = TestDir::new("detail-dest");
+        let dest = workdir.0.join("plugin");
+        let base = spec(
+            "detail-plugin",
+            origin.0.to_str().unwrap(),
+            dest.to_str().unwrap(),
+        );
+
+        let locks = Arc::new(RwLock::new(HashMap::new()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        handle_install(40, vec![base.clone()], 1, &tx, &locks).await;
+        drain_events(&mut rx).await;
+
+        // Nothing moved, so there is nothing to report.
+        handle_update(41, vec![base.clone()], 1, &tx, &locks).await;
+        let events = drain_events(&mut rx).await;
+        assert!(
+            !events.iter().any(|e| e["type"] == "update_detail"),
+            "an up-to-date plugin reported a diff"
+        );
+
+        std::fs::write(origin.0.join("plugin.txt"), "two\n").unwrap();
+        git(&origin.0, &["commit", "-aqm", "second subject"]);
+        std::fs::write(origin.0.join("plugin.txt"), "three\n").unwrap();
+        git(&origin.0, &["commit", "-aqm", "third subject"]);
+        let after = git_out(&origin.0, &["rev-parse", "HEAD"]);
+
+        handle_update(42, vec![base.clone()], 1, &tx, &locks).await;
+        let events = drain_events(&mut rx).await;
+        let detail = events
+            .iter()
+            .find(|e| e["type"] == "update_detail")
+            .expect("update reported no detail");
+        assert_eq!(detail["name"], "detail-plugin");
+        assert_eq!(detail["from"], before);
+        assert_eq!(detail["to"], after);
+        let subjects: Vec<String> = detail["subjects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(subjects.len(), 2, "wrong subject count: {subjects:?}");
+        assert!(
+            subjects[0].ends_with("third subject"),
+            "newest commit is not first: {subjects:?}"
+        );
+        assert!(
+            subjects[1].ends_with("second subject"),
+            "older commit missing: {subjects:?}"
+        );
+
+        // A rollback is an ordinary commit-pinned update: it reports the move
+        // with an empty subject list, because nothing came in.
+        let mut rollback = base;
+        rollback.commit = before.clone();
+        handle_update(43, vec![rollback], 1, &tx, &locks).await;
+        let events = drain_events(&mut rx).await;
+        let detail = events
+            .iter()
+            .find(|e| e["type"] == "update_detail")
+            .expect("rollback reported no detail");
+        assert_eq!(detail["from"], after);
+        assert_eq!(detail["to"], before);
+        assert_eq!(detail["subjects"].as_array().unwrap().len(), 0);
+        assert_eq!(git_out(&dest, &["rev-parse", "HEAD"]), before);
     }
 
     #[tokio::test]

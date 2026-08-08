@@ -1,10 +1,12 @@
 :PlugClean	simpleplug.txt	/*:PlugClean*
+:PlugDiff	simpleplug.txt	/*:PlugDiff*
 :PlugHealth	simpleplug.txt	/*:PlugHealth*
 :PlugHook	simpleplug.txt	/*:PlugHook*
 :PlugInstall	simpleplug.txt	/*:PlugInstall*
 :PlugLog	simpleplug.txt	/*:PlugLog*
 :PlugRestart	simpleplug.txt	/*:PlugRestart*
 :PlugRestore	simpleplug.txt	/*:PlugRestore*
+:PlugRollback	simpleplug.txt	/*:PlugRollback*
 :PlugSnapshot	simpleplug.txt	/*:PlugSnapshot*
 :PlugSnapshotDiff	simpleplug.txt	/*:PlugSnapshotDiff*
 :PlugStatus	simpleplug.txt	/*:PlugStatus*

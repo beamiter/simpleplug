@@ -29,6 +29,8 @@ command! -bang -nargs=* -complete=customlist,simpleplug#CompletePluginNames Plug
 command! -bang PlugClean simpleplug#Clean(<bang>0)
 command! PlugStatus    simpleplug#Status()
 command! PlugStop      simpleplug#Stop()
+command! -nargs=* -complete=customlist,simpleplug#CompletePluginNames PlugDiff simpleplug#Diff([<f-args>])
+command! -bang -nargs=1 -complete=customlist,simpleplug#CompletePluginNames PlugRollback simpleplug#Rollback(<q-args>, <bang>0)
 command! -nargs=? -complete=file PlugSnapshot simpleplug#Snapshot(<q-args>)
 command! -nargs=? -complete=file PlugSnapshotDiff simpleplug#SnapshotDiff(<q-args>)
 command! -nargs=? -complete=file PlugRestore simpleplug#Restore(<q-args>)
