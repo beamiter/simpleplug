@@ -55,6 +55,10 @@
   refire 关成 `v:false` 的人，按下第一个 `i` 收到的是一个从我们自己的 autocmd 里
   抛出来的错误；`g:simpleplug_debug = v:true` 更糟，Log() 大半是在 `catch` 里被调
   的。两处都改成 `!get(...)`，跟本文件里其余布尔选项的读法一致。
+- 新增 `tests/vim_order.vim`（`make vim-order`，已并入 `make check`）：一个带真 vimrc
+  的子 Vim，让启动扫描把 eager 插件 source 一遍，再从 VimEnter 里重新 source 同一个
+  vimrc，断言两条路径给出的加载顺序一字不差。上面那条顺序修正此前没有任何测试盯着，
+  把 `End()` 里的 `reverse()` 删掉，整个 `make check` 照样全绿。
 
 ### :PlugProfile 修正：eager 真的被量到了，ftdetect 不再被抹掉
 

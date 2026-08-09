@@ -248,6 +248,8 @@ Vim9 延迟加载（filetype、命令、`<Plug>` 映射、ftdetect、重新 sour
 声明 `for` 与 `on` 的插件）smoke test，
 autocmd 事件触发与交付、关掉交付、带模式的事件、被拒的事件名、只在插入/命令行模式
 存在的触发器及其重放、依赖顺序与成环回退的专项测试，
+一个带真 vimrc 的子 Vim 测试：启动扫描 source 一遍 eager 插件，VimEnter 之后再重新
+source 同一个 vimrc，两条路径的加载顺序必须一致，
 以及完成事件、同步等待、安装后激活、`:PlugDiff` 渲染与回滚线格式的端到端断言。
 
 ## License

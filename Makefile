@@ -1,6 +1,6 @@
-.PHONY: check fmt clippy test vim-test vim-batch vim-lazy vim-profile vim-core defcompile core-verify
+.PHONY: check fmt clippy test vim-test vim-batch vim-lazy vim-order vim-profile vim-core defcompile core-verify
 
-check: core-verify fmt clippy test defcompile vim-core vim-test vim-batch vim-lazy vim-profile
+check: core-verify fmt clippy test defcompile vim-core vim-test vim-batch vim-lazy vim-order vim-profile
 
 fmt:
 	cargo fmt --all -- --check
@@ -25,6 +25,14 @@ vim-batch:
 # or cmdline mode only, and declared dependency ordering.
 vim-lazy:
 	vim -Nu NONE -n -i NONE -es -S tests/vim_lazy.vim
+
+# Eager plugins are sourced by Vim's startup scan of 'runtimepath', but by
+# simpleplug#End() itself once VimEnter has passed — the two must agree on the
+# order, or re-sourcing a vimrc changes which plugin overrides which.  Only a
+# real startup shows it, so this one drives a child Vim whose vimrc re-sources
+# itself from a VimEnter autocommand.
+vim-order:
+	vim -Nu NONE -n -i NONE -es -S tests/vim_order.vim
 
 # :PlugProfile.  An eager plugin is sourced by Vim's own 'runtimepath' scan,
 # which runs after the vimrc and before -S, so the case the report exists for
