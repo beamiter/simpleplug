@@ -136,6 +136,25 @@ assert_equal(1, get(g:, 'simpleplug_broken_fixture_sourced', 0),
 assert_match('source error', debug_log,
   'the debug log did not report the source failure: ' .. string(debug_log))
 
+# The other direction is the one the guard exists for.  Log() is called from
+# every catch block in this plugin, so with g:simpleplug_debug unset — which is
+# every user who never asked for it — a transient source or git failure has to
+# reach nobody.  Same broken fixture, same reporting path, no output.
+unlet g:simpleplug_debug
+simpleplug#Begin(plugdir)
+simpleplug#Plug('local/broken-plugin', {
+  as: 'broken-fixture-quiet',
+  dir: root .. '/tests/fixtures/broken-plugin',
+  event: 'InsertEnter',
+})
+simpleplug#End()
+var quiet_log = execute('doautocmd InsertEnter')
+g:simpleplug_debug = 0
+assert_equal(2, get(g:, 'simpleplug_broken_fixture_sourced', 0),
+  'the quiet run never reached the reporting path, so it proves nothing')
+assert_notmatch('SimplePlug', quiet_log,
+  'Log() spoke although g:simpleplug_debug is unset: ' .. string(quiet_log))
+
 # An event may carry a pattern, and only a matching buffer may wake the plugin.
 unlet g:simpleplug_event_fixture_loaded
 autocmd! SimplePlugEventFixture
