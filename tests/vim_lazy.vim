@@ -81,6 +81,61 @@ assert_false(exists('g:simpleplug_event_fixture_insert'),
   'the event was re-fired although g:simpleplug_lazy_event_refire is 0')
 g:simpleplug_lazy_event_refire = 1
 
+# "Set it to 0" is also written `v:false`, and Vim9 refuses to compare a bool
+# with a number: read with `== 0`, the option turned the user's first InsertEnter
+# into E1138 thrown out of our own autocommand.  Every boolean-ish option here
+# has to be read the tolerant way.
+unlet g:simpleplug_event_fixture_loaded
+autocmd! SimplePlugEventFixture
+g:simpleplug_lazy_event_refire = v:false
+simpleplug#Begin(plugdir)
+simpleplug#Plug('local/event-plugin', {
+  as: 'event-fixture-boolfalse',
+  dir: event_fixture,
+  event: 'InsertEnter',
+})
+simpleplug#End()
+var bool_error = ''
+try
+  doautocmd InsertEnter
+catch
+  bool_error = v:exception
+endtry
+assert_equal('', bool_error,
+  'g:simpleplug_lazy_event_refire = v:false threw out of the autocommand')
+assert_equal(1, get(g:, 'simpleplug_event_fixture_loaded', 0),
+  'v:false kept the plugin from loading at all')
+assert_false(exists('g:simpleplug_event_fixture_insert'),
+  'v:false did not switch the re-fire off')
+g:simpleplug_lazy_event_refire = 1
+
+# The same hazard, in the one place a second exception is least welcome:
+# g:simpleplug_debug = v:true is ordinary, and Log() is called almost only from
+# `catch` blocks.  The broken fixture throws while being sourced, which is
+# exactly such a block — the failure must stay swallowed and reported.
+g:simpleplug_debug = v:true
+simpleplug#Begin(plugdir)
+simpleplug#Plug('local/broken-plugin', {
+  as: 'broken-fixture',
+  dir: root .. '/tests/fixtures/broken-plugin',
+  event: 'InsertEnter',
+})
+simpleplug#End()
+var debug_error = ''
+var debug_log = ''
+try
+  debug_log = execute('doautocmd InsertEnter')
+catch
+  debug_error = v:exception
+endtry
+g:simpleplug_debug = 0
+assert_equal('', debug_error,
+  'g:simpleplug_debug = v:true threw while reporting a source failure')
+assert_equal(1, get(g:, 'simpleplug_broken_fixture_sourced', 0),
+  'the broken fixture was never sourced, so nothing reached the log')
+assert_match('source error', debug_log,
+  'the debug log did not report the source failure: ' .. string(debug_log))
+
 # An event may carry a pattern, and only a matching buffer may wake the plugin.
 unlet g:simpleplug_event_fixture_loaded
 autocmd! SimplePlugEventFixture

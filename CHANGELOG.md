@@ -50,6 +50,11 @@
   已加载插件的 stub 不被留在册上、被拒的模式字母、延迟依赖的加载顺序、按仓库串解析
   依赖、非延迟插件把延迟依赖提升并排到自己前面、无依赖时 rtp 顺序不变、成环回退、
   依赖不存在时依赖方照常加载。
+- `g:simpleplug_lazy_event_refire` 与 `g:simpleplug_debug` 现在也认 `v:false` /
+  `v:true`。此前这两个值是拿 `== 0` 读的，而 Vim9 里 bool 撞上数字就是 E1138：把
+  refire 关成 `v:false` 的人，按下第一个 `i` 收到的是一个从我们自己的 autocmd 里
+  抛出来的错误；`g:simpleplug_debug = v:true` 更糟，Log() 大半是在 `catch` 里被调
+  的。两处都改成 `!get(...)`，跟本文件里其余布尔选项的读法一致。
 
 ### :PlugProfile 修正：eager 真的被量到了，ftdetect 不再被抹掉
 

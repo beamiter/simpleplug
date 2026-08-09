@@ -161,7 +161,10 @@ var s_ui_targets: list<string> = []   # 本次操作涉及的插件名(注册顺
 # ─────────────────── 日志 ───────────────────
 
 def Log(msg: string, hl: string = 'None')
-  if get(g:, 'simpleplug_debug', 0) == 0
+  # 用 `!` 而不是 `== 0`：`g:simpleplug_debug = v:true` 是完全正常的写法，而
+  # Vim9 里拿 bool 跟数字比会抛 E1138。Log() 大半是在 catch 里被调的——那正是
+  # 最不该再多冒出一个异常的地方。
+  if !get(g:, 'simpleplug_debug', 0)
     return
   endif
   echohl {hl}
@@ -555,7 +558,9 @@ export def LazyLoadEvent(name: string, event: string)
     return
   endif
   # 置 0 换成“插件从下一次事件开始生效”：叫醒它的这一次它看不见。
-  if get(g:, 'simpleplug_lazy_event_refire', 1) == 0
+  # 用 `!` 而不是 `== 0`：`v:false` 也是“关掉”的一种写法，而 Vim9 里拿 bool
+  # 跟数字比会当场抛 E1138——用户按下 i 就吃一个错误，而他写的东西没有错。
+  if !get(g:, 'simpleplug_lazy_event_refire', 1)
     return
   endif
   DeliverWakingEvent(event, match)

@@ -478,6 +478,8 @@ simpleplug#LastResult()
 ==============================================================================
 7. CONFIGURATION                                           *simpleplug-config*
 
+An option documented below as 0 or 1 also accepts |v:false| and |v:true|.
+
                                                             *g:simpleplug_dir*
 Plugin directory. Default: ~/.vim/plugged
 

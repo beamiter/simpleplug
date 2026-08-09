@@ -158,6 +158,8 @@ g:simpleplug_profile_threshold_ms " :PlugProfile 里多少毫秒起算延迟加�
 g:simpleplug_lazy_event_refire    " 叫醒 event 插件的那次事件是否交付给它 (默认 1)
 ```
 
+写 0 / 1 的选项同样认 `v:false` / `v:true`。
+
 ## Plug() 选项
 
 | 选项 | 说明 |
