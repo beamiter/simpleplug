@@ -22,8 +22,9 @@ g:simpleplug_activate_on_install = get(g:, 'simpleplug_activate_on_install', 1)
 g:simpleplug_sync_timeout = get(g:, 'simpleplug_sync_timeout', 1800)
 # 进度窗口 spinner 的刷新间隔（毫秒）
 g:simpleplug_spinner_interval = get(g:, 'simpleplug_spinner_interval', 200)
-# event 触发的插件加载完之后，把叫醒它的那次事件补发给它；代价是这个事件的其
-# 他监听者会看见它两次。置 0 则该插件从下一次事件开始生效。
+# event 触发的插件加载完之后，叫醒它的那一次事件照样交给它，而且只交一次：这
+# 一发只对 SimplePlug 自己的 autocmd 组发，该事件的其他监听者一个也不重跑。
+# 置 0 则该插件从下一次事件开始生效。
 g:simpleplug_lazy_event_refire = get(g:, 'simpleplug_lazy_event_refire', 1)
 # 新建快照文件的格式：'v1'（默认，带 url/branch）或 'legacy'（{名字: OID}）。
 # 覆盖已有文件时永远保持该文件原来的格式，这个选项管不着。
