@@ -100,10 +100,51 @@ doautocmd BufReadPre
 assert_equal(1, get(g:, 'simpleplug_event_fixture_loaded', 0),
   'a matching buffer did not wake the plugin')
 
+# Several patterns may follow the event name.  :autocmd ends its pattern at the
+# first blank, so they have to reach it joined with ',' — joined with a blank
+# the first word would be the only pattern and every other word would be read
+# as the command to run, swallowing ++once and erroring on every match.
+for tail in ['evtone', 'evttwo']
+  unlet! g:simpleplug_event_fixture_loaded
+  autocmd! SimplePlugEventFixture
+  simpleplug#Begin(plugdir)
+  simpleplug#Plug('local/event-plugin', {
+    as: 'event-fixture-patterns-' .. tail,
+    dir: event_fixture,
+    event: 'BufReadPre *.evtone *.evttwo',
+  })
+  simpleplug#End()
+  execute 'edit /tmp/simpleplug-vim-lazy-list.' .. tail
+  v:errmsg = ''
+  silent! doautocmd BufReadPre
+  assert_equal(1, get(g:, 'simpleplug_event_fixture_loaded', 0),
+    printf('a *.%s buffer did not wake the plugin declared for that pattern list', tail))
+  assert_equal('', v:errmsg,
+    printf('firing the event on a *.%s buffer raised an error', tail))
+endfor
+
+# The other side of that: a blank that is part of one pattern is written the
+# way :autocmd itself writes it, '\ ', and must not be read as a separator.
+unlet! g:simpleplug_event_fixture_loaded
+autocmd! SimplePlugEventFixture
+simpleplug#Begin(plugdir)
+simpleplug#Plug('local/event-plugin', {
+  as: 'event-fixture-escaped-blank',
+  dir: event_fixture,
+  event: 'BufReadPre /tmp/simpleplug-vim-lazy\ blank.evtblank',
+})
+simpleplug#End()
+edit /tmp/simpleplug-vim-lazy\ blank.evtblank
+v:errmsg = ''
+silent! doautocmd BufReadPre
+assert_equal(1, get(g:, 'simpleplug_event_fixture_loaded', 0),
+  'a pattern whose blank was escaped did not wake the plugin')
+assert_equal('', v:errmsg, 'a pattern whose blank was escaped raised an error')
+
 # Not every event matches its pattern against a file name: FileType matches on
 # the filetype, User on the user event name.  Such an event must reach the
 # plugin that was deferred to it just like a buffer event does.
-unlet g:simpleplug_event_fixture_loaded
+silent! unlet g:simpleplug_event_fixture_loaded
 silent! unlet g:simpleplug_event_fixture_ft
 autocmd! SimplePlugEventFixture
 simpleplug#Begin(plugdir)

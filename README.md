@@ -172,7 +172,7 @@ g:simpleplug_lazy_event_refire    " 叫醒 event 插件的那次事件是否交�
 | `as` | 自定义插件名，用于解决同名仓库冲突 |
 | `for` | 按文件类型延迟加载（字符串或列表；插件自带 ftdetect 会预先生效） |
 | `on` | 按命令或按键延迟加载（字符串、列表，或 `{keys, modes}` 指定模式） |
-| `event` | 按 autocmd 事件延迟加载，如 `'InsertEnter'`、`'BufReadPre *.md'`（字符串或列表） |
+| `event` | 按 autocmd 事件延迟加载，如 `'InsertEnter'`、`'BufReadPre *.md *.org'`（字符串或列表） |
 | `dependencies` | 必须先 source 的插件名（或声明时的仓库串）列表 |
 
 版本锁定优先级：`commit` > `tag` > `branch`。
@@ -193,9 +193,12 @@ clone、update、snapshot、hook 与 clean 仍以完整仓库目录为单位。�
 模式字母不认识时当场报错，而不是装上一个什么都不映射的触发器；一个插件的触发器
 全被拒绝，它就保持非延迟。
 
-`event` 的一条记录是事件名加可选 pattern（默认 `*`），例如 `'InsertEnter'` 或
-`'BufReadPre *.md'`。事件名打错会当场被拒——否则代价是一个永远不加载也永远不出声
-的插件。叫醒插件的那次事件到达时插件还没有任何处理器（处理器正是这次事件引发的
+`event` 的一条记录是事件名加零个或多个 pattern（默认 `*`），例如 `'InsertEnter'`、
+`'BufReadPre *.md'` 或 `'BufReadPre *.md *.org'`。事件名后面用空格分开的每个 pattern
+都能叫醒插件——它们是用 `,` 接起来交给 `:autocmd` 的，`:autocmd` 自己就是这么写一串
+pattern 的；真要让空格属于某一个 pattern，就按 `:autocmd` 的写法转义成 `\ `，例如
+`'BufReadPre /srv/my\ notes/*'`。事件名打错会当场被拒——否则代价是一个永远不加载
+也永远不出声的插件。叫醒插件的那次事件到达时插件还没有任何处理器（处理器正是这次事件引发的
 source 装上的，而 Vim 不会把执行途中新挂上的 autocmd 算进这一轮），SimplePlug 让
 正在进行的这一轮继续走进那些新挂的处理器：插件对这次事件**只看见一次**，就像它本
 来就加载好了一样，这个事件的其他监听者一个也不会重跑。

@@ -4,10 +4,15 @@
 
 ### 延迟加载：autocmd 事件、按模式绑定的触发器、依赖顺序
 
-- 新增 `event`：把插件推迟到某个 autocmd 事件，一条记录是事件名加可选 pattern
-  （`'InsertEnter'`、`'BufReadPre *.md'`）。此前延迟加载的词汇只有 `for` 和 `on`，
-  也就是 vim-plug 在 2014 年的那一套：补全插件没法推迟到 `InsertEnter`，git 插件
-  没法推迟到第一个读进来的 buffer。
+- 新增 `event`：把插件推迟到某个 autocmd 事件，一条记录是事件名加零个或多个
+  pattern（`'InsertEnter'`、`'BufReadPre *.md'`、`'BufReadPre *.md *.org'`）。此前
+  延迟加载的词汇只有 `for` 和 `on`，也就是 vim-plug 在 2014 年的那一套：补全插件
+  没法推迟到 `InsertEnter`，git 插件没法推迟到第一个读进来的 buffer。
+- 事件名后面的多个 pattern 用 `,` 接起来交给 `:autocmd`——`:autocmd` 的 pattern 到
+  第一个空白就结束，后面的一律当命令。用空格接的话 `'BufReadPre *.aaa *.bbb'` 装出
+  来的是 pattern `*.aaa` 加命令 `*.bbb ++once ++nested call ...`：`++once` 被吞进命令
+  里所以触发器永不退役，每一次匹配只报一个 E1050，插件一次也不会加载。反过来，
+  空格真属于某一个 pattern 时按 `:autocmd` 自己的写法转义成 `\ ` 即可。
 - 事件名当场用 `exists('##...')` 校验并拒绝。打错一个事件名的代价，本来是一个
   永远不加载、也永远不说为什么的插件。触发器全被拒绝的插件保持非延迟。
 - 叫醒插件的那一次事件，插件的处理器是赶不上的——处理器正是这次事件引发的

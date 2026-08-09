@@ -916,7 +916,16 @@ def NormalizeTriggers(pname: string, configured: any): dict<any>
   return {cmds: cmds, maps: maps}
 enddef
 
-# `event`：'InsertEnter' 或 'BufReadPre *.md'（事件名 + 可选 pattern，默认 '*'）。
+# `event`：'InsertEnter' 或 'BufReadPre *.md'（事件名 + 若干 pattern，默认 '*'）。
+#
+# 事件名后面可以写不止一个 pattern。它们必须用 ',' 接起来交给 :autocmd——
+# :autocmd 的 pattern 到第一个空白就结束，后面的东西一律当成要执行的命令。用空
+# 格接起来的话，`'BufReadPre *.aaa *.bbb'` 装出来的是 pattern '*.aaa'、命令
+# '*.bbb ++once ++nested call ...'：++once 被吞进命令里所以触发器永不退役，而每
+# 一次匹配都只报一个 E1050，插件一次也不会加载。
+#
+# 反过来，pattern 里真要带空格，:autocmd 的写法是 '\ '（反斜杠转义），所以这里
+# 按“前面没有反斜杠的空白”来切——'BufReadPre foo\ bar' 仍是一个 pattern。
 def NormalizeEvents(pname: string, configured: any): list<dict<string>>
   var events: list<dict<string>> = []
   var entries: list<any> = type(configured) == v:t_list ? configured : [configured]
@@ -928,13 +937,13 @@ def NormalizeEvents(pname: string, configured: any): list<dict<string>>
     if entry ==# ''
       continue
     endif
-    var parts = split(entry, '\s\+')
+    var parts = split(entry, '\\\@<!\s\+')
     # 事件名打错了，代价本来是一个永远不加载、也永远不说为什么的插件。
     if !exists('##' .. parts[0])
       OptionError(pname, 'unknown autocommand event: ' .. parts[0])
       continue
     endif
-    add(events, {event: parts[0], pattern: len(parts) > 1 ? join(parts[1 :], ' ') : '*'})
+    add(events, {event: parts[0], pattern: len(parts) > 1 ? join(parts[1 :], ',') : '*'})
   endfor
   return events
 enddef

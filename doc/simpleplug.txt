@@ -105,11 +105,19 @@ fired in.
 
                                                        *simpleplug-lazy-event*
 `event` defers a plugin to an autocommand event. An entry is an event name,
-optionally followed by a pattern (default "*"): >
+optionally followed by one or more patterns (default "*"): >
 
     call simpleplug#Plug('user/snippets', {'event': 'InsertEnter'})
     call simpleplug#Plug('user/markdown', {'event': ['BufReadPre *.md',
           \                                          'BufNewFile *.md']})
+    call simpleplug#Plug('user/notes', {'event': 'BufReadPre *.md *.org'})
+<
+Patterns after the event name are separated by blanks, and any one of them
+wakes the plugin: they reach |:autocmd| joined with ",", which is how :autocmd
+itself spells a list of patterns. A blank that belongs inside a single pattern
+is escaped as "\ ", again exactly as :autocmd spells it: >
+
+    call simpleplug#Plug('user/notes', {'event': 'BufReadPre /srv/my\ notes/*'})
 <
 An unknown event name is refused at registration — the alternative is a plugin
 that never loads and never says why — and a plugin whose every event was
