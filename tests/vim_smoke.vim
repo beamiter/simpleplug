@@ -595,11 +595,16 @@ PlugProfile
 var profile_lines = getline(1, '$')
 assert_match('SimplePlug profile', profile_lines[0])
 assert_match('wall ms', profile_lines[2], 'the profile did not label its unit as wall clock')
-var profile_row = filter(copy(profile_lines), (_, l) => l =~# 'profile-fixture')
-assert_equal(1, len(profile_row), 'the profile did not attribute the load: ' .. string(profile_lines))
-assert_match('\<lazy\>', profile_row[0], 'a lazily loaded plugin was not labelled lazy')
+var profile_rows = filter(copy(profile_lines), (_, l) => l =~# 'profile-fixture')
+# Two rows, not one: the triggered load and the ftdetect the plugin already
+# paid for at startup. Loading the body must not relabel that cost as lazy.
+assert_equal(2, len(profile_rows), 'the profile did not attribute the load: ' .. string(profile_lines))
+var profile_row = filter(copy(profile_rows), (_, l) => l =~# '\<lazy\>')
+assert_equal(1, len(profile_row), 'a lazily loaded plugin was not labelled lazy: ' .. string(profile_rows))
 assert_match(':ProfileFixtureCommand', profile_row[0], 'the profile did not record the trigger')
 assert_match('^\s\+\d\+\.\d', profile_row[0], 'the profile row carries no measurement')
+assert_equal(1, len(filter(copy(profile_rows), (_, l) => l =~# '\<ftdetect\>')),
+  'the eager ftdetect cost stopped being reported on its own: ' .. string(profile_rows))
 assert_match('q close', profile_lines[-1])
 bwipeout!
 

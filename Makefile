@@ -1,6 +1,6 @@
-.PHONY: check fmt clippy test vim-test vim-batch vim-core defcompile core-verify
+.PHONY: check fmt clippy test vim-test vim-batch vim-profile vim-core defcompile core-verify
 
-check: core-verify fmt clippy test defcompile vim-core vim-test vim-batch
+check: core-verify fmt clippy test defcompile vim-core vim-test vim-batch vim-profile
 
 fmt:
 	cargo fmt --all -- --check
@@ -19,6 +19,13 @@ vim-test:
 # freshly installed plugin in the running session.
 vim-batch:
 	vim -Nu NONE -n -i NONE -es -S tests/vim_batch.vim
+
+# :PlugProfile.  An eager plugin is sourced by Vim's own 'runtimepath' scan,
+# which runs after the vimrc and before -S, so the case the report exists for
+# cannot be reproduced from a test script: this one starts a child Vim with a
+# real vimrc and reads the report back out of it.
+vim-profile:
+	vim -Nu NONE -n -i NONE -es -S tests/vim_profile.vim
 
 # ---------------------------------------------------------------------------
 # simplecore: the vendored daemon supervisor shared by the simple* suite.

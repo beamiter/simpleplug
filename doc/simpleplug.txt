@@ -47,9 +47,11 @@ plugin's real command and mapping down on the first matching |FileType| event,
 arbitrarily later in the session.
 
 simpleplug#End() adds every installed plugin to 'runtimepath' (including its
-after/ directory), sources non-lazy plugins, and enables filetype and syntax.
-For a plugin with `rtp`, the configured subdirectory is used instead of the
-checkout root.
+after/ directory) and enables filetype and syntax. At startup Vim's own
+'runtimepath' scan is what sources the non-lazy plugins, right after the
+vimrc returns; when End() is called after |VimEnter| — re-sourcing a vimrc,
+say — that scan is long over, so End() sources them itself. For a plugin with
+`rtp`, the configured subdirectory is used instead of the checkout root.
 
 ==============================================================================
 3. PLUGIN OPTIONS                                         *simpleplug-options*
@@ -291,19 +293,29 @@ restoring the directory and repeating the trigger retries the load.
                                                                 *:PlugProfile*
 :PlugProfile[!]
         Attribute startup cost to the plugin that spent it: every plugin
-        SimplePlug has sourced, sorted by descending wall milliseconds, with
+        SimplePlug has loaded, sorted by descending wall milliseconds, with
         how it was loaded (eager, lazy, install, ftdetect) and, for a lazy
         plugin, the trigger that loaded it. With [!] each sourced file is
         listed with its own measurement.
 
         The whole justification for `for` and `on` is startup time, so
-        annotating plugins without a measurement is guesswork. SimplePlug is
-        the thing that calls :source, which is why it can measure this at all.
+        annotating plugins without a measurement is guesswork.
+
+        An eager plugin is not sourced by SimplePlug. simpleplug#End() runs
+        from your vimrc, and that runs before Vim walks 'runtimepath' for
+        plugin/ scripts, so Vim itself does the sourcing. SimplePlug times
+        that scan with |SourcePre| and |SourcePost| autocommands over the
+        directories it just registered, and drops them again at |VimEnter| so
+        that nothing sourced later — an ftplugin, a syntax file — is charged
+        to startup. A Vim without those two events reports no eager plugin at
+        all rather than a made-up number.
 
         A `for` plugin's ftdetect/ files are sourced eagerly — otherwise its
         filetype could never be detected and the trigger could never fire — so
-        that cost is charged to startup and reported on its own. It is often
-        what a lazy plugin still costs you.
+        that cost is charged to startup and reported on its own row. It keeps
+        that row after the trigger fires and the plugin body loads: the
+        startup cost was paid either way. It is often what a lazy plugin
+        still costs you.
 
         The report ends with the eager plugins that cost at least
         |g:simpleplug_profile_threshold_ms|, as candidates for `for` or `on`.

@@ -2,14 +2,31 @@
 
 ## Unreleased - 2026-08-08
 
+### :PlugProfile 修正：eager 真的被量到了，ftdetect 不再被抹掉
+
+- `:PlugProfile` 之前永远量不到 eager 插件，而"哪几个值得改成 `for` / `on`"正是它
+  存在的理由。`End()` 是 vimrc 调的，跑在 Vim 扫 `runtimepath` 加载 `plugin/` 之前，
+  所以 eager 插件的 `source` 从来不经过 SimplePlug：报告里那一行 eager 在真实会话中
+  一次都不会出现，`(x of it at startup)` 里也只剩 ftdetect。现在 `End()` 会挂上
+  `SourcePre` / `SourcePost`，量 Vim 自己那次扫描花在每个插件目录上的时间，并在
+  `VimEnter` 立刻摘掉——之后按需 source 的 ftplugin / syntax 不该算进启动。
+- 加载顺序一点没动：仍旧是 Vim 自己 source 的，SimplePlug 只在旁边看表。没有
+  `SourcePre` / `SourcePost` 的 Vim 就老实不报 eager，而不是报个假数字。
+- 一个 `for` / `on` 插件被触发之后，它的 ftdetect 开销会被改写成 `lazy`，从启动合计里
+  整个消失——恰好和帮助里写的相反，而"跑过一阵子之后"正是大多数人打开这份报告的
+  时刻。现在 ftdetect 和插件本体分开记账，触发之后它照样自己占一行。
+- 回归：新增 `tests/vim_profile.vim`（`make vim-profile`）。eager 那一半没法在测试脚本
+  里复现——`-S` 同样跑在扫描之后——所以它拉起一个带真 vimrc 的子 Vim，把报告读回来
+  断言；另一半断言 ftdetect 那一行在触发前后都在，且启动合计不会因此变小。
+
 ### :PlugProfile：启动时间到底花在谁身上
 
 - 新增 `:PlugProfile[!]`：按插件报出加载耗时（墙钟毫秒，大的在前）、加载方式
   （eager / lazy / install / ftdetect）以及延迟插件是被哪个触发器叫起来的；`!` 展开到
   每个被 source 的文件。`for` / `on` 的全部理由是启动时间，而在此之前这个数字从来
   没人看见过，于是每一条延迟加载标注都是猜的。
-- SimplePlug 恰好是唯一有资格测的：`source` 是它调的，`SourcePluginScripts()` 是所有
-  eager、lazy、装完即用三条路径共同的收口。
+- lazy 与装完即用两条路径的 `source` 是 SimplePlug 自己调的，`SourcePluginScripts()`
+  是它们共同的收口；eager 由 Vim 自己 source，靠 `SourcePre` / `SourcePost` 计时。
 - `for` 插件的 `ftdetect/` 是被急切 source 的（否则它自带的文件类型永远认不出来，
   触发器也就永远不会响），这笔开销照样算在启动上，并且单独列出来——它常常正是
   "延迟加载"底下藏着的真实成本。

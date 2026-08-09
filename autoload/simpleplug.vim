@@ -187,6 +187,8 @@ export def Begin(dir: string = '')
   s_plugins = []
   s_loaded_plugins = {}
   s_auto_install_checked = false
+  # 注册表清空了，上一轮挂上的启动测量也就没有归属了；End() 会重新挂。
+  ForgetStartupWatch()
   if dir !=# ''
     g:simpleplug_dir = fnamemodify(dir, ':p')
     # 去掉末尾斜杠
@@ -227,6 +229,10 @@ def LoadPlugin(plug: dict<any>, runtime_dir: string)
   # End() 也可能由用户在 VimEnter 之后调用，此时 Vim 不会再自动扫描 plugin/。
   if v:vim_did_enter
     SourcePluginScripts(plug.name, runtime_dir)
+  else
+    # 正常启动时 :source 不是我们调的——vimrc 跑在 Vim 扫 'runtimepath' 之前，
+    # eager 插件是 Vim 自己加载的。想量它就只能挂到 SourcePre/SourcePost 上。
+    WatchStartupSourcing(plug.name, runtime_dir)
   endif
 enddef
 
@@ -407,20 +413,132 @@ enddef
 # ─────────────────── 启动开销归因 ───────────────────
 
 # `for`/`on` 的全部理由是启动时间，可这个插件从来没让人看见过那个数字，于是
-# 每一条延迟加载标注都是猜的。SimplePlug 恰好是唯一有资格测的：source 是它调的。
+# 每一条延迟加载标注都是猜的。
 #
-# name -> {total_ms, files: [{path, ms}], when, trigger}
+# body_ms 和 ftdetect_ms 分开记：一个 `for` 插件的 ftdetect 是启动时就付掉的，
+# 而插件本体是触发时才付的。两者合成一个数字的话，触发之后 when 会被改写成
+# lazy，那笔启动开销就凭空消失——恰好是这段报告最该说清楚的东西。
+#
+# name -> {body_ms, ftdetect_ms, files: [{path, ms}], when, trigger}
 var s_load_times: dict<dict<any>> = {}
 
+def LoadEntry(name: string, when: string): dict<any>
+  var entry = get(s_load_times, name,
+    {body_ms: 0.0, ftdetect_ms: 0.0, files: [], when: when, trigger: ''})
+  s_load_times[name] = entry
+  return entry
+enddef
+
 def RecordLoad(name: string, when: string, trigger: string, files: list<dict<any>>, ms: float)
-  var entry = get(s_load_times, name, {total_ms: 0.0, files: [], when: when, trigger: ''})
-  entry.total_ms = entry.total_ms + ms
+  var entry = LoadEntry(name, when)
+  entry.body_ms = entry.body_ms + ms
   extend(entry.files, files)
   entry.when = when
   if trigger !=# ''
     entry.trigger = trigger
   endif
-  s_load_times[name] = entry
+enddef
+
+# ftdetect 单独记一笔，绝不改写 when：插件随后被触发时，when 会变成 lazy，
+# 而这笔钱照样是启动时花的。
+def RecordFtdetect(name: string, files: list<dict<any>>, ms: float)
+  var entry = LoadEntry(name, 'ftdetect')
+  entry.ftdetect_ms = entry.ftdetect_ms + ms
+  extend(entry.files, files)
+enddef
+
+def EntryTotalMs(entry: dict<any>): float
+  return entry.body_ms + entry.ftdetect_ms
+enddef
+
+# 只有 eager 插件的本体算在启动里；ftdetect 无论插件后来是否被触发都算。
+def EntryStartupMs(entry: dict<any>): float
+  return entry.ftdetect_ms + (entry.when ==# 'eager' ? entry.body_ms : 0.0)
+enddef
+
+# ── eager 插件：Vim 自己 source 的那一段 ──
+#
+# End() 由 vimrc 调用，跑在 Vim 扫 'runtimepath' 加载 plugin/ 之前，所以 eager
+# 插件的 :source 从来不经过 SourcePluginScripts——没有这段，:PlugProfile 里永
+# 远不会出现一行 eager，而"哪几个值得改成 for/on"正是它存在的理由。
+# SourcePre/SourcePost 在那次扫描里照常触发，是唯一量得到它的挂钩点。
+#
+# runtime dir -> plugin name
+var s_startup_watch: dict<string> = {}
+var s_startup_stack: list<dict<any>> = []
+var s_startup_depth: dict<number> = {}
+
+def ForgetStartupWatch()
+  s_startup_watch = {}
+  s_startup_stack = []
+  s_startup_depth = {}
+  augroup SimplePlugProfile
+    autocmd!
+  augroup END
+enddef
+
+def WatchStartupSourcing(name: string, runtime_dir: string)
+  # 极旧的 Vim 没有 SourcePost；量不到就老实不量，不要报个假数字。
+  if !exists('##SourcePre') || !exists('##SourcePost')
+    return
+  endif
+  var arm = empty(s_startup_watch)
+  s_startup_watch[NormalDir(runtime_dir)] = name
+  if !arm
+    return
+  endif
+  augroup SimplePlugProfile
+    autocmd!
+    autocmd SourcePre  * call simpleplug#ProfileSourcePre()
+    autocmd SourcePost * call simpleplug#ProfileSourcePost()
+    autocmd VimEnter   * call simpleplug#ProfileStartupDone()
+  augroup END
+enddef
+
+def StartupOwner(path: string): string
+  if empty(s_startup_watch) || path ==# ''
+    return ''
+  endif
+  for [dir, name] in items(s_startup_watch)
+    if stridx(path, dir .. '/') == 0
+      return name
+    endif
+  endfor
+  return ''
+enddef
+
+export def ProfileSourcePre()
+  var path = fnamemodify(expand('<afile>'), ':p')
+  var name = StartupOwner(path)
+  if name ==# ''
+    return
+  endif
+  # 嵌套 source（plugin/ 里再 source 同一插件的文件）只有最外层计入总数，
+  # 否则同一段时间会被加两遍。
+  var depth = get(s_startup_depth, name, 0)
+  add(s_startup_stack, {name: name, path: path, started: reltime(), outer: depth == 0})
+  s_startup_depth[name] = depth + 1
+enddef
+
+export def ProfileSourcePost()
+  if empty(s_startup_stack)
+    return
+  endif
+  var path = fnamemodify(expand('<afile>'), ':p')
+  if s_startup_stack[-1].path !=# path
+    return
+  endif
+  var record = remove(s_startup_stack, -1)
+  s_startup_depth[record.name] = s_startup_depth[record.name] - 1
+  var ms = reltimefloat(reltime(record.started)) * 1000.0
+  RecordLoad(record.name, 'eager', '', [{path: record.path, ms: ms}],
+    record.outer ? ms : 0.0)
+enddef
+
+# 启动扫描结束，钩子的工作也就结束了：留着它只会把之后按需 source 的
+# ftplugin/syntax 也算成启动开销。
+export def ProfileStartupDone()
+  ForgetStartupWatch()
 enddef
 
 # Returns one message per file that threw.  Sourcing third-party code is
@@ -470,8 +588,15 @@ def SourceFtdetect(name: string, dir: string, when: string = 'ftdetect')
     add(files, {path: f, ms: reltimefloat(reltime(file_started)) * 1000.0})
   endfor
   augroup END
-  if !empty(files)
-    RecordLoad(name, when, '', files, reltimefloat(reltime(started)) * 1000.0)
+  if empty(files)
+    return
+  endif
+  var ms = reltimefloat(reltime(started)) * 1000.0
+  if when ==# 'ftdetect'
+    RecordFtdetect(name, files, ms)
+  else
+    # 装完之后当场激活的插件：这笔钱是安装时花的，不是这次启动花的。
+    RecordLoad(name, when, '', files, ms)
   endif
 enddef
 
@@ -1811,11 +1936,11 @@ export def Profile(detailed: bool = false)
   var names = keys(s_load_times)
   # 大的在前：找的就是那几个最贵的。
   sort(names, (left, right) => {
-    var a: float = s_load_times[left].total_ms
-    var b: float = s_load_times[right].total_ms
+    var a: float = EntryTotalMs(s_load_times[left])
+    var b: float = EntryTotalMs(s_load_times[right])
     return a ==# b ? (left <# right ? -1 : 1) : (a > b ? -1 : 1)
   })
-  var peak: float = s_load_times[names[0]].total_ms
+  var peak: float = EntryTotalMs(s_load_times[names[0]])
 
   var eager_total = 0.0
   var total = 0.0
@@ -1823,14 +1948,12 @@ export def Profile(detailed: bool = false)
   var threshold = ProfileThreshold()
   for name in names
     var entry = s_load_times[name]
-    var ms: float = entry.total_ms
-    total += ms
-    # ftdetect 也算启动开销：它是延迟加载省下来的那部分底下藏着的成本。
-    if entry.when ==# 'eager' || entry.when ==# 'ftdetect'
-      eager_total += ms
-      if entry.when ==# 'eager' && ms >= threshold
-        add(candidates, printf('    %-30s %7.1f', ShortLine(name, 30), ms))
-      endif
+    total += EntryTotalMs(entry)
+    # ftdetect 也算启动开销：它是延迟加载省下来的那部分底下藏着的成本，
+    # 并且插件后来被触发了也不会因此消失。
+    eager_total += EntryStartupMs(entry)
+    if entry.when ==# 'eager' && EntryTotalMs(entry) >= threshold
+      add(candidates, printf('    %-30s %7.1f', ShortLine(name, 30), EntryTotalMs(entry)))
     endif
   endfor
 
@@ -1843,11 +1966,19 @@ export def Profile(detailed: bool = false)
   ]
   for name in names
     var entry = s_load_times[name]
-    var ms: float = entry.total_ms
     var when: string = entry.when
-    var trigger: string = entry.trigger
-    add(lines, printf('  %8.1f  %-14s %-9s %-24s %s',
-      ms, ProfileBar(ms, peak, 14), when, ShortLine(name, 24), trigger))
+    # ftdetect 永远自己占一行：把它并进插件本体那一行，触发之后它就会被
+    # 重新标成 lazy，那笔启动开销也就再没人看得见了。
+    if when !=# 'ftdetect'
+      add(lines, printf('  %8.1f  %-14s %-9s %-24s %s',
+        entry.body_ms, ProfileBar(entry.body_ms, peak, 14), when,
+        ShortLine(name, 24), entry.trigger))
+    endif
+    if entry.ftdetect_ms > 0.0
+      add(lines, printf('  %8.1f  %-14s %-9s %-24s %s',
+        entry.ftdetect_ms, ProfileBar(entry.ftdetect_ms, peak, 14), 'ftdetect',
+        ShortLine(name, 24), 'startup'))
+    endif
     if detailed
       for file in entry.files
         add(lines, printf('  %8.1f    %s', file.ms, fnamemodify(file.path, ':t')))
