@@ -24,6 +24,7 @@ g:simpleplug_git_timeout	simpleplug.txt	/*g:simpleplug_git_timeout*
 g:simpleplug_hook_timeout	simpleplug.txt	/*g:simpleplug_hook_timeout*
 g:simpleplug_jobs	simpleplug.txt	/*g:simpleplug_jobs*
 g:simpleplug_last_result	simpleplug.txt	/*g:simpleplug_last_result*
+g:simpleplug_lazy_event_refire	simpleplug.txt	/*g:simpleplug_lazy_event_refire*
 g:simpleplug_profile_threshold_ms	simpleplug.txt	/*g:simpleplug_profile_threshold_ms*
 g:simpleplug_snapshot_format	simpleplug.txt	/*g:simpleplug_snapshot_format*
 g:simpleplug_spinner_interval	simpleplug.txt	/*g:simpleplug_spinner_interval*
@@ -38,6 +39,9 @@ simpleplug-daemon	simpleplug.txt	/*simpleplug-daemon*
 simpleplug-daemon-cli	simpleplug.txt	/*simpleplug-daemon-cli*
 simpleplug-declare	simpleplug.txt	/*simpleplug-declare*
 simpleplug-intro	simpleplug.txt	/*simpleplug-intro*
+simpleplug-lazy-deps	simpleplug.txt	/*simpleplug-lazy-deps*
+simpleplug-lazy-event	simpleplug.txt	/*simpleplug-lazy-event*
+simpleplug-lazy-keys	simpleplug.txt	/*simpleplug-lazy-keys*
 simpleplug-options	simpleplug.txt	/*simpleplug-options*
 simpleplug-re-clone	simpleplug.txt	/*simpleplug-re-clone*
 simpleplug-scripting	simpleplug.txt	/*simpleplug-scripting*

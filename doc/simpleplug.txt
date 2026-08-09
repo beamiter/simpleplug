@@ -70,7 +70,13 @@ a local path, plus an optional dictionary:
   do        Shell command to run after install or update (a post-hook).
   frozen    Never update this plugin.
   for       Load only for these filetypes (string or list).
-  on        Load on this command or <Plug> mapping (string or list).
+  on        Load on this command or key sequence (string, list, or a
+            {keys, modes} dictionary; see |simpleplug-lazy-keys|).
+  event     Load on this autocommand event (string or list; see
+            |simpleplug-lazy-event|).
+  dependencies
+            Plugins that must be sourced before this one (list; see
+            |simpleplug-lazy-deps|).
 
 `tag` and `commit` make the plugin appear as `pinned` in |:PlugStatus|. Shallow
 clones fetch the requested object directly, falling back to full history only
@@ -79,6 +85,67 @@ when that fails.
 `for` sources the plugin's ftdetect/ files eagerly, so a filetype the plugin
 itself defines can still trigger the load. `on` with a <Plug> mapping installs
 a stub that loads the plugin and replays the key on first use.
+
+                                                        *simpleplug-lazy-keys*
+An `on` entry that is a bare string is a command name, unless it starts with
+"<", in which case it is a key sequence mapped in Normal, Visual and
+Operator-pending mode. To bind a trigger in other modes, write the entry as a
+dictionary: >
+
+    call simpleplug#Plug('user/completion', {'on': [
+          \ {'keys': '<Plug>(complete)', 'modes': 'i'},
+          \ {'keys': '<Plug>(cmdline)',  'modes': 'c'}]})
+<
+`modes` is a string of mode letters, any of "n", "x", "o", "i" and "c"; it
+defaults to "nxo". An unknown letter is refused at registration rather than
+mapped into nothing, and a plugin left with no usable trigger at all stays
+eager. The stub uses |<Cmd>|, which does not change the current mode, so the
+replayed key resolves to the plugin's own mapping in the mode the trigger
+fired in.
+
+                                                       *simpleplug-lazy-event*
+`event` defers a plugin to an autocommand event. An entry is an event name,
+optionally followed by a pattern (default "*"): >
+
+    call simpleplug#Plug('user/snippets', {'event': 'InsertEnter'})
+    call simpleplug#Plug('user/markdown', {'event': ['BufReadPre *.md',
+          \                                          'BufNewFile *.md']})
+<
+An unknown event name is refused at registration — the alternative is a plugin
+that never loads and never says why — and a plugin whose every event was
+refused stays eager. Each event trigger is spent once and is not re-armed.
+
+The occurrence that wakes a plugin arrives before the plugin has any handler
+for it: the handler is registered by the sourcing that occurrence caused, and
+Vim does not run autocommands that appear while it is already delivering an
+event. SimplePlug therefore lets the delivery in progress continue into the
+handlers the plugin just registered, so the plugin sees the occurrence that
+woke it exactly once, as if it had been loaded before the event arrived. No
+other listener for that event is run again. Set
+|g:simpleplug_lazy_event_refire| to 0 to skip this, and the plugin starts
+taking effect from the next occurrence instead.
+
+                                                        *simpleplug-lazy-deps*
+`dependencies` lists plugins that must be sourced before this one. Each entry
+is a plugin name (the directory name, or whatever `as` set) or the repository
+string the plugin was declared with. The dependency may be declared after the
+plugin that needs it: >
+
+    call simpleplug#Plug('user/ui', {'on': 'UiOpen',
+          \                          'dependencies': ['plenary']})
+    call simpleplug#Plug('user/plenary', {'as': 'plenary'})
+<
+'runtimepath' is ordered so that a dependency comes before its dependants, and
+a lazily triggered plugin loads its dependencies before sourcing itself.
+
+A dependency of an eagerly loaded plugin is loaded eagerly too, even when it
+was declared with `for`, `on` or `event`: "before" is decided by 'runtimepath'
+order during Vim's startup scan, and a trigger that has not fired yet never
+gets there. Plugins that no dependency edge constrains keep their declaration
+order, so adding the option does not reshuffle the rest of 'runtimepath'. A
+cycle is reported by name and the plugins in it fall back to declaration
+order; a dependency that was never declared is reported and skipped, and the
+plugin that named it still loads.
 
 `rtp` affects 'runtimepath', eager/lazy script loading, ftdetect and helptags.
 Git operations, hooks, snapshots and cleanup still operate on the checkout
@@ -91,7 +158,9 @@ the main runtime entry was already present.
 If an `on` or `for` trigger fires while its runtime directory is temporarily
 missing, SimplePlug reports the path and keeps the plugin unloaded. Command
 and mapping stubs remain usable, and FileType triggers remain registered, so
-restoring the directory and repeating the trigger retries the load.
+restoring the directory and repeating the trigger retries the load. An `event`
+trigger is spent by the occurrence that fired it, missing directory or not, so
+that plugin waits for the next |:PlugInstall| or the next Vim.
 
 ==============================================================================
 4. COMMANDS                                              *simpleplug-commands*
@@ -437,12 +506,13 @@ When an install finishes, each plugin it reports as newly installed is added
 to 'runtimepath' and its plugin/ and after/plugin/ scripts are sourced; its
 ftdetect/ files are sourced too and already-open buffers are re-detected, so a
 filetype the plugin introduces takes effect immediately. A plugin declared
-with `for` or `on` only gets its triggers armed — it stays unloaded until one
-of them fires, as usual. A plugin whose directory did not actually appear is
+with `for`, `on` or `event` only gets its triggers armed — it stays unloaded
+until one of them fires, as usual, unless something eager depends on it (see
+|simpleplug-lazy-deps|). A plugin whose directory did not actually appear is
 reported and left unloaded.
 
 Anything that goes wrong while a plugin is being activated — a script that
-throws, a `for`/`on` trigger that is not a usable command name or mapping, a
+throws, an `on` trigger that is not a usable command name or mapping, a
 runtime directory Vim will not take — is reported on that plugin's row and
 goes no further. It does not stop the rest of the batch, and it never
 suppresses helptag generation or |SimplePlugComplete|.
@@ -453,6 +523,17 @@ unusual moment can upset a plugin that assumes it loads before |VimEnter|.
                                                   *g:simpleplug_sync_timeout*
 How many seconds [!] on |:PlugInstall| / |:PlugUpdate| and |simpleplug#Await()|
 will wait before giving up. Default: 1800. The operation itself keeps running.
+
+                                            *g:simpleplug_lazy_event_refire*
+Let the occurrence that woke an `event` plugin reach the plugin. Default: 1
+
+The event arrives before the plugin has any handler for it — the handler is
+registered by the sourcing that occurrence caused — so without this the first
+|InsertEnter| is the one InsertEnter the plugin never sees. Set it to 0 for an
+event whose handlers must not run at an unexpected moment, and accept that the
+plugin starts taking effect from the next occurrence. Either way the event is
+delivered at most once, and no other listener is run twice. See
+|simpleplug-lazy-event|.
 
                                               *g:simpleplug_spinner_interval*
 Progress window refresh interval in milliseconds. Default: 200

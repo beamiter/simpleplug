@@ -1,6 +1,6 @@
-.PHONY: check fmt clippy test vim-test vim-batch vim-profile vim-core defcompile core-verify
+.PHONY: check fmt clippy test vim-test vim-batch vim-lazy vim-profile vim-core defcompile core-verify
 
-check: core-verify fmt clippy test defcompile vim-core vim-test vim-batch vim-profile
+check: core-verify fmt clippy test defcompile vim-core vim-test vim-batch vim-lazy vim-profile
 
 fmt:
 	cargo fmt --all -- --check
@@ -19,6 +19,12 @@ vim-test:
 # freshly installed plugin in the running session.
 vim-batch:
 	vim -Nu NONE -n -i NONE -es -S tests/vim_batch.vim
+
+# Lazy loading past `for`/`on`: autocommand events and the re-fire that lets the
+# plugin's own handler see the occurrence that woke it, triggers bound to insert
+# or cmdline mode only, and declared dependency ordering.
+vim-lazy:
+	vim -Nu NONE -n -i NONE -es -S tests/vim_lazy.vim
 
 # :PlugProfile.  An eager plugin is sourced by Vim's own 'runtimepath' scan,
 # which runs after the vimrc and before -S, so the case the report exists for

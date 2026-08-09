@@ -7,7 +7,8 @@
 - **Vim9 Script** 前端，与 simpleclipboard / simpletree / simpletreesitter 同风格
 - **Rust (Tokio) 后端**：并行 clone / pull / status，并由 `g:simpleplug_jobs` 限流
 - 支持 `branch`、`tag`、`commit`（版本锁定）、`do`（post-install hook）、`frozen`（锁定不更新）
-- 支持 `for`（按文件类型延迟加载）、`on`（按命令或 `<Plug>` 映射延迟加载）
+- 支持 `for`（按文件类型）、`on`（按命令或按键，可指定模式）、`event`（按 autocmd 事件）三种延迟加载
+- `dependencies` 声明依赖：被依赖的插件保证先 source，`'runtimepath'` 顺序也随之排好
 - 快照与恢复：`:PlugSnapshot` 记录全部插件的精确 commit，`:PlugRestore` 一键回滚
 - `:PlugCheck` 只读地问"有没有更新"：只 fetch，不动工作区、不跑 hook
 - `:PlugProfile` 按插件报出启动开销，直接告诉你哪几个值得改成 `for` / `on`
@@ -154,6 +155,7 @@ g:simpleplug_sync_timeout  " :PlugInstall! / :PlugUpdate! 最长等待秒数 (�
 g:simpleplug_spinner_interval     " 进度窗口刷新间隔毫秒 (默认 200)
 g:simpleplug_snapshot_format      " 新建快照的格式: 'v1' (默认) 或 'legacy'
 g:simpleplug_profile_threshold_ms " :PlugProfile 里多少毫秒起算延迟加载候选 (默认 5)
+g:simpleplug_lazy_event_refire    " 叫醒 event 插件的那次事件是否交付给它 (默认 1)
 ```
 
 ## Plug() 选项
@@ -169,7 +171,9 @@ g:simpleplug_profile_threshold_ms " :PlugProfile 里多少毫秒起算延迟加�
 | `rtp` | 相对仓库根目录的 Vim runtime 子目录，例如 `vim` 或 `editors/vim` |
 | `as` | 自定义插件名，用于解决同名仓库冲突 |
 | `for` | 按文件类型延迟加载（字符串或列表；插件自带 ftdetect 会预先生效） |
-| `on` | 按命令或 `<Plug>` 映射延迟加载（字符串或列表） |
+| `on` | 按命令或按键延迟加载（字符串、列表，或 `{keys, modes}` 指定模式） |
+| `event` | 按 autocmd 事件延迟加载，如 `'InsertEnter'`、`'BufReadPre *.md'`（字符串或列表） |
+| `dependencies` | 必须先 source 的插件名（或声明时的仓库串）列表 |
 
 版本锁定优先级：`commit` > `tag` > `branch`。
 
@@ -181,7 +185,28 @@ clone、update、snapshot、hook 与 clean 仍以完整仓库目录为单位。�
 
 若 `on` / `for` 延迟加载触发时 `rtp` 目录暂时不存在（例如刚切换到目录结构不同
 的分支），SimplePlug 会给出明确错误并保留命令或映射 stub 及未加载状态；目录恢复
-后再次触发即可重试，不需要重启 Vim。
+后再次触发即可重试，不需要重启 Vim。`event` 触发器只响一次，目录不在也照样算用掉。
+
+`on` 里裸字符串以 `<` 开头的是按键（默认映射到 `nxo` 三种模式），否则是命令名；
+写成 `{keys: '<Plug>(x)', modes: 'i'}` 可以指定模式（`n`/`x`/`o`/`i`/`c`）。stub 走
+`<Cmd>`，不改变当前模式，所以重放出去的按键会解析到插件自己在该模式下的映射。
+模式字母不认识时当场报错，而不是装上一个什么都不映射的触发器；一个插件的触发器
+全被拒绝，它就保持非延迟。
+
+`event` 的一条记录是事件名加可选 pattern（默认 `*`），例如 `'InsertEnter'` 或
+`'BufReadPre *.md'`。事件名打错会当场被拒——否则代价是一个永远不加载也永远不出声
+的插件。叫醒插件的那次事件到达时插件还没有任何处理器（处理器正是这次事件引发的
+source 装上的，而 Vim 不会把执行途中新挂上的 autocmd 算进这一轮），SimplePlug 让
+正在进行的这一轮继续走进那些新挂的处理器：插件对这次事件**只看见一次**，就像它本
+来就加载好了一样，这个事件的其他监听者一个也不会重跑。
+`g:simpleplug_lazy_event_refire = 0` 则跳过这一步，插件从下一次事件开始生效。
+
+`dependencies` 里写插件名或声明时用的仓库串，依赖可以声明在被依赖者前面。
+`'runtimepath'` 会排成"被依赖的在前"，延迟触发的插件也会先把依赖加载完再 source
+自己。被非延迟插件依赖的插件一律提升为非延迟：先后是由启动扫描时的
+`'runtimepath'` 顺序决定的，一个还没响的触发器根本轮不到。没有依赖关系约束的插件
+保持声明顺序不变。依赖成环会报出环里的插件名并退回声明顺序；依赖一个从未声明过的
+插件会被报出来，声明它的插件照常加载。
 
 ## 更新与清理安全
 
@@ -216,6 +241,8 @@ git clone / pull / status
 测试包含 Rust 协议/并发/安全清理/脏工作区/版本锁定/浅克隆分支切换/中断 clone 修复回归，
 Vim9 延迟加载（filetype、命令、`<Plug>` 映射、ftdetect、重新 source vimrc——包括同时
 声明 `for` 与 `on` 的插件）smoke test，
+autocmd 事件触发与交付、关掉交付、带模式的事件、被拒的事件名、只在插入/命令行模式
+存在的触发器及其重放、依赖顺序与成环回退的专项测试，
 以及完成事件、同步等待、安装后激活、`:PlugDiff` 渲染与回滚线格式的端到端断言。
 
 ## License

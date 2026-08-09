@@ -10,11 +10,18 @@ const s_plugin_root = fnamemodify(expand('<sfile>'), ':p:h:h')
 # ─────────────────── 插件注册表 ───────────────────
 
 var s_plugins: list<dict<any>> = []
-# {name, repo, url, dir, rtp, branch, tag, commit, do, frozen, on_ft, on_cmd}
+# {name, repo, url, dir, rtp, branch, tag, commit, do, frozen,
+#  on_ft, on_cmds, on_maps, on_event, deps}
 
 var s_loaded_plugins: dict<bool> = {}
 var s_lazy_commands: list<string> = []
-var s_lazy_maps: list<string> = []
+# {keys, modes}：模式得跟按键一起记下来，不然解除映射的时候只能靠猜——一个只
+# 装在插入模式上的触发器，按 'nxo' 去 unmap 是全打空。
+var s_lazy_maps: list<dict<string>> = []
+# 被某个非延迟插件依赖、因而不能保持延迟的插件；End() 每次重算。
+var s_forced_eager: dict<bool> = {}
+# 正在解析依赖的插件，用来在依赖成环时截断递归。
+var s_lazy_loading: dict<bool> = {}
 
 # name -> the runtime directory whose plugin scripts were actually sourced.
 # Deliberately NOT cleared by Begin(): re-sourcing a vimrc resets SimplePlug's
@@ -175,9 +182,9 @@ export def Begin(dir: string = '')
     endif
   endfor
   s_lazy_commands = []
-  for keys in s_lazy_maps
-    for md in ['n', 'x', 'o']
-      execute 'silent! ' .. md .. 'unmap ' .. keys
+  for entry in s_lazy_maps
+    for md in split(entry.modes, '\zs')
+      execute 'silent! ' .. md .. 'unmap ' .. entry.keys
     endfor
   endfor
   s_lazy_maps = []
@@ -186,6 +193,8 @@ export def Begin(dir: string = '')
   augroup END
   s_plugins = []
   s_loaded_plugins = {}
+  s_forced_eager = {}
+  s_lazy_loading = {}
   s_auto_install_checked = false
   # 注册表清空了，上一轮挂上的启动测量也就没有归属了；End() 会重新挂。
   ForgetStartupWatch()
@@ -199,16 +208,33 @@ export def Begin(dir: string = '')
 enddef
 
 export def End()
-  # 将所有已注册插件加入 runtimepath
-  for plug in s_plugins
-    if isdirectory(plug.dir)
-      var runtime_dir = CheckedRuntimeDir(plug)
-      if empty(runtime_dir)
-        continue
-      endif
-      AddRuntimePath(runtime_dir)
-      # 加载插件
-      LoadPlugin(plug, runtime_dir)
+  var order = LoadOrder()
+  s_forced_eager = ForcedEager()
+
+  # 'runtimepath' 里的先后就是 Vim 启动扫描 plugin/ 的先后，而 AddRuntimePath
+  # 是往前插的：按 order 依次前插，rtp 里得到的是 order 的倒序。LoadOrder()
+  # 因此返回“依赖别人的在前、被依赖的在后”，倒过来正好是被依赖的先 source。
+  var runtime_dirs: dict<string> = {}
+  for plug in order
+    if !isdirectory(plug.dir)
+      continue
+    endif
+    var runtime_dir = CheckedRuntimeDir(plug)
+    if empty(runtime_dir)
+      continue
+    endif
+    runtime_dirs[plug.name] = runtime_dir
+    AddRuntimePath(runtime_dir)
+  endfor
+
+  # 加载按 rtp 的先后走，也就是 order 的倒序。启动时这一步只是登记状态、装触
+  # 发器，真正的 source 由 Vim 自己的扫描按 rtp 顺序做；VimEnter 之后再调
+  # End() 则由 LoadPlugin 自己 source——两条路径必须给出同一个顺序，否则重新
+  # source 一遍 vimrc 就能换掉谁覆盖谁，而 dependencies 承诺的“先”也只在其中
+  # 一条路径上成立。
+  for plug in reverse(copy(order))
+    if has_key(runtime_dirs, plug.name)
+      LoadPlugin(plug, runtime_dirs[plug.name])
     endif
   endfor
   filetype plugin indent on
@@ -220,7 +246,7 @@ def LoadPlugin(plug: dict<any>, runtime_dir: string)
     return
   endif
   # 延迟插件必须保持未加载状态，直到对应事件真正触发。
-  if !empty(get(plug, 'on_ft', '')) || !empty(get(plug, 'on_cmd', ''))
+  if IsLazy(plug) && !get(s_forced_eager, plug.name, false)
     s_loaded_plugins[plug.name] = false
     SetupLazyLoad(plug, runtime_dir)
     return
@@ -236,19 +262,133 @@ def LoadPlugin(plug: dict<any>, runtime_dir: string)
   endif
 enddef
 
-def LazyTriggers(plug: dict<any>): list<string>
-  var result: list<string> = []
-  var configured = get(plug, 'on_cmd', '')
-  if type(configured) == v:t_string && configured !=# ''
-    add(result, configured)
-  elseif type(configured) == v:t_list
-    for trigger in configured
-      if type(trigger) == v:t_string && trigger !=# ''
-        add(result, trigger)
+def IsLazy(plug: dict<any>): bool
+  return !empty(get(plug, 'on_ft', ''))
+    || !empty(get(plug, 'on_cmds', []))
+    || !empty(get(plug, 'on_maps', []))
+    || !empty(get(plug, 'on_event', []))
+enddef
+
+# ─────────────────── 依赖关系 ───────────────────
+
+# `dependencies` 里写的是插件名，也接受声明时用的那个仓库串——两种都是用户眼
+# 里“这个插件”的名字，逼他记住哪一种才算数没有道理。
+def ResolveDep(spec: string): dict<any>
+  var plug = FindPlugin(spec)
+  if plug != {}
+    return plug
+  endif
+  for p in s_plugins
+    if p.repo ==# spec
+      return p
+    endif
+  endfor
+  return {}
+enddef
+
+# 依赖可以声明在被依赖者之前，所以解析必须推迟到注册表齐了以后。report 只在
+# End() 的那一次为真：同一个笔误没必要在每次延迟加载时再喊一遍。
+def DependencyNames(plug: dict<any>, report: bool = false): list<string>
+  var names: list<string> = []
+  for spec in get(plug, 'deps', [])
+    var dep = ResolveDep(spec)
+    if dep == {}
+      if report
+        echohl ErrorMsg
+        echom printf('[SimplePlug] %s depends on an unregistered plugin: %s', plug.name, spec)
+        echohl None
+      endif
+      continue
+    endif
+    if dep.name ==# plug.name || index(names, dep.name) >= 0
+      continue
+    endif
+    add(names, dep.name)
+  endfor
+  return names
+enddef
+
+# 返回一个顺序：依赖别人的插件在前，被依赖的在后（见 End() 里对 rtp 的说明）。
+#
+# 没有插件声明 dependencies 时每个节点的入度都是 0，结果逐字等于声明顺序——
+# 多一个特性不该改变别人 rtp 里的先后。
+def LoadOrder(): list<dict<any>>
+  var deps_of: dict<list<string>> = {}
+  var indegree: dict<number> = {}
+  for plug in s_plugins
+    indegree[plug.name] = 0
+    deps_of[plug.name] = []
+  endfor
+  for plug in s_plugins
+    for dep in DependencyNames(plug, true)
+      add(deps_of[plug.name], dep)
+      indegree[dep] += 1
+    endfor
+  endfor
+
+  var order: list<dict<any>> = []
+  var emitted: dict<bool> = {}
+  # 每一轮都按声明顺序整表扫一遍，而不是维护一个就绪队列：同一层里的先后必须
+  # 还是用户写下的先后。
+  while true
+    var progressed = false
+    for plug in s_plugins
+      if get(emitted, plug.name, false) || indegree[plug.name] > 0
+        continue
+      endif
+      emitted[plug.name] = true
+      add(order, plug)
+      for dep in deps_of[plug.name]
+        indegree[dep] -= 1
+      endfor
+      progressed = true
+    endfor
+    if !progressed
+      break
+    endif
+  endwhile
+
+  if len(order) < len(s_plugins)
+    # 成环的那几个按名字报出来，然后退回声明顺序：一个环不该让整个 vimrc 停摆，
+    # 也不该让环里的插件从 rtp 上消失。
+    var stuck = mapnew(filter(copy(s_plugins), (_, p) => !get(emitted, p.name, false)),
+      (_, p) => p.name)
+    echohl ErrorMsg
+    echom '[SimplePlug] dependency cycle, falling back to declaration order: '
+      .. join(stuck, ', ')
+    echohl None
+    for plug in s_plugins
+      if !get(emitted, plug.name, false)
+        add(order, plug)
       endif
     endfor
   endif
-  return result
+  return order
+enddef
+
+# 被一个非延迟插件依赖的插件不能保持延迟。依赖的意思是“它的 plugin/ 脚本先跑
+# 完”，而先后只有启动扫描时的 rtp 顺序说了算——触发器说了不算，触发器可能永
+# 远不响。留它在延迟状态等于承诺一件做不到的事。
+def ForcedEager(): dict<bool>
+  var forced: dict<bool> = {}
+  var frontier: list<string> = []
+  for plug in s_plugins
+    if !IsLazy(plug)
+      extend(frontier, DependencyNames(plug))
+    endif
+  endfor
+  while !empty(frontier)
+    var name = remove(frontier, 0)
+    if get(forced, name, false)
+      continue
+    endif
+    forced[name] = true
+    var dep_plug = FindPlugin(name)
+    if dep_plug != {}
+      extend(frontier, DependencyNames(dep_plug))
+    endif
+  endwhile
+  return forced
 enddef
 
 
@@ -295,14 +435,25 @@ def SetupLazyLoad(plug: dict<any>, pdir: string)
     endfor
   endif
 
-  # on_cmd 延迟加载：普通命令走 command stub，<Plug>/按键序列走 mapping stub
-  for c in LazyTriggers(plug)
-    if c =~# '^<'
-      SetupLazyMap(pname, c)
-    else
-      add(s_lazy_commands, c)
-      DefineLazyCommand(pname, c)
-    endif
+  # on 延迟加载：普通命令走 command stub，<Plug>/按键序列走 mapping stub
+  for c in get(plug, 'on_cmds', [])
+    add(s_lazy_commands, c)
+    DefineLazyCommand(pname, c)
+  endfor
+  for m in get(plug, 'on_maps', [])
+    SetupLazyMap(pname, m.keys, m.modes)
+  endfor
+
+  # event 延迟加载。
+  #   ++once   这一条把插件叫醒之后就再没有意义了。
+  #   ++nested 插件的 plugin/ 脚本是在这条 autocmd 里 source 的，而 Vim 默认不
+  #            在 autocmd 里执行 autocmd：没有它，插件加载途中自己触发的事件
+  #            （filetype 检测、User 事件……）会被整个吞掉，同一个插件被事件叫
+  #            醒和被命令叫醒的结果就不一样了。
+  for ev in get(plug, 'on_event', [])
+    execute printf(
+      'autocmd SimplePlugLazy %s %s ++once ++nested call simpleplug#LazyLoadEvent(%s, %s)',
+      ev.event, ev.pattern, string(pname), string(ev.event))
   endfor
 
   # ftdetect 必须立即生效，否则插件自带的文件类型永远不会被识别，
@@ -314,11 +465,11 @@ def SetupLazyLoad(plug: dict<any>, pdir: string)
 enddef
 
 # <Plug> 映射延迟加载：先注册 stub，触发时卸载 stub、加载插件、重放按键。
-def SetupLazyMap(pname: string, keys: string)
-  add(s_lazy_maps, keys)
+def SetupLazyMap(pname: string, keys: string, modes: string)
+  add(s_lazy_maps, {keys: keys, modes: modes})
   # <lt> 转义参数里的 '<'，避免映射定义时被翻译成键码。
   var keys_arg = substitute(string(keys), '<', '<lt>', 'g')
-  for md in ['n', 'x', 'o']
+  for md in split(modes, '\zs')
     execute printf('%snoremap <silent> %s <Cmd>call simpleplug#LazyLoadMap(%s, %s, "%s")<CR>',
       md, keys, string(pname), keys_arg, md)
   endfor
@@ -328,10 +479,86 @@ export def LazyLoadMap(name: string, keys: string, mode: string)
   if !LazyLoad(name, keys)
     return
   endif
+  # 重放要插到 typeahead 的**队首**，不能追加到队尾：stub 正是从 typeahead 里
+  # 读出来的，它后面往往还排着同一串按键里的后续键（"i<Plug>(x)<Esc>" 里的
+  # <Esc>）。追到队尾就意味着 <Esc> 先跑，插入模式已经退掉，重放的键落在普通
+  # 模式里，再也解析不到插件刚刚装上的那条插入模式映射。
+  #
+  # 插入模式和命令行模式不需要另外还原模式：stub 走的是 <Cmd>，它不改变当前
+  # 模式，所以重放出去的按键就落在触发时的那个模式里。
+  feedkeys(substitute(keys, '\c^<Plug>', "\<Plug>", ''), 'i')
+  # 可视模式的选区在 stub 执行完就没了，'gv' 必须排在重放之前——所以在重放之
+  # 后再往队首插一次。'n'：gv 就是 gv，不许被重映射。
   if mode ==# 'x'
-    feedkeys('gv', 'n')
+    feedkeys('gv', 'ni')
   endif
-  feedkeys(substitute(keys, '\c^<Plug>', "\<Plug>", ''))
+enddef
+
+# 正在补发的事件名；见 DeliverWakingEvent()。
+var s_event_refiring: dict<bool> = {}
+
+# 每成功延迟加载一个插件加一。DeliverWakingEvent() 用它判断“刚才那一轮有没有
+# 又叫醒别的插件”。
+var s_lazy_load_serial: number = 0
+
+# 把叫醒插件的那一次事件交付给插件自己的处理器——一次，不是两次。
+#
+# 处理器是这次事件引发的 source 才装上的，而 Vim 在一轮事件开始时就记下了“这
+# 一轮到哪条 autocmd 为止”，执行途中新挂上的 autocmd 因此拿不到这一轮（这一点
+# 是量出来的，见 tests/vim_lazy.vim）。
+#
+# 关键是**不要自己去补发**：`doautocmd {event}` 会把事件送给所有监听者，包括
+# 插件刚装上的那几条——而这条 doautocmd 同时把“到哪为止”的记号推到了链表尾
+# 部，于是外面那一轮回来之后还会再送一遍。插件的处理器跑两次，事件的其他监听
+# 者也跑两次。
+#
+# 改成只对**我们自己的组**发一次：这一组里该响的触发器早都响过了（已加载的
+# 插件在上面那个分支就返回了），所以这一发什么也没做，唯一的作用是让 Vim 重新
+# 记一次“到哪为止”。外面那一轮于是自然地走进插件新挂的处理器——正好一次，就
+# 像插件本来就在事件到达之前加载好了一样；而已经跑过的监听者一个也不会重跑。
+# match 是这次事件里的 <amatch>：模式是拿它去比的，缓冲区事件里它是文件名，
+# FileType 里是文件类型，User 里是用户事件名。不带它发这一发，Vim 会拿当前缓冲
+# 区的名字去比——`event: 'FileType rust'` 这样的触发器就一条也匹配不上，于是这
+# 一发变成空转，什么记号也没重记。
+def DeliverWakingEvent(event: string, match: string)
+  if get(s_event_refiring, event, false)
+    return
+  endif
+  s_event_refiring[event] = true
+  try
+    # 同一个事件上挂着好几个延迟插件时，这一发会把其余几个也叫醒（它们的触发
+    # 器就在这一组里），而它们的处理器又是在这一发**之后**才挂上的。所以只要
+    # 上一发还在叫醒新的插件，就再记一次，否则最后叫醒的那个插件永远收不到。
+    while true
+      var serial = s_lazy_load_serial
+      execute printf('silent! doautocmd <nomodeline> SimplePlugLazy %s %s', event, match)
+      if s_lazy_load_serial == serial
+        break
+      endif
+    endwhile
+  finally
+    remove(s_event_refiring, event)
+  endtry
+enddef
+
+# 事件触发的延迟加载。
+export def LazyLoadEvent(name: string, event: string)
+  # ++once 是在这条 autocmd **执行完**之后才被摘掉的，下面那一发因此会原样打
+  # 回这里来。插件已经加载就在这里停住。
+  if get(s_loaded_plugins, name, false)
+    return
+  endif
+  # 加载会 source 第三方脚本，那里面完全可能再触发别的 autocmd 并改掉 <amatch>；
+  # 这次事件匹配的是什么，只有现在问才准。
+  var match = expand('<amatch>')
+  if !LazyLoad(name, event)
+    return
+  endif
+  # 置 0 换成“插件从下一次事件开始生效”：叫醒它的这一次它看不见。
+  if get(g:, 'simpleplug_lazy_event_refire', 1) == 0
+    return
+  endif
+  DeliverWakingEvent(event, match)
 enddef
 
 
@@ -365,18 +592,17 @@ enddef
 # replaced a stub, the name in s_lazy_commands/s_lazy_maps no longer refers to
 # anything of ours — and Begin() deletes everything those lists name.
 def RemoveLazyStubs(plug: dict<any>)
-  for trigger in LazyTriggers(plug)
-    if trigger =~# '^<'
-      for md in ['n', 'x', 'o']
-        execute 'silent! ' .. md .. 'unmap ' .. trigger
-      endfor
-      filter(s_lazy_maps, (_, keys) => keys !=# trigger)
-    else
-      if exists(':' .. trigger) == 2
-        execute 'silent! delcommand ' .. trigger
-      endif
-      filter(s_lazy_commands, (_, cmd) => cmd !=# trigger)
+  for cmd in get(plug, 'on_cmds', [])
+    if exists(':' .. cmd) == 2
+      execute 'silent! delcommand ' .. cmd
     endif
+    filter(s_lazy_commands, (_, c) => c !=# cmd)
+  endfor
+  for m in get(plug, 'on_maps', [])
+    for md in split(m.modes, '\zs')
+      execute 'silent! ' .. md .. 'unmap ' .. m.keys
+    endfor
+    filter(s_lazy_maps, (_, entry) => entry.keys !=# m.keys)
   endfor
 enddef
 
@@ -392,6 +618,10 @@ export def LazyLoad(name: string, trigger: string = ''): bool
   if get(s_loaded_plugins, name, false)
     return true
   endif
+  if get(s_lazy_loading, name, false)
+    # 依赖成环。LoadOrder() 已经把环报出来过一次；这里只要不无限递归就够了。
+    return false
+  endif
 
   # Validate before removing a command/mapping stub or changing loaded state.
   # A missing runtime may appear after an update; leaving the stub intact makes
@@ -400,7 +630,22 @@ export def LazyLoad(name: string, trigger: string = ''): bool
   if empty(dir)
     return false
   endif
+
+  # 依赖必须先 source 完。这里只可能碰到延迟的依赖：被非延迟插件依赖的插件在
+  # End() 里就已经被 ForcedEager() 提成非延迟的了。
+  s_lazy_loading[name] = true
+  try
+    for dep in DependencyNames(plug)
+      if !get(s_loaded_plugins, dep, false)
+        LazyLoad(dep, 'dependency of ' .. name)
+      endif
+    endfor
+  finally
+    remove(s_lazy_loading, name)
+  endtry
+
   s_loaded_plugins[name] = true
+  s_lazy_load_serial += 1
   RemoveLazyStubs(plug)
 
   # 重新加入 runtimepath
@@ -610,6 +855,109 @@ def FindPlugin(name: string): dict<any>
 enddef
 
 # =============================================================
+# 触发器声明的归一化
+# =============================================================
+
+# 一个映射 stub 默认装在普通/可视/操作符待决三种模式上——历史行为，也是绝大
+# 多数 <Plug> 映射的实际用法。
+const s_map_modes_default = 'nxo'
+const s_map_modes_valid = 'nxoic'
+
+def OptionError(pname: string, message: string)
+  echohl ErrorMsg
+  echom printf('[SimplePlug] %s: %s', pname, message)
+  echohl None
+enddef
+
+# `on` 的一条记录可以是：
+#   'CommandName'                     命令 stub
+#   '<Plug>(x)' / 按键序列             映射 stub，装在默认的 nxo 上
+#   {keys: '<Plug>(x)', modes: 'i'}   映射 stub，装在指定模式上
+# 字典形式是唯一能表达“这个映射只在插入模式里存在”的写法；裸字符串形式必须
+# 原样继续工作，所以两种在这里合并成同一批内部记录。
+def NormalizeTriggers(pname: string, configured: any): dict<any>
+  var cmds: list<string> = []
+  var maps: list<dict<string>> = []
+  var entries: list<any> = type(configured) == v:t_list ? configured : [configured]
+  for entry in entries
+    if type(entry) == v:t_string
+      if entry ==# ''
+        continue
+      endif
+      if entry =~# '^<'
+        add(maps, {keys: entry, modes: s_map_modes_default})
+      else
+        add(cmds, entry)
+      endif
+    elseif type(entry) == v:t_dict
+      var keys = get(entry, 'keys', '')
+      if type(keys) != v:t_string || keys ==# ''
+        OptionError(pname, 'an `on` entry needs a non-empty "keys"')
+        continue
+      endif
+      var modes = get(entry, 'modes', s_map_modes_default)
+      if type(modes) != v:t_string || modes ==# ''
+        OptionError(pname, printf('modes for %s must be a non-empty string', keys))
+        continue
+      endif
+      # 不认识的模式字母只会装出一个什么都不映射的触发器，然后这个插件永远不
+      # 加载；当场拒绝便宜得多。
+      var unknown = filter(split(modes, '\zs'), (_, m) => stridx(s_map_modes_valid, m) < 0)
+      if !empty(unknown)
+        OptionError(pname, printf('unknown map mode "%s" for %s (valid: %s)',
+          join(unknown, ''), keys, s_map_modes_valid))
+        continue
+      endif
+      add(maps, {keys: keys, modes: modes})
+    else
+      OptionError(pname, 'an `on` entry must be a command name, a key sequence, or {keys, modes}')
+    endif
+  endfor
+  return {cmds: cmds, maps: maps}
+enddef
+
+# `event`：'InsertEnter' 或 'BufReadPre *.md'（事件名 + 可选 pattern，默认 '*'）。
+def NormalizeEvents(pname: string, configured: any): list<dict<string>>
+  var events: list<dict<string>> = []
+  var entries: list<any> = type(configured) == v:t_list ? configured : [configured]
+  for entry in entries
+    if type(entry) != v:t_string
+      OptionError(pname, 'an `event` entry must be a string')
+      continue
+    endif
+    if entry ==# ''
+      continue
+    endif
+    var parts = split(entry, '\s\+')
+    # 事件名打错了，代价本来是一个永远不加载、也永远不说为什么的插件。
+    if !exists('##' .. parts[0])
+      OptionError(pname, 'unknown autocommand event: ' .. parts[0])
+      continue
+    endif
+    add(events, {event: parts[0], pattern: len(parts) > 1 ? join(parts[1 :], ' ') : '*'})
+  endfor
+  return events
+enddef
+
+# `dependencies`：插件名（或声明时用的仓库串）。此刻还不能解析成插件——依赖完
+# 全可以声明在被依赖者前面——所以只做形状检查，解析留给 End()。
+def NormalizeDeps(pname: string, configured: any): list<string>
+  var deps: list<string> = []
+  var entries: list<any> = type(configured) == v:t_list ? configured : [configured]
+  for entry in entries
+    if type(entry) != v:t_string
+      OptionError(pname, 'a `dependencies` entry must be a plugin name')
+      continue
+    endif
+    if entry ==# '' || index(deps, entry) >= 0
+      continue
+    endif
+    add(deps, entry)
+  endfor
+  return deps
+enddef
+
+# =============================================================
 # Plug() — 注册单个插件
 # =============================================================
 
@@ -707,7 +1055,7 @@ export def Plug(repo: string, opts: dict<any> = {})
     frozen = frozen_val
   endif
   var on_ft = get(opts, 'for', '')
-  var on_cmd = get(opts, 'on', '')
+  var triggers = NormalizeTriggers(name, get(opts, 'on', ''))
 
   add(s_plugins, {
     name: name,
@@ -721,7 +1069,10 @@ export def Plug(repo: string, opts: dict<any> = {})
     do: do_cmd,
     frozen: frozen,
     on_ft: on_ft,
-    on_cmd: on_cmd,
+    on_cmds: triggers.cmds,
+    on_maps: triggers.maps,
+    on_event: NormalizeEvents(name, get(opts, 'event', '')),
+    deps: NormalizeDeps(name, get(opts, 'dependencies', [])),
   })
 enddef
 
@@ -1109,7 +1460,7 @@ def ActivateInstalled()
         s_ui_plug_state[name] = st
         continue
       endif
-      if !empty(get(plug, 'on_ft', '')) || !empty(get(plug, 'on_cmd', ''))
+      if IsLazy(plug) && !get(s_forced_eager, plug.name, false)
         # End() 当时整个跳过了这个插件（目录还不存在），触发器是第一次装上。
         s_loaded_plugins[name] = false
         SetupLazyLoad(plug, dir)
