@@ -37,6 +37,15 @@ g:simpleplug_daemon_path = fake
 var home = tempname()
 mkdir(home, 'p')
 
+# The progress UI is a temporary split.  Closing it must restore the window
+# layout and buffer from before the batch instead of leaving a [No Name] split.
+var batch_origin_winid = win_getid()
+var batch_origin_bufnr = bufnr()
+var batch_origin_windows = winnr('$')
+silent file [SimpleStartifyFixture]
+setlocal buftype=nofile bufhidden=wipe noswapfile nobuflisted
+setlocal filetype=startify
+
 # A plugin's checkout only appears when the daemon reports it installed, so
 # End() cannot have loaded it: everything below is activation or nothing.
 def PlantTemplate(dir: string, body: list<string>, ftdetect: list<string> = [])
@@ -94,6 +103,22 @@ assert_true(index(split(&runtimepath, ','), eager_dir) < 0,
 # Without it this returns before a single "clone" completes, which is why
 # `vim -es +PlugInstall +qall` never worked as a bootstrap.
 PlugInstall!
+
+assert_equal(batch_origin_windows + 1, winnr('$'),
+  'opening the progress UI did not create exactly one split')
+assert_equal('simpleplug', &filetype,
+  'opening the progress UI did not leave focus in its window')
+feedkeys('q', 'x')
+assert_equal(batch_origin_windows, winnr('$'),
+  'q left a [No Name] split beside a scratch-buffer dashboard')
+assert_equal(batch_origin_winid, win_getid(),
+  'q did not restore the progress UI origin window')
+assert_equal(batch_origin_bufnr, bufnr(),
+  'q replaced the dashboard instead of restoring it')
+assert_true(empty(filter(getbufinfo(),
+  (_, b) => getbufvar(b.bufnr, '&filetype') ==# 'simpleplug')),
+  'q left the progress scratch buffer behind')
+enew!
 
 assert_equal(1, g:simpleplug_batch_events, 'SimplePlugComplete did not fire exactly once')
 var result = simpleplug#LastResult()

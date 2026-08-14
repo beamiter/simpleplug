@@ -47,6 +47,7 @@ var s_stop_pending: bool = false
 
 var s_ui_bufnr: number = -1
 var s_ui_winid: number = 0
+var s_ui_origin_winid: number = 0
 var s_ui_lines: list<string> = []
 
 # 每个插件的实时状态追踪
@@ -3207,6 +3208,9 @@ def UIOpen()
   if s_ui_bufnr > 0 && bufexists(s_ui_bufnr)
     var wins = win_findbuf(s_ui_bufnr)
     if !empty(wins)
+      if win_getid() != wins[0]
+        s_ui_origin_winid = win_getid()
+      endif
       win_gotoid(wins[0])
       s_ui_winid = wins[0]
       UIBuildAndRender(true)
@@ -3216,6 +3220,7 @@ def UIOpen()
   endif
 
   # 新建右侧分屏
+  s_ui_origin_winid = win_getid()
   botright vertical new
   execute ':vertical resize ' .. UiWidth()
   s_ui_winid = win_getid()
@@ -3248,13 +3253,36 @@ enddef
 
 export def UIClose()
   StopSpinner()
-  if s_ui_bufnr > 0 && bufexists(s_ui_bufnr)
-    execute 'bwipeout ' .. s_ui_bufnr
+  var ui_bufnr = s_ui_bufnr
+  var origin_winid = s_ui_origin_winid
+  if ui_bufnr > 0 && bufexists(ui_bufnr)
+    # If the neighbouring window is another bufhidden=wipe scratch buffer
+    # (SimpleStartify is the common case), :bwipeout replaces this UI with a
+    # fresh [No Name] instead of removing its split.  Close the UI windows
+    # explicitly before wiping any hidden copy that remains.
+    for winid in win_findbuf(ui_bufnr)
+      var location = win_id2tabwin(winid)
+      if len(location) == 2 && location[0] > 0
+            && tabpagewinnr(location[0], '$') > 1
+        try
+          win_execute(winid, 'close')
+        catch
+          Log('could not close UI window: ' .. v:exception, 'WarningMsg')
+        endtry
+      endif
+    endfor
+    if bufexists(ui_bufnr)
+      execute 'bwipeout ' .. ui_bufnr
+    endif
   endif
   s_ui_bufnr = -1
   s_ui_winid = 0
+  s_ui_origin_winid = 0
   s_ui_filter_active = false
   s_ui_filter_text = ''
+  if origin_winid > 0
+    win_gotoid(origin_winid)
+  endif
 enddef
 
 export def UIRetry()

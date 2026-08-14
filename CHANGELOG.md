@@ -2,6 +2,18 @@
 
 ## Unreleased - 2026-08-08
 
+### 关闭进度 UI 不再留下空分屏
+
+- `q` / `<Esc>` 过去只 `:bwipeout` 进度 buffer。普通文件在隔壁时 Vim 会顺带
+  收掉分屏，但 SimpleStartify 也是 `buftype=nofile`、`bufhidden=wipe` 的 scratch
+  buffer；两个 scratch window 相邻时，Vim 会在原进度窗口里生成 `[No Name]`
+  而不是删除窗口。
+- SimplePlug 现在记住打开 UI 前的窗口，关闭时先显式关闭所有承载进度 buffer 的
+  window，再清理残留 buffer 并恢复焦点。只有 UI 已经是标签页最后一个窗口时才
+  保留 Vim 必需的替代 buffer。
+- 批处理回归测试构造一个最小的 SimpleStartify 形状，走真实 `q` 映射并断言窗口数、
+  原 dashboard buffer 和 UI scratch buffer 的完整生命周期。
+
 ### 延迟加载：autocmd 事件、按模式绑定的触发器、依赖顺序
 
 - 新增 `event`：把插件推迟到某个 autocmd 事件，一条记录是事件名加零个或多个
