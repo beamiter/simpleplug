@@ -156,6 +156,8 @@ var s_ui_filter_active: bool = false
 var s_ui_plug_timings: dict<float> = {}
 var s_ui_plug_start_times: dict<list<any>> = {}
 var s_ui_sorted_names: list<string> = []
+# install/update 结束后 ok(已是最新)的行默认折叠成一行，z 展开。
+var s_ui_ok_expanded: bool = false
 var s_ui_cursor_buf_line: number = 0  # 光标对应的缓冲区行号(1-based)
 var s_ui_targets: list<string> = []   # 本次操作涉及的插件名(注册顺序)
 
@@ -2525,6 +2527,7 @@ def InitPlugStates(plugs: list<dict<any>>, status: string, icon: string)
   s_ui_cursor_name = ''
   s_ui_filter_text = ''
   s_ui_filter_active = false
+  s_ui_ok_expanded = false
   s_ui_targets = mapnew(plugs, (_, p) => p.name)
   for p in plugs
     s_ui_plug_state[p.name] = {status: status, msg: '', icon: icon, action: '', branch: '', commit: '', dirty: false}
@@ -2890,6 +2893,28 @@ def SortedPluginNames(): list<string>
     endfor
     return working + finished + waiting
   endif
+  # install/update 结束后: 出错的和真正动过的排在前面，already up-to-date
+  # 的沉底 —— 那几行才是这次 update 要看的东西。结束后状态不再变化，
+  # 顺序是静态的，所以不像进行中那样需要在选中后冻住。
+  if IsDone() && IsInstallUpdateMode()
+    var rank: dict<number> = {}
+    for i in range(len(s_ui_targets))
+      var action = UiAction(get(s_ui_plug_state, s_ui_targets[i], {}))
+      var r = 4
+      if action ==# 'error' || action ==# 'missing' || action ==# 'dirty'
+        r = 0
+      elseif action ==# 'updated' || action ==# 'installed'
+        r = 1
+      elseif action ==# 'frozen'
+        r = 2
+      elseif action ==# 'ok'
+        r = 3
+      endif
+      # 同档位按注册顺序排，避免 sort() 不稳定打乱。
+      rank[s_ui_targets[i]] = r * 100000 + i
+    endfor
+    return sort(copy(s_ui_targets), (a, b) => rank[a] - rank[b])
+  endif
   # 其他模式保持注册顺序
   return copy(s_ui_targets)
 enddef
@@ -3092,8 +3117,24 @@ def UIBuildAndRender(move_cursor: bool = false)
   if s_ui_mode =~# 'clean'
     sorted = []
   endif
+  # install/update 结束后把 already up-to-date 的行折叠成一行 ——
+  # 全绿的时候几十行一模一样的 'ok / already up-to-date' 只是噪音，
+  # 真正要看的是 updated 和 error 那几行。z 展开；过滤时不动，
+  # 用户既然在找某个插件就得能看到它。
+  var collapsed_ok = 0
+  if IsDone() && IsInstallUpdateMode() && !s_ui_ok_expanded && s_ui_filter_text ==# ''
+    var visible: list<string> = []
+    for n in sorted
+      if UiAction(get(s_ui_plug_state, n, {})) ==# 'ok'
+        collapsed_ok += 1
+      else
+        add(visible, n)
+      endif
+    endfor
+    sorted = visible
+  endif
   if index(sorted, s_ui_cursor_name) < 0
-    # 选中的插件被过滤掉或已经不在这一批里了。
+    # 选中的插件被过滤掉、被折叠或已经不在这一批里了。
     s_ui_cursor_name = ''
   endif
 
@@ -3142,6 +3183,11 @@ def UIBuildAndRender(move_cursor: bool = false)
     AddUiLine(lines, content, W)
   endfor
 
+  if collapsed_ok > 0
+    AddUiLine(lines, printf('  ○ %-30s %-12s %-10s %s',
+      printf('%d up-to-date', collapsed_ok), 'ok', '—', 'z expand'), W)
+  endif
+
   if s_ui_mode =~# 'clean'
     if empty(s_ui_plug_state)
       AddUiLine(lines, '  Nothing to clean.', W)
@@ -3161,7 +3207,7 @@ def UIBuildAndRender(move_cursor: bool = false)
 
   add(lines, DividerLine(W))
   AddUiLine(lines, '  ' .. SummaryLine(), W)
-  AddUiLine(lines, '  q close  j/k move  <CR> open  d log  D diff  u update  / filter  ? help  R retry  S status', W)
+  AddUiLine(lines, '  q close  j/k move  <CR> open  d log  D diff  u update  / filter  z expand  R retry  S status', W)
 
   s_ui_lines = lines
   UIRender(move_cursor)
@@ -3245,6 +3291,7 @@ def UIOpen()
   nnoremap <buffer><silent> h <Cmd>call simpleplug#ToggleHelp()<CR>
   nnoremap <buffer><silent> ? <Cmd>call simpleplug#ToggleHelp()<CR>
   nnoremap <buffer><silent> / <Cmd>call simpleplug#StartFilterSplit()<CR>
+  nnoremap <buffer><silent> z <Cmd>call simpleplug#UIToggleOkExpand()<CR>
 
   UIBuildAndRender(true)
   SetupSyntax()
@@ -3338,6 +3385,16 @@ def PluginNameAtCursor(): string
 enddef
 
 export def UIMove(delta: number)
+  # 光标可能是用户用普通移动放在某一行上的，s_ui_cursor_name 还是 ''。
+  # 排序只在这个时候是活的；先认下当前行让顺序冻住并重排一次，再找
+  # 邻居 —— 否则选中那一刻行序变化，j/k 会落到错的那一行。
+  if s_ui_cursor_name ==# ''
+    var under = get(s_ui_line_map, string(line('.')), '')
+    if under !=# ''
+      s_ui_cursor_name = under
+      UIBuildAndRender(true)
+    endif
+  endif
   var rows = PluginRows()
   if empty(rows)
     return
@@ -3381,6 +3438,7 @@ def DoToggleHelp()
     '    D           查看这次 update 带进来的提交（可回滚）',
     '    u           只更新光标所在的插件',
     '    /           搜索过滤插件',
+    '    z           展开/折叠 already up-to-date 的插件',
     '    R           重试失败的插件',
     '    S           查看状态',
     '    q / Esc     关闭窗口',
@@ -3435,6 +3493,11 @@ enddef
 
 export def StartFilterSplit()
   s_ui_filter_text = input(' Filter: ')
+  UIBuildAndRender()
+enddef
+
+export def UIToggleOkExpand()
+  s_ui_ok_expanded = !s_ui_ok_expanded
   UIBuildAndRender()
 enddef
 
@@ -3497,6 +3560,10 @@ def SetupSyntax()
   win_execute(w, 'syntax match SPlugWaiting /waiting/')
   # frozen
   win_execute(w, 'syntax match SPlugFrozen /frozen/')
+  # already up-to-date 降噪(展开行的 Details 和折叠行都染灰)
+  win_execute(w, 'syntax match SPlugUpToDate /already up-to-date/')
+  win_execute(w, 'syntax match SPlugUpToDate /\d\+ up-to-date/')
+  win_execute(w, 'syntax match SPlugUpToDate /z expand/')
   # removed
   win_execute(w, 'syntax match SPlugRemoved /removed/')
   # 搜索栏
@@ -3549,6 +3616,7 @@ def SetupSyntax()
   win_execute(w, 'highlight default SPlugTableHeader ctermfg=252 guifg=#d0d0d0 cterm=bold gui=bold')
   win_execute(w, 'highlight default SPlugWaiting ctermfg=240 guifg=#585858')
   win_execute(w, 'highlight default SPlugFrozen ctermfg=245 guifg=#8a8a8a')
+  win_execute(w, 'highlight default SPlugUpToDate ctermfg=245 guifg=#8a8a8a')
   win_execute(w, 'highlight default SPlugRemoved ctermfg=204 guifg=#ff5f87')
   win_execute(w, 'highlight default SPlugFilter ctermfg=75 guifg=#5fafff')
   win_execute(w, 'highlight default SPlugSumInstalled ctermfg=114 guifg=#87d787 cterm=bold gui=bold')
