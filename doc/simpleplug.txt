@@ -78,6 +78,11 @@ a local path, plus an optional dictionary:
             Plugins that must be sourced before this one (list; see
             |simpleplug-lazy-deps|).
 
+The scalar option types are checked during registration. as, dir, branch, tag,
+commit and do must be strings; frozen must be a number or boolean. A malformed
+plugin is rejected before a daemon batch starts. dir cannot contain a comma,
+because comma separates entries in 'runtimepath'.
+
 `tag` and `commit` make the plugin appear as `pinned` in |:PlugStatus|. Shallow
 clones fetch the requested object directly, falling back to full history only
 when that fails.
@@ -479,6 +484,10 @@ simpleplug#LastResult()
 7. CONFIGURATION                                           *simpleplug-config*
 
 An option documented below as 0 or 1 also accepts |v:false| and |v:true|.
+Every option is type/range checked when the plugin loads.  Options consulted
+again at runtime (timeouts, jobs and UI sizing/timing) are checked at the use
+site too, so a later bad assignment falls back safely instead of escaping from
+an autocommand or timer.
 
                                                             *g:simpleplug_dir*
 Plugin directory. Default: ~/.vim/plugged

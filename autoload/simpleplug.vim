@@ -7,6 +7,49 @@ vim9script
 
 const s_plugin_root = fnamemodify(expand('<sfile>'), ':p:h:h')
 
+def ConfigFlag(name: string, fallback: bool): bool
+  var value = get(g:, name, fallback)
+  if type(value) == v:t_bool
+    return value
+  endif
+  if type(value) == v:t_number
+    return value != 0
+  endif
+  return fallback
+enddef
+
+def ConfigInt(name: string, fallback: number, minimum: number, maximum: number): number
+  var value = get(g:, name, fallback)
+  return type(value) == v:t_number
+    ? min([maximum, max([minimum, value])])
+    : fallback
+enddef
+
+def ConfigPositive(name: string, fallback: number): number
+  var value = get(g:, name, fallback)
+  return type(value) == v:t_number && value > 0
+    ? value : fallback
+enddef
+
+def ConfigAtLeast(name: string, fallback: number, minimum: number): number
+  var value = get(g:, name, fallback)
+  return type(value) == v:t_number && value > 0
+    ? max([minimum, value]) : fallback
+enddef
+
+def ConfigFloat(name: string, fallback: float, minimum: float): float
+  var value = get(g:, name, fallback)
+  return type(value) == v:t_number || type(value) == v:t_float
+    ? max([minimum, 0.0 + value])
+    : fallback
+enddef
+
+def PlugDir(): string
+  var value = get(g:, 'simpleplug_dir', '')
+  return type(value) == v:t_string && !empty(value)
+    ? value : expand('~/.vim/plugged')
+enddef
+
 # ─────────────────── 插件注册表 ───────────────────
 
 var s_plugins: list<dict<any>> = []
@@ -167,7 +210,7 @@ def Log(msg: string, hl: string = 'None')
   # 用 `!` 而不是 `== 0`：`g:simpleplug_debug = v:true` 是完全正常的写法，而
   # Vim9 里拿 bool 跟数字比会抛 E1138。Log() 大半是在 catch 里被调的——那正是
   # 最不该再多冒出一个异常的地方。
-  if !get(g:, 'simpleplug_debug', 0)
+  if !ConfigFlag('simpleplug_debug', false)
     return
   endif
   echohl {hl}
@@ -563,7 +606,7 @@ export def LazyLoadEvent(name: string, event: string)
   # 置 0 换成“插件从下一次事件开始生效”：叫醒它的这一次它看不见。
   # 用 `!` 而不是 `== 0`：`v:false` 也是“关掉”的一种写法，而 Vim9 里拿 bool
   # 跟数字比会当场抛 E1138——用户按下 i 就吃一个错误，而他写的东西没有错。
-  if !get(g:, 'simpleplug_lazy_event_refire', 1)
+  if !ConfigFlag('simpleplug_lazy_event_refire', true)
     return
   endif
   DeliverWakingEvent(event, match)
@@ -991,8 +1034,12 @@ export def Plug(repo: string, opts: dict<any> = {})
     name = fnamemodify(repo, ':t')
   endif
 
-  var alias = get(opts, 'as', '')
-  if type(alias) == v:t_string && alias !=# ''
+  var alias: any = get(opts, 'as', '')
+  if type(alias) != v:t_string
+    OptionError(repo, '`as` must be a string')
+    return
+  endif
+  if alias !=# ''
     name = alias
   endif
   if name !~# '^[A-Za-z0-9._-]\+$'
@@ -1008,7 +1055,11 @@ export def Plug(repo: string, opts: dict<any> = {})
     return
   endif
 
-  var dir_override = get(opts, 'dir', '')
+  var dir_override: any = get(opts, 'dir', '')
+  if type(dir_override) != v:t_string
+    OptionError(name, '`dir` must be a string')
+    return
+  endif
   var dir: string
   if dir_override !=# ''
     dir = fnamemodify(dir_override, ':p')
@@ -1016,7 +1067,15 @@ export def Plug(repo: string, opts: dict<any> = {})
       dir = dir[: -2]
     endif
   else
-    dir = g:simpleplug_dir .. '/' .. name
+    dir = PlugDir() .. '/' .. name
+  endif
+  # A comma is the separator in 'runtimepath' and Vim provides no lossless way
+  # to put one inside an entry.  Letting this through splits one checkout into
+  # two unrelated runtime roots, so reject it before registration rather than
+  # corrupting the option in End().
+  if stridx(dir, ',') >= 0
+    OptionError(name, '`dir` must not contain a comma')
+    return
   endif
 
   var rtp_value = get(opts, 'rtp', '')
@@ -1060,16 +1119,36 @@ export def Plug(repo: string, opts: dict<any> = {})
     return
   endif
 
-  var branch = get(opts, 'branch', '')
-  var tag = get(opts, 'tag', '')
-  var commit = get(opts, 'commit', '')
-  var do_cmd = get(opts, 'do', '')
-  var frozen_val = get(opts, 'frozen', 0)
+  # These values cross the JSON boundary into strongly typed Rust fields.  A
+  # list accidentally used for `branch`, for example, used to make serde reject
+  # the whole batch after it started; every correctly declared sibling then
+  # stayed in "working" until the supervisor timeout.  Reject only the bad
+  # declaration here, while the vimrc line that caused it is still visible.
+  for option in ['branch', 'tag', 'commit', 'do']
+    var value: any = get(opts, option, '')
+    if type(value) != v:t_string
+      OptionError(name, printf('`%s` must be a string', option))
+      return
+    endif
+    if option !=# 'do' && (value =~# "[\r\n]" || value =~# '^-')
+      OptionError(name, printf('`%s` must be a single Git reference, not %s',
+        option, string(value)))
+      return
+    endif
+  endfor
+  var branch: string = get(opts, 'branch', '')
+  var tag: string = get(opts, 'tag', '')
+  var commit: string = get(opts, 'commit', '')
+  var do_cmd: string = get(opts, 'do', '')
+  var frozen_val: any = get(opts, 'frozen', 0)
   var frozen: bool = false
   if type(frozen_val) == v:t_number
     frozen = frozen_val != 0
   elseif type(frozen_val) == v:t_bool
     frozen = frozen_val
+  else
+    OptionError(name, '`frozen` must be a number or boolean')
+    return
   endif
   var on_ft = get(opts, 'for', '')
   var triggers = NormalizeTriggers(name, get(opts, 'on', ''))
@@ -1143,8 +1222,10 @@ def EnsureBackend(): bool
   # Timeouts are read fresh on every start so :PlugInstall picks up a change
   # to g:simpleplug_git_timeout without a Vim restart.
   simpleplug#core#Configure('env', {
-    SIMPLEPLUG_GIT_TIMEOUT: string(get(g:, 'simpleplug_git_timeout', 300)),
-    SIMPLEPLUG_HOOK_TIMEOUT: string(get(g:, 'simpleplug_hook_timeout', 600)),
+    SIMPLEPLUG_GIT_TIMEOUT: string(ConfigPositive(
+      'simpleplug_git_timeout', 300)),
+    SIMPLEPLUG_HOOK_TIMEOUT: string(ConfigPositive(
+      'simpleplug_hook_timeout', 600)),
   })
   # :PlugStop only sends SIGTERM, and job_status() keeps answering 'run' until
   # the process is actually reaped — so core#Ensure() would hand back the
@@ -1216,14 +1297,15 @@ export def Health()
   add(lines, printf('[%s] git: %s',
     executable('git') ? 'OK' : 'ERROR',
     executable('git') ? exepath('git') : 'not found in $PATH'))
-  add(lines, printf('[INFO] plugin directory: %s', get(g:, 'simpleplug_dir', '(unset)')))
+  add(lines, printf('[INFO] plugin directory: %s', PlugDir()))
   add(lines, printf('[INFO] registered plugins: %d', len(s_plugins)))
   if s_check_behind >= 0
     add(lines, printf('[INFO] %d plugin%s had updates at the last :PlugCheck',
       s_check_behind, s_check_behind == 1 ? '' : 's'))
   endif
   add(lines, printf('[INFO] git timeout: %ds, hook timeout: %ds',
-    get(g:, 'simpleplug_git_timeout', 300), get(g:, 'simpleplug_hook_timeout', 600)))
+    ConfigPositive('simpleplug_git_timeout', 300),
+    ConfigPositive('simpleplug_hook_timeout', 600)))
   for line in lines
     echom line
   endfor
@@ -1395,8 +1477,7 @@ def StartRequest(mode: string): number
 enddef
 
 def JobCount(): number
-  var jobs = get(g:, 'simpleplug_jobs', 8)
-  return type(jobs) == v:t_number ? max([1, min([jobs, 64])]) : 8
+  return ConfigInt('simpleplug_jobs', 8, 1, 64)
 enddef
 
 def NormalDir(path: string): string
@@ -1449,7 +1530,7 @@ enddef
 # 21 个插件全都躺在磁盘上却一个都没生效——作者自己的配置为此在 timer 里整个
 # 重新 source .vimrc，那会把每个 mapping、autocmd、option 都重跑一遍。
 def ActivateInstalled()
-  if !get(g:, 'simpleplug_activate_on_install', 1)
+  if !ConfigFlag('simpleplug_activate_on_install', true)
     return
   endif
   var activated = 0
@@ -1555,8 +1636,7 @@ export def LastResult(): dict<any>
 enddef
 
 def SyncTimeout(): number
-  var limit = get(g:, 'simpleplug_sync_timeout', 1800)
-  return type(limit) == v:t_number && limit > 0 ? limit : 1800
+  return ConfigPositive('simpleplug_sync_timeout', 1800)
 enddef
 
 # Block until the running operation finishes, then return its result.
@@ -1609,7 +1689,7 @@ export def AutoInstallMissing()
   endif
   s_auto_install_checked = true
 
-  if !get(g:, 'simpleplug_auto_install', 1)
+  if !ConfigFlag('simpleplug_auto_install', true)
     return
   endif
 
@@ -1641,7 +1721,7 @@ enddef
 var s_snapshot_nonce: number = 0
 
 def SnapshotPath(file: string): string
-  return file ==# '' ? g:simpleplug_dir .. '/simpleplug.snapshot.json' : fnamemodify(file, ':p')
+  return file ==# '' ? PlugDir() .. '/simpleplug.snapshot.json' : fnamemodify(file, ':p')
 enddef
 
 
@@ -1767,7 +1847,7 @@ enddef
 
 def SnapshotFormat(): string
   var configured = get(g:, 'simpleplug_snapshot_format', 'v1')
-  return configured ==# 'legacy' ? 'legacy' : 'v1'
+  return type(configured) == v:t_string && configured ==# 'legacy' ? 'legacy' : 'v1'
 enddef
 
 
@@ -2062,7 +2142,7 @@ var s_diff_line_map: dict<string> = {}
 var s_diff_bufnr: number = -1
 
 def LastUpdatePath(): string
-  return g:simpleplug_dir .. '/.simpleplug-lastupdate.json'
+  return PlugDir() .. '/.simpleplug-lastupdate.json'
 enddef
 
 # `from` 会作为 commit pin 原样发回 daemon，所以它跨过的是和快照文件同一条
@@ -2283,9 +2363,7 @@ enddef
 # =============================================================
 
 def ProfileThreshold(): float
-  var configured = get(g:, 'simpleplug_profile_threshold_ms', 5)
-  return type(configured) == v:t_number || type(configured) == v:t_float
-    ? 0.0 + configured : 5.0
+  return ConfigFloat('simpleplug_profile_threshold_ms', 5.0, 0.0)
 enddef
 
 def ProfileBar(ms: float, peak: float, width: number): string
@@ -2396,13 +2474,13 @@ export def Clean(force: bool = false)
   endif
   var keep: list<string> = []
   for p in s_plugins
-    if NormalDir(fnamemodify(p.dir, ':h')) ==# NormalDir(g:simpleplug_dir)
+    if NormalDir(fnamemodify(p.dir, ':h')) ==# NormalDir(PlugDir())
       add(keep, fnamemodify(p.dir, ':t'))
     endif
   endfor
   # Never let SimplePlug clean its own checkout when it lives in plugdir.
   var manager_dir = s_plugin_root
-  if NormalDir(fnamemodify(manager_dir, ':h')) ==# NormalDir(g:simpleplug_dir)
+  if NormalDir(fnamemodify(manager_dir, ':h')) ==# NormalDir(PlugDir())
     add(keep, fnamemodify(manager_dir, ':t'))
   endif
   s_ui_total = 0
@@ -2411,7 +2489,7 @@ export def Clean(force: bool = false)
   s_ui_plug_state = {}
   s_ui_targets = []
   UIOpen()
-  Send({type: 'clean', id: id, plugdir: g:simpleplug_dir, keep: keep})
+  Send({type: 'clean', id: id, plugdir: PlugDir(), keep: keep})
 enddef
 
 export def Status()
@@ -2796,7 +2874,7 @@ enddef
 
 def StartSpinner()
   StopSpinner()
-  var interval = get(g:, 'simpleplug_spinner_interval', 200)
+  var interval = ConfigAtLeast('simpleplug_spinner_interval', 200, 16)
   s_ui_spinner_timer = timer_start(interval, function('SpinnerTick'), {repeat: -1})
 enddef
 
@@ -2940,7 +3018,7 @@ enddef
 const s_default_width = 88
 
 def UiWidth(): number
-  return get(g:, 'simpleplug_window_width', s_default_width)
+  return ConfigPositive('simpleplug_window_width', s_default_width)
 enddef
 
 def ShortLine(content: string, width: number): string

@@ -299,6 +299,28 @@ silent simpleplug#Plug('local/comma-rtp', {rtp: 'vim,/tmp'})
 assert_equal([], simpleplug#CompletePluginNames('unsafe-', '', 0))
 assert_equal([], simpleplug#CompletePluginNames('comma-', '', 0))
 
+# Scalar declarations cross a strongly typed JSON boundary.  Reject a bad
+# plugin locally instead of sending one malformed field that makes the daemon
+# reject the complete install/update batch (including every valid sibling).
+var option_noise = execute("silent call simpleplug#Plug('local/bad-alias', {as: 7})")
+option_noise ..= execute("silent call simpleplug#Plug('local/bad-dir', {dir: []})")
+option_noise ..= execute("silent call simpleplug#Plug('local/bad-branch', {branch: ['main']})")
+option_noise ..= execute("silent call simpleplug#Plug('local/bad-tag', {tag: '--help'})")
+option_noise ..= execute("silent call simpleplug#Plug('local/bad-commit', {commit: " .. string("abc\ndef") .. "})")
+option_noise ..= execute("silent call simpleplug#Plug('local/bad-hook', {do: {}})")
+option_noise ..= execute("silent call simpleplug#Plug('local/bad-frozen', {frozen: 'yes'})")
+option_noise ..= execute("silent call simpleplug#Plug('local/bad-dir-comma', {dir: '/tmp/a,b'})")
+for bad in ['bad-alias', 'bad-dir', 'bad-branch', 'bad-tag', 'bad-commit',
+    'bad-hook', 'bad-frozen', 'bad-dir-comma']
+  assert_equal([], simpleplug#CompletePluginNames(bad, '', 0),
+    bad .. ' was registered despite an invalid scalar option')
+endfor
+assert_match('`as` must be a string', option_noise)
+assert_match('`branch` must be a string', option_noise)
+assert_match('`tag` must be a single Git reference', option_noise)
+assert_match('`frozen` must be a number or boolean', option_noise)
+assert_match('`dir` must not contain a comma', option_noise)
+
 # Containment is rechecked after registration: replacing a valid runtime with
 # a symlink cannot make End() source a directory outside the checkout.
 if executable('ln')

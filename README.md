@@ -158,6 +158,9 @@ g:simpleplug_profile_threshold_ms " :PlugProfile 里多少毫秒起算延迟加�
 g:simpleplug_lazy_event_refire    " 叫醒 event 插件的那次事件是否交付给它 (默认 1)
 ```
 
+配置在加载时统一做类型与范围归一化；运行期间可修改的超时、并行度、UI
+宽度/刷新间隔等在使用点还会再校验，错误类型不会从 VimEnter、timer 或健康检查中抛出。
+
 写 0 / 1 的选项同样认 `v:false` / `v:true`。
 
 ## Plug() 选项
@@ -178,6 +181,10 @@ g:simpleplug_lazy_event_refire    " 叫醒 event 插件的那次事件是否交�
 | `dependencies` | 必须先 source 的插件名（或声明时的仓库串）列表 |
 
 版本锁定优先级：`commit` > `tag` > `branch`。
+
+`as`、`dir`、`branch`、`tag`、`commit` 与 `do` 必须是字符串，`frozen`
+必须是数字或布尔值。错误声明会在注册时被拒绝，不会等到安装批次已经启动后再由
+后台协议失败。由于逗号是 Vim `'runtimepath'` 的结构分隔符，`dir` 也不能包含逗号。
 
 `rtp` 只改变加入 `'runtimepath'`、延迟加载和生成 helptags 时使用的目录；
 clone、update、snapshot、hook 与 clean 仍以完整仓库目录为单位。为避免插件逃出

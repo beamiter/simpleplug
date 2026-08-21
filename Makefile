@@ -1,6 +1,6 @@
-.PHONY: check fmt clippy test vim-test vim-batch vim-lazy vim-order vim-profile vim-core defcompile core-verify
+.PHONY: check fmt clippy test vim-test vim-config vim-batch vim-lazy vim-order vim-profile vim-core defcompile core-verify
 
-check: core-verify fmt clippy test defcompile vim-core vim-test vim-batch vim-lazy vim-order vim-profile
+check: core-verify fmt clippy test defcompile vim-core vim-test vim-config vim-batch vim-lazy vim-order vim-profile
 
 fmt:
 	cargo fmt --all -- --check
@@ -13,6 +13,9 @@ test:
 
 vim-test:
 	vim -Nu NONE -n -i NONE -es -S tests/vim_smoke.vim
+
+vim-config:
+	vim -Nu NONE -n -i NONE -es -S tests/vim_config.vim
 
 # Install/update batches end to end against a scripted daemon: the completion
 # event and its result dictionary, the synchronous bang, and activation of a
