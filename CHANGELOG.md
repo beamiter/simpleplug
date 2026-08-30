@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased - 2026-08-30
+
+### 守护进程不再有无界的缓冲区，hook 也不再漏杀子孙
+
+- 请求流改成有界读取。此前 `serve()` 用 `AsyncBufReadExt::lines()` 收请求：
+  一行没等到换行符就一直长，Vim 通道写到一半死掉留下的半行、或者任何丢了换行符
+  的生产者，都能把守护进程撑到被 OOM 杀掉；而且撑爆之后也没法跳过这条坏记录。
+  现在按块读，超过 `MAX_REQUEST_LINE_BYTES`（8 MiB）的记录连同它的换行符一起丢弃，
+  回一条 `request line exceeds N bytes` 的 error 事件，下一条正常请求照常服务。
+  simplecc / simplefinder / simplemarkdown / simplegit / simpleline / simpleminimap
+  用的是同一个读法。
+- post-update hook 的两个流各自截断到 64 KiB。hook 就是 `make`、`npm ci`、
+  `./install.sh`：一次啰嗦的构建能在 600 秒里往 stdout 打几百 MB，过去这些字节
+  被 `Command::output()` 整个买进内存，再原样塞进一条 `hook_done` JSON 发给 Vim
+  ——Vim 会收到一条几百 MB 的通道消息。截断之后剩下的字节仍然读走（不读的话
+  管道写满，hook 自己会卡死），只是不再留存。
+- hook 子进程自成进程组，超时和 drop 时杀的是取负的 pgid。`kill_on_drop` 只够到
+  那个 `sh`，底下真正占着 CPU 和网络的 npm 会被过继给 init 继续跑——守护进程一边
+  报 `hook failed`，一边让它继续往即将清理的插件目录里写。simplecc 的 installer
+  早就是这么做的，hook 是同一类负载。
+- `du -sk` 走 crate 自己的 `run_with_timeout`。它是这个 crate 里唯一一个绕开那个
+  helper 的子进程：没有超时、没有 `kill_on_drop`，于是网络挂载上的一个插件目录
+  就能永久占住 `handle_status` 的一个 job 名额，`:PlugStatus` 一直空着。新增
+  `SIMPLEPLUG_SIZE_TIMEOUT`（默认 30 秒），超时的那一项只是没有大小，不再拖住整批。
+- 启动 `git` 前清掉 `GIT_DIR` 一族的八个变量。Vim 继承的是启动它的那个 shell 的
+  环境，一个从 git hook 或 `git rebase --exec vim` 漏出来的 `GIT_DIR`，会把每个
+  插件的 git 都指到那个仓库上。simplegit 和 simpleline 清的是同样这八个。
+
 ## Unreleased - 2026-08-08
 
 ### 关闭进度 UI 不再留下空分屏

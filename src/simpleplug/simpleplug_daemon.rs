@@ -2,12 +2,40 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{RwLock, Semaphore};
 
 const DEFAULT_JOBS: usize = 8;
 const MAX_JOBS: usize = 64;
+
+/// The largest request this daemon will assemble.  An install/update request
+/// carries one spec per plugin in the user's vimrc — a few hundred bytes each
+/// — so this sits far above any real configuration while staying finite: a Vim
+/// channel that dies mid-write leaves a partial line, and a client that loses
+/// its newline must not grow the daemon until the machine runs out of memory.
+const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024 * 1024;
+
+/// How much of a post-update hook's output is kept, per stream.  Hooks are
+/// `make`, `npm ci`, `./install.sh`; a chatty build prints hundreds of
+/// megabytes, and every byte of it would otherwise be buffered whole and then
+/// serialised into a single `hook_done` JSON line for Vim to read.
+const MAX_HOOK_OUTPUT_BYTES: usize = 64 * 1024;
+
+/// Cleared before every `git` this daemon starts.  Vim inherits whatever the
+/// shell that started it exported, so a stray `GIT_DIR` — from a git hook, or
+/// from `git rebase --exec vim` — would otherwise redirect every plugin's git
+/// at that repository instead of at the plugin directory.
+const GIT_REPOSITORY_ENV_VARS: [&str; 8] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+];
 
 fn default_jobs() -> usize {
     DEFAULT_JOBS
@@ -312,12 +340,83 @@ async fn main() -> std::process::ExitCode {
     }
 }
 
-async fn serve() -> std::io::Result<()> {
-    let stdin = BufReader::new(tokio::io::stdin());
-    let mut lines = stdin.lines();
+fn finish_request_line(mut bytes: Vec<u8>, too_long: bool) -> Result<String, String> {
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    if too_long || bytes.len() > MAX_REQUEST_LINE_BYTES {
+        return Err(format!(
+            "request line exceeds {MAX_REQUEST_LINE_BYTES} bytes"
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| "request line is not valid UTF-8".to_string())
+}
 
+/// Read one bounded JSONL record, discarding the remainder of an oversized one
+/// through its newline so that the next well-formed request is still served.
+///
+/// `AsyncBufReadExt::lines()`, which this replaced, can offer neither
+/// guarantee: it grows a single String until the next newline arrives or the
+/// allocator gives up, and once it has it cannot skip the malformed record.
+async fn read_request_line<R>(
+    reader: &mut BufReader<R>,
+) -> std::io::Result<Option<Result<String, String>>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::new();
+    let mut too_long = false;
+
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return if bytes.is_empty() && !too_long {
+                Ok(None)
+            } else {
+                Ok(Some(finish_request_line(bytes, too_long)))
+            };
+        }
+
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let content_len = newline.unwrap_or(available.len());
+        let consumed = newline.map_or(available.len(), |position| position + 1);
+
+        if !too_long {
+            // Keep one framing byte until the record ends.  A terminal CR in
+            // CRLF is not part of the JSONL payload's documented size limit.
+            if bytes.len().saturating_add(content_len) > MAX_REQUEST_LINE_BYTES.saturating_add(1) {
+                too_long = true;
+                bytes.clear();
+            } else {
+                bytes.extend_from_slice(&available[..content_len]);
+            }
+        }
+        reader.consume(consumed);
+
+        if newline.is_some() {
+            return Ok(Some(finish_request_line(bytes, too_long)));
+        }
+    }
+}
+
+async fn serve() -> std::io::Result<()> {
     let (out_tx, out_rx) = tokio::sync::mpsc::channel::<String>(4096);
     let writer = tokio::spawn(stdout_writer(out_rx));
+
+    let result = process_requests(tokio::io::stdin(), out_tx.clone()).await;
+
+    // stdin EOF：请求都已收尾（见 process_requests），让 writer 把事件刷完。
+    drop(out_tx);
+    let _ = writer.await;
+    result
+}
+
+/// The request loop, over any reader so a test can drive it end to end.
+async fn process_requests<R>(input: R, out_tx: EventTx) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut input = BufReader::new(input);
 
     // 简单的全局锁：防止并发写同一个插件目录
     let locks: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
@@ -325,7 +424,17 @@ async fn serve() -> std::io::Result<()> {
 
     let mut tasks = tokio::task::JoinSet::new();
 
-    while let Some(line) = lines.next_line().await? {
+    loop {
+        let Some(line) = read_request_line(&mut input).await? else {
+            break;
+        };
+        let line = match line {
+            Ok(line) => line,
+            Err(message) => {
+                send_event(&out_tx, &Event::Error { id: 0, message }).await;
+                continue;
+            }
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -383,10 +492,8 @@ async fn serve() -> std::io::Result<()> {
         });
     }
 
-    // stdin EOF：等所有进行中的请求收尾，再让 writer 把事件全部刷出。
+    // stdin EOF：等所有进行中的请求收尾，调用者随后关闭事件通道。
     while tasks.join_next().await.is_some() {}
-    drop(out_tx);
-    let _ = writer.await;
     Ok(())
 }
 
@@ -394,6 +501,11 @@ async fn serve() -> std::io::Result<()> {
 
 const DEFAULT_GIT_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 600;
+/// `du` walks a plugin directory that may sit on a network mount or hold a
+/// symlink loop, and it does so while holding one of `handle_status`'s job
+/// permits.  A status listing that could not measure a directory is worth far
+/// more than a status listing that never arrives, so this deadline is short.
+const DEFAULT_SIZE_TIMEOUT_SECS: u64 = 30;
 
 fn timeout_from_env(var: &str, default_secs: u64) -> std::time::Duration {
     let secs = std::env::var(var)
@@ -410,6 +522,10 @@ fn git_timeout() -> std::time::Duration {
 
 fn hook_timeout() -> std::time::Duration {
     timeout_from_env("SIMPLEPLUG_HOOK_TIMEOUT", DEFAULT_HOOK_TIMEOUT_SECS)
+}
+
+fn size_timeout() -> std::time::Duration {
+    timeout_from_env("SIMPLEPLUG_SIZE_TIMEOUT", DEFAULT_SIZE_TIMEOUT_SECS)
 }
 
 async fn run_with_timeout(
@@ -443,9 +559,23 @@ enum GitOutcome {
     Unavailable(String),
 }
 
-async fn try_git(dir: &str, args: &[&str]) -> GitOutcome {
+/// Every `git` this daemon starts.
+///
+/// The ambient repository environment is removed here rather than at each call
+/// site, so no subcommand added later can forget it; simplegit and simpleline
+/// clear the same eight variables for the same reason.
+fn git_command(args: &[&str]) -> Command {
     let mut cmd = Command::new("git");
-    cmd.args(args).current_dir(dir);
+    cmd.args(args);
+    for variable in GIT_REPOSITORY_ENV_VARS {
+        cmd.env_remove(variable);
+    }
+    cmd
+}
+
+async fn try_git(dir: &str, args: &[&str]) -> GitOutcome {
+    let mut cmd = git_command(args);
+    cmd.current_dir(dir);
     match run_with_timeout(cmd, "git", git_timeout()).await {
         Err(e) => GitOutcome::Unavailable(e),
         Ok(output) if output.status.success() => {
@@ -479,8 +609,7 @@ async fn git_clone(url: &str, dir: &str, refname: &str) -> Result<(), String> {
     args.push(url);
     args.push(dir);
 
-    let mut cmd = Command::new("git");
-    cmd.args(&args);
+    let cmd = git_command(&args);
     let output = run_with_timeout(cmd, "git clone", git_timeout()).await?;
 
     if output.status.success() {
@@ -1716,13 +1845,16 @@ fn validate_clean_root(plugdir: &str) -> Result<PathBuf, String> {
 
 // ─────────────────── status ───────────────────
 
-async fn dir_size_kb(path: &Path) -> Option<u64> {
-    let output = Command::new("du")
-        .args(["-sk"])
-        .arg(path)
-        .output()
-        .await
-        .ok()?;
+/// Directory size for the status listing.
+///
+/// Routed through `run_with_timeout` like every other subprocess in this crate.
+/// It once called `du` bare — no deadline, no `kill_on_drop` — so a slow path
+/// held a status job's semaphore permit for ever and `:PlugStatus` never
+/// completed.  The caller passes the deadline, exactly as the git call sites do.
+async fn dir_size_kb(path: &Path, timeout: std::time::Duration) -> Option<u64> {
+    let mut cmd = Command::new("du");
+    cmd.args(["-sk"]).arg(path);
+    let output = run_with_timeout(cmd, "du", timeout).await.ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1758,7 +1890,7 @@ async fn handle_status(id: u64, plugins: Vec<PluginSpec>, jobs: usize, tx: &Even
             let last_commit = run_git(&p.dir, &["log", "-1", "--format=%cs %s"])
                 .await
                 .unwrap_or_default();
-            let size_kb = dir_size_kb(&dir_path).await;
+            let size_kb = dir_size_kb(&dir_path, size_timeout()).await;
             PluginStatus {
                 name: p.name,
                 installed,
@@ -1946,10 +2078,145 @@ async fn handle_post_hook(id: u64, name: &str, dir: &str, cmd: &str, tx: &EventT
 
 // ─────────────────── shell helper ───────────────────
 
+#[cfg(unix)]
+struct HookProcessGroup {
+    pgid: Option<libc::pid_t>,
+}
+
+#[cfg(unix)]
+impl HookProcessGroup {
+    fn new(pid: Option<u32>) -> Self {
+        Self {
+            pgid: pid.and_then(|pid| libc::pid_t::try_from(pid).ok()),
+        }
+    }
+
+    fn kill(&self) {
+        if let Some(pgid) = self.pgid {
+            // ESRCH simply means the whole group already exited.
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for HookProcessGroup {
+    fn drop(&mut self) {
+        // The child is its own process-group leader.  Killing the negative id
+        // reaches the make/npm descendants that Child::kill_on_drop cannot see.
+        self.kill();
+    }
+}
+
+#[cfg(not(unix))]
+struct HookProcessGroup;
+
+#[cfg(not(unix))]
+impl HookProcessGroup {
+    fn new(_pid: Option<u32>) -> Self {
+        // Windows retains kill_on_drop for the direct child.  A Job Object
+        // would be needed for descendant-wide termination and is not available
+        // in this dependency-light daemon.
+        Self
+    }
+
+    fn kill(&self) {}
+}
+
+/// Copy one hook stream, keeping at most `limit` bytes of it.
+///
+/// The remainder is still read — a hook whose pipe filled up would block for
+/// ever — but never retained.
+async fn read_capped<R>(mut stream: R, limit: usize) -> std::io::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut kept = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(kept.len());
+        kept.extend_from_slice(&chunk[..read.min(remaining)]);
+    }
+    Ok(kept)
+}
+
+async fn terminate_hook_child(group: &HookProcessGroup, child: &mut tokio::process::Child) {
+    group.kill();
+    let _ = child.start_kill();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), child.wait()).await;
+}
+
+/// Run one post-update hook.
+///
+/// Deliberately not `run_with_timeout`.  That helper's `Command::output()`
+/// buffers the whole of a `make` or `npm install` in memory, and this output
+/// leaves the daemon as a single `hook_done` JSON line — so both streams are
+/// capped at `MAX_HOOK_OUTPUT_BYTES` instead.  Its `kill_on_drop` also reaches
+/// only the `sh`: the npm underneath is reparented to init and keeps running,
+/// unreachable and unreported, writing into a plugin directory the daemon
+/// believes it has cancelled.  The child therefore leads its own process group,
+/// which is killed as a group on timeout and on drop.
+async fn run_hook_child(
+    mut command: Command,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, String> {
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // A daemon must never sit on an interactive credential prompt.
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let mut child = command.spawn().map_err(|e| format!("exec hook: {e}"))?;
+    let group = HookProcessGroup::new(child.id());
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "hook stdout pipe was not created".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "hook stderr pipe was not created".to_string())?;
+
+    let waited = tokio::time::timeout(timeout, async {
+        let (status, stdout, stderr) = tokio::join!(
+            child.wait(),
+            read_capped(stdout, MAX_HOOK_OUTPUT_BYTES),
+            read_capped(stderr, MAX_HOOK_OUTPUT_BYTES),
+        );
+        Ok::<_, String>(std::process::Output {
+            status: status.map_err(|e| format!("exec hook: {e}"))?,
+            stdout: stdout.map_err(|e| format!("exec hook: reading stdout: {e}"))?,
+            stderr: stderr.map_err(|e| format!("exec hook: reading stderr: {e}"))?,
+        })
+    })
+    .await;
+
+    let outcome = match waited {
+        Ok(result) => result,
+        Err(_) => {
+            terminate_hook_child(&group, &mut child).await;
+            Err(format!("hook timed out after {}s", timeout.as_secs()))
+        }
+    };
+    // Also reaches any descendant that outlived a normally exiting parent.
+    drop(group);
+    outcome
+}
+
 async fn run_shell_cmd(dir: &str, cmd: &str) -> Result<String, String> {
     let mut command = Command::new("sh");
     command.args(["-c", cmd]).current_dir(dir);
-    let output = run_with_timeout(command, "hook", hook_timeout()).await?;
+    let output = run_hook_child(command, hook_timeout()).await?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -2850,5 +3117,210 @@ mod tests {
             git_checkout_state(dest.to_str().unwrap()).await,
             CheckoutState::Valid
         ));
+    }
+
+    // ── the request stream is bounded ──────────────────────────────────
+
+    #[tokio::test]
+    async fn an_oversized_request_is_refused_and_the_next_one_is_served() {
+        let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+        let served = tokio::spawn(process_requests(reader, tx));
+
+        // A producer that loses its newline: this used to grow one String
+        // until the allocator gave up, and could never skip the bad record.
+        let flood = vec![b'x'; MAX_REQUEST_LINE_BYTES + 1];
+        writer.write_all(&flood).await.unwrap();
+        writer.write_all(b"\n").await.unwrap();
+        writer
+            .write_all(b"{\"type\":\"ping\",\"id\":42}\n")
+            .await
+            .unwrap();
+        writer.shutdown().await.unwrap();
+        served.await.unwrap().unwrap();
+
+        let events = drain_events(&mut rx).await;
+        assert_eq!(events.len(), 2, "unexpected event stream: {events:?}");
+        assert_eq!(events[0]["type"], "error");
+        assert_eq!(events[0]["id"], 0);
+        assert!(
+            events[0]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("request line exceeds")),
+            "oversized record was not reported: {events:?}"
+        );
+        assert_eq!(events[1]["type"], "pong", "recovery failed: {events:?}");
+        assert_eq!(events[1]["id"], 42);
+    }
+
+    #[tokio::test]
+    async fn crlf_at_the_exact_line_limit_is_accepted() {
+        let mut input = vec![b'x'; MAX_REQUEST_LINE_BYTES];
+        input.extend_from_slice(b"\r\n");
+        let mut reader = BufReader::new(input.as_slice());
+        let line = read_request_line(&mut reader)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(line.len(), MAX_REQUEST_LINE_BYTES);
+    }
+
+    // ── hook output is bounded, and hooks die as a group ───────────────
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hook_streams_are_drained_but_memory_bounded() {
+        // 320 KiB on each stream: five times the cap, and enough to fill and
+        // refill both pipes, so a reader that stopped early would deadlock.
+        let script = r#"i=0; while [ "$i" -lt 10000 ]; do printf '0123456789abcdef0123456789abcdef\n'; printf '0123456789abcdef0123456789abcdef\n' >&2; i=$((i + 1)); done; exit 7"#;
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", script]);
+        let output = run_hook_child(command, std::time::Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert!(!output.status.success());
+        assert_eq!(output.stdout.len(), MAX_HOOK_OUTPUT_BYTES);
+        assert_eq!(output.stderr.len(), MAX_HOOK_OUTPUT_BYTES);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_chatty_hook_does_not_become_one_unbounded_event() {
+        let dir = TestDir::new("hook-output");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let script = r#"i=0; while [ "$i" -lt 10000 ]; do printf '0123456789abcdef0123456789abcdef\n'; i=$((i + 1)); done"#;
+        handle_post_hook(9, "chatty", dir.0.to_str().unwrap(), script, &tx).await;
+
+        let events = drain_events(&mut rx).await;
+        assert_eq!(events.len(), 1, "unexpected event stream: {events:?}");
+        assert_eq!(events[0]["type"], "hook_done");
+        assert_eq!(events[0]["ok"], true);
+        let output = events[0]["output"].as_str().unwrap();
+        assert!(
+            output.len() <= MAX_HOOK_OUTPUT_BYTES,
+            "{} bytes of hook stdout reached Vim in one event",
+            output.len()
+        );
+        assert!(
+            output.len() > MAX_HOOK_OUTPUT_BYTES / 2,
+            "the hook's output was not reported at all: {output:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_timed_out_hook_kills_its_descendants() {
+        let dir = TestDir::new("hook-pgid");
+        let pid_file = dir.0.join("pids");
+        // `sh` publishes its own pid, backgrounds a sleep, publishes that one
+        // too, then waits.  Killing only `sh` leaves the sleep running.
+        let script = r#"printf '%s\n' "$$" > "$1"; sleep 300 & printf '%s\n' "$!" >> "$1"; wait"#;
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", script, "simpleplug-hook"])
+            .arg(&pid_file);
+        let runner = tokio::spawn(run_hook_child(command, std::time::Duration::from_secs(5)));
+
+        let pids = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let Ok(text) = tokio::fs::read_to_string(&pid_file).await {
+                    let pids = text
+                        .lines()
+                        .filter_map(|line| line.trim().parse::<u32>().ok())
+                        .collect::<Vec<_>>();
+                    if pids.len() == 2 {
+                        break pids;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the hook and its child publish their PIDs");
+
+        let error = runner.await.unwrap().unwrap_err();
+        assert!(
+            error.contains("timed out"),
+            "the hook did not hit its deadline: {error}"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let all_gone = pids.iter().all(|pid| {
+                    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                        Err(_) => true,
+                        // A zombie has exited; its subreaper may reap it later.
+                        Ok(stat) => matches!(
+                            stat.rsplit_once(") ")
+                                .and_then(|(_, rest)| rest.chars().next()),
+                            Some('Z' | 'X')
+                        ),
+                    }
+                });
+                if all_gone {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the hook's whole process group exits with it");
+    }
+
+    // ── the status listing cannot hang on du ───────────────────────────
+
+    #[tokio::test]
+    async fn dir_size_observes_a_deadline_instead_of_holding_a_status_slot() {
+        let dir = TestDir::new("du-deadline");
+        // Twenty thousand entries: a walk `du` measurably cannot finish inside
+        // one timer tick, standing in for the network mount and the vendored
+        // tree that made this call site hang in the first place.
+        for outer in 0..200 {
+            let sub = dir.0.join(format!("d{outer:03}"));
+            std::fs::create_dir_all(&sub).unwrap();
+            for inner in 0..100 {
+                std::fs::write(sub.join(format!("f{inner:03}")), "x").unwrap();
+            }
+        }
+
+        assert!(
+            dir_size_kb(&dir.0, size_timeout()).await.is_some(),
+            "du no longer measures an ordinary plugin directory"
+        );
+
+        // `du` once ran with no deadline at all, so one slow directory held a
+        // status job's permit for ever and :PlugStatus never completed.  The
+        // outer timeout is the assertion: without an inner deadline this call
+        // does not return.
+        let expired = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            dir_size_kb(&dir.0, std::time::Duration::ZERO),
+        )
+        .await
+        .expect("dir_size_kb must enforce the deadline it is given");
+        assert_eq!(expired, None, "du outran its own deadline");
+    }
+
+    // ── git never inherits another repository ──────────────────────────
+
+    #[test]
+    fn git_commands_drop_an_inherited_repository_environment() {
+        // Asserted on the command rather than by exporting GIT_DIR: the
+        // variable would reach every other test's git through the shared
+        // process environment.
+        let command = git_command(&["status"]);
+        let removed = command
+            .as_std()
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        for variable in GIT_REPOSITORY_ENV_VARS {
+            assert!(
+                removed.iter().any(|key| key == variable),
+                "{variable} would follow git into the plugin directory: {removed:?}"
+            );
+        }
     }
 }
