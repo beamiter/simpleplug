@@ -39,9 +39,13 @@ enddef
 
 def ConfigFloat(name: string, fallback: float, minimum: float): float
   var value = get(g:, name, fallback)
-  return type(value) == v:t_number || type(value) == v:t_float
-    ? max([minimum, 0.0 + value])
-    : fallback
+  if type(value) != v:t_number && type(value) != v:t_float
+    return fallback
+  endif
+  # Vim's max() only accepts Number values.  Keep the calculation in Float
+  # space so :PlugProfile accepts both integer and fractional thresholds.
+  var numeric = 0.0 + value
+  return numeric < minimum ? minimum : numeric
 enddef
 
 def PlugDir(): string

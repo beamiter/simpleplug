@@ -7,6 +7,8 @@ var root = fnamemodify(expand('<sfile>'), ':p:h:h')
 execute 'set runtimepath^=' .. fnameescape(root)
 execute 'source ' .. fnameescape(root .. '/plugin/simpleplug.vim')
 assert_equal(2, exists(':PlugSnapshotDiff'))
+assert_equal(5.0, g:simpleplug_profile_threshold_ms,
+  'the default integer profile threshold was not normalised to Float')
 
 var fixture = root .. '/tests/fixtures/lazy-plugin'
 simpleplug#Begin('/tmp/simpleplug-vim-smoke')

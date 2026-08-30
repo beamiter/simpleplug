@@ -31,9 +31,13 @@ def AtLeast(value: any, fallback: number, minimum: number): number
     ? max([minimum, value]) : fallback
 enddef
 
-def NonNegative(value: any, fallback: float): any
+def NonNegative(value: any, fallback: float): float
   if type(value) == v:t_number || type(value) == v:t_float
-    return max([0.0, 0.0 + value])
+    # max()/min() accept Numbers only, even though arithmetic and comparisons
+    # support Float.  Normalise first, then clamp without passing a Float list
+    # to max(); the old expression aborted the plugin during its default load.
+    var numeric = 0.0 + value
+    return numeric < 0.0 ? 0.0 : numeric
   endif
   return fallback
 enddef
