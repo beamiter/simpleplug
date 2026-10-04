@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased - 2026-10-04
+
+### 延迟加载、快照 git 环境、以及半成品 checkout 的状态
+
+- `globpath()` 过去带着 `'wildignore'` 去找 `plugin/` 和 `ftdetect/`。用户
+  `set wildignore+=*.vim`（或者更常见的把备份文件排除在补全之外）时，延迟
+  插件的触发器还在，脚本却一次也不会被 source。现在 `nosuf` 打开，加载路径
+  不再借用编辑补全的忽略名单。
+- `:PlugSnapshot` / `:PlugSnapshotDiff` 以及进度窗口的 `d` 在本进程里跑 git，
+  却没清 `GIT_DIR` 一族。从 git hook 里开起来的 Vim 会把每个插件的 HEAD 读成
+  那个钩子所在仓库的 HEAD，锁文件看起来整批漂移。Vim 侧现在清的是和 daemon
+  同一组八个变量。
+- `{for: ...}` 在 `filetype plugin on` 已经先跑过的 vimrc 里加载了 plugin/，
+  但叫醒它的那一次 FileType 已经空转过 `filetypeplugin`，ftplugin/ 不会再跑。
+  现在只对 `filetypeplugin` / `filetypeindent` / `syntaxset` 补发一次，并沿用
+  事件那套只对 SimplePlugLazy 组记记号的办法。
+- `for` 会写进 `:autocmd FileType`，以前既不校验类型也不校验名字：`for: 1`
+  把插件挂成延迟却永远没有触发器，`for: 'rust | echo'` 变成命令注入。无效项
+  当场拒绝，触发器全被拒的插件保持非延迟，跟 `event` 同一条规则。
+- `after/ftdetect/` 与 `after/doc/` 以前被跳过。Vim 自己的启动扫描两个都会走；
+  重新 source vimrc 也不会再 source 已经跑过的 ftdetect（那些脚本往
+  filetypedetect 上追加，跑第二次就是重复的探测器）。
+- 事件触发器不再用 `++once`：runtime 还没落地的那一次失败会把触发器带走，
+  checkout 出现之后同一次会话里再发同一事件也不会重试。已加载的插件仍在
+  回调开头返回。
+- `End()` 里单个插件 `SetupLazyLoad` 抛错（`on: 'fzf'` 这类 E183）不再中止
+  整个循环，排在后面的插件照常进 `'runtimepath'`。
+- `:PlugStatus` 把“有 `.git` 目录”当成已安装；中断的 clone 正好留下这个，却
+  没有能解析的 HEAD。现在与 install/update/check 共用 `git_checkout_state`。
+
 ## Unreleased - 2026-08-30
 
 ### 守护进程不再有无界的缓冲区，hook 也不再漏杀子孙

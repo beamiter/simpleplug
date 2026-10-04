@@ -76,6 +76,12 @@ var s_lazy_loading: dict<bool> = {}
 # guard inside a plugin that already ran.  Anything we tear down here can
 # therefore never be rebuilt by sourcing that plugin a second time.
 var s_sourced_runtime: dict<string> = {}
+# Runtime directories whose ftdetect (and after/ftdetect) scripts have been
+# sourced this session.  Those scripts typically `autocmd` into filetypedetect
+# without clearing it; sourcing them again on a vimrc re-source duplicates the
+# detectors.  Keyed by directory, not plugin name: the same checkout can be
+# registered under more than one `as`.
+var s_ftdetect_sourced: dict<bool> = {}
 
 def AlreadySourced(name: string, runtime_dir: string): bool
   return get(s_sourced_runtime, name, '') ==# runtime_dir
@@ -287,7 +293,14 @@ export def End()
   # 一条路径上成立。
   for plug in reverse(copy(order))
     if has_key(runtime_dirs, plug.name)
-      LoadPlugin(plug, runtime_dirs[plug.name])
+      # SetupLazyLoad can throw (an `on` trigger that is not a legal user
+      # command name is E183).  One bad declaration must not abort End() and
+      # leave every later plugin off 'runtimepath'.
+      try
+        LoadPlugin(plug, runtime_dirs[plug.name])
+      catch
+        RuntimeIssue(plug, 'failed to load: ' .. v:exception)
+      endtry
     endif
   endfor
   filetype plugin indent on
@@ -476,16 +489,19 @@ def SetupLazyLoad(plug: dict<any>, pdir: string)
     return
   endif
 
-  # on_ft 延迟加载
+  # on_ft 延迟加载。
+  #   ++nested  插件的 ftplugin/indent/syntax 是靠 FileType 上已经挂着的
+  #             filetypeplugin 组加载的。用户几乎总是在 vimrc 顶部就
+  #             `filetype plugin on`，那一组因此排在 SimplePlugLazy 前面：
+  #             这一轮 FileType 走到它时，插件还不在 'runtimepath' 上，
+  #             ftplugin 被静默跳过。没有 nested，后面也没有人再跑一次。
+  #   不用 ++once  LazyLoad 失败（runtime 还没落地）时触发器必须留着，
+  #             否则装好之后同一次会话里再进这个文件类型也不会重试。
   var ft = get(plug, 'on_ft', '')
-  if type(ft) == v:t_string && ft !=# ''
-    execute printf('autocmd SimplePlugLazy FileType %s call simpleplug#LazyLoad(%s, %s)',
-      ft, string(pname), string('FileType ' .. ft))
-  elseif type(ft) == v:t_list
-    for f in ft
-      execute printf('autocmd SimplePlugLazy FileType %s call simpleplug#LazyLoad(%s, %s)',
-        f, string(pname), string('FileType ' .. f))
-    endfor
+  if ft !=# ''
+    execute printf(
+      'autocmd SimplePlugLazy FileType %s ++nested call simpleplug#LazyLoadFileType(%s, %s)',
+      ft, string(pname), string(ft))
   endif
 
   # on 延迟加载：普通命令走 command stub，<Plug>/按键序列走 mapping stub
@@ -498,14 +514,16 @@ def SetupLazyLoad(plug: dict<any>, pdir: string)
   endfor
 
   # event 延迟加载。
-  #   ++once   这一条把插件叫醒之后就再没有意义了。
+  #   不用 ++once  加载失败时这条触发器必须还能再响；已加载则在
+  #             LazyLoadEvent 开头返回。DeliverWakingEvent 会再打回
+  #             这一组，所以“只跑一次”不能靠摘掉 autocmd。
   #   ++nested 插件的 plugin/ 脚本是在这条 autocmd 里 source 的，而 Vim 默认不
   #            在 autocmd 里执行 autocmd：没有它，插件加载途中自己触发的事件
   #            （filetype 检测、User 事件……）会被整个吞掉，同一个插件被事件叫
   #            醒和被命令叫醒的结果就不一样了。
   for ev in get(plug, 'on_event', [])
     execute printf(
-      'autocmd SimplePlugLazy %s %s ++once ++nested call simpleplug#LazyLoadEvent(%s, %s)',
+      'autocmd SimplePlugLazy %s %s ++nested call simpleplug#LazyLoadEvent(%s, %s)',
       ev.event, ev.pattern, string(pname), string(ev.event))
   endfor
 
@@ -594,10 +612,36 @@ def DeliverWakingEvent(event: string, match: string)
   endtry
 enddef
 
+# FileType (`for`) 触发的延迟加载。叫醒插件的这一次 FileType 必须把
+# ftplugin/indent/syntax 以及插件自己新挂上的 FileType 处理器都跑上，
+# 否则 `for` 的全部意义——打开对应文件时插件生效——只覆盖了 plugin/。
+export def LazyLoadFileType(name: string, _ft: string)
+  if get(s_loaded_plugins, name, false)
+    return
+  endif
+  var match = expand('<amatch>')
+  if match ==# ''
+    match = _ft
+  endif
+  if !LazyLoad(name, 'FileType ' .. match)
+    return
+  endif
+  # 只重跑这三组，不要 `doautocmd FileType`：那会把已经跑过的监听者（包括
+  # 别人的）再送一遍。filetypeplugin 在 rtp 补上之前已经空转过一次。
+  silent! execute 'doautocmd <nomodeline> filetypeplugin FileType ' .. match
+  silent! execute 'doautocmd <nomodeline> filetypeindent FileType ' .. match
+  silent! execute 'doautocmd <nomodeline> syntaxset FileType ' .. match
+  if !ConfigFlag('simpleplug_lazy_event_refire', true)
+    return
+  endif
+  DeliverWakingEvent('FileType', match)
+enddef
+
+
 # 事件触发的延迟加载。
 export def LazyLoadEvent(name: string, event: string)
-  # ++once 是在这条 autocmd **执行完**之后才被摘掉的，下面那一发因此会原样打
-  # 回这里来。插件已经加载就在这里停住。
+  # DeliverWakingEvent 会对 SimplePlugLazy 再发一次同一事件；插件已经加载
+  # 就在这里停住。不用 ++once：加载失败时这条触发器必须还能再响。
   if get(s_loaded_plugins, name, false)
     return
   endif
@@ -854,7 +898,7 @@ def SourcePluginScripts(
   var files: list<dict<any>> = []
   var started = reltime()
   for pattern in ['plugin/**/*.vim', 'after/plugin/**/*.vim']
-    for f in globpath(dir, pattern, 0, 1)
+    for f in globpath(dir, pattern, 1, 1)
       var file_started = reltime()
       try
         execute 'source ' .. fnameescape(f)
@@ -875,22 +919,32 @@ enddef
 # 这一步对 `for` 插件是必须的，也因此**照样计在启动开销里**——它常常是延迟
 # 加载省下来的那部分底下藏着的真实成本，所以要单独记一笔。
 def SourceFtdetect(name: string, dir: string, when: string = 'ftdetect')
+  if get(s_ftdetect_sourced, dir, false)
+    return
+  endif
   var files: list<dict<any>> = []
   var started = reltime()
   augroup filetypedetect
-  for f in globpath(dir, 'ftdetect/*.vim', 0, 1)
-    var file_started = reltime()
-    try
-      execute 'source ' .. fnameescape(f)
-    catch
-      Log('ftdetect source error: ' .. v:exception, 'ErrorMsg')
-    endtry
-    add(files, {path: f, ms: reltimefloat(reltime(file_started)) * 1000.0})
+  # Match Vim's own startup walk: `runtime! ftdetect/*.vim` then
+  # `runtime! after/ftdetect/*.vim`.  nosuf=1 so a user's 'wildignore'
+  # (which commonly includes `*.vim` backup patterns, or `*/ftdetect/*`)
+  # cannot silently disable filetype detection.
+  for pattern in ['ftdetect/*.vim', 'after/ftdetect/*.vim']
+    for f in globpath(dir, pattern, 1, 1)
+      var file_started = reltime()
+      try
+        execute 'source ' .. fnameescape(f)
+      catch
+        Log('ftdetect source error: ' .. v:exception, 'ErrorMsg')
+      endtry
+      add(files, {path: f, ms: reltimefloat(reltime(file_started)) * 1000.0})
+    endfor
   endfor
   augroup END
   if empty(files)
     return
   endif
+  s_ftdetect_sourced[dir] = true
   var ms = reltimefloat(reltime(started)) * 1000.0
   if when ==# 'ftdetect'
     RecordFtdetect(name, files, ms)
@@ -1019,6 +1073,45 @@ def NormalizeDeps(pname: string, configured: any): list<string>
     add(deps, entry)
   endfor
   return deps
+enddef
+
+# `for`：一个或多个 FileType 名。会原样写进 `:autocmd FileType {names}`，所以
+# 只接受 Vim 认的那一类标识符；`rust | echo` 这种会变成命令注入，`1` 这种会
+# 让插件挂成延迟却永远没有触发器。
+def NormalizeFiletypes(pname: string, configured: any): string
+  var fts: list<string> = []
+  var entries: list<any>
+  if type(configured) == v:t_list
+    entries = configured
+  elseif type(configured) == v:t_string
+    if configured ==# ''
+      return ''
+    endif
+    entries = [configured]
+  else
+    OptionError(pname, '`for` must be a filetype name or a list of names')
+    return ''
+  endif
+  for entry in entries
+    if type(entry) != v:t_string
+      OptionError(pname, '`for` entries must be filetype names')
+      continue
+    endif
+    for raw in split(entry, ',')
+      var ft = substitute(raw, '^\_s\+\|\_s\+$', '', 'g')
+      if ft ==# ''
+        continue
+      endif
+      if ft !~# '^[A-Za-z0-9_+-]\+$'
+        OptionError(pname, 'invalid filetype name: ' .. ft)
+        continue
+      endif
+      if index(fts, ft) < 0
+        add(fts, ft)
+      endif
+    endfor
+  endfor
+  return join(fts, ',')
 enddef
 
 # =============================================================
@@ -1154,7 +1247,7 @@ export def Plug(repo: string, opts: dict<any> = {})
     OptionError(name, '`frozen` must be a number or boolean')
     return
   endif
-  var on_ft = get(opts, 'for', '')
+  var on_ft = NormalizeFiletypes(name, get(opts, 'for', ''))
   var triggers = NormalizeTriggers(name, get(opts, 'on', ''))
 
   add(s_plugins, {
@@ -1595,10 +1688,12 @@ def GenerateHelptags()
     if !isdirectory(runtime_dir) || !IsInsideCheckout(runtime_dir, p.dir)
       continue
     endif
-    var doc = runtime_dir .. '/doc'
-    if isdirectory(doc)
-      execute 'silent! helptags ' .. fnameescape(doc)
-    endif
+    for sub in ['/doc', '/after/doc']
+      var doc = runtime_dir .. sub
+      if isdirectory(doc)
+        execute 'silent! helptags ' .. fnameescape(doc)
+      endif
+    endfor
   endfor
 enddef
 
@@ -1731,6 +1826,42 @@ enddef
 
 def IsFullGitOid(value: any): bool
   return type(value) == v:t_string && value =~? '^\x\{40}\%([0-9a-f]\{24}\)\?$'
+enddef
+
+
+# Same eight variables the daemon strips before every git.  :PlugSnapshot and
+# the progress-window `d` mapping run git from this process, which inherited
+# Vim's environment — a git hook that launched the editor leaves GIT_DIR set,
+# and `git -C {plugin}` then reports that other repository's HEAD.
+const s_git_repository_env_vars = [
+  'GIT_DIR',
+  'GIT_WORK_TREE',
+  'GIT_INDEX_FILE',
+  'GIT_OBJECT_DIRECTORY',
+  'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+  'GIT_COMMON_DIR',
+  'GIT_CEILING_DIRECTORIES',
+  'GIT_DISCOVERY_ACROSS_FILESYSTEM',
+]
+
+
+def GitInCheckout(dir: string, args: string): string
+  var saved: dict<any> = {}
+  for name in s_git_repository_env_vars
+    saved[name] = getenv(name)
+    setenv(name, v:null)
+  endfor
+  var out = ''
+  try
+    # Empty stdin: under `vim -es` an inherited stdin that never EOFs makes
+    # git wait for a command; Snapshot would then hang the whole editor.
+    out = trim(system('git -C ' .. shellescape(dir) .. ' ' .. args, ''))
+  finally
+    for name in s_git_repository_env_vars
+      setenv(name, saved[name])
+    endfor
+  endtry
+  return out
 enddef
 
 
@@ -1941,7 +2072,7 @@ def PluginCheckoutState(plugin: dict<any>): dict<string>
   if getftype(plugin.dir .. '/.git') ==# ''
     return {status: 'not-git', oid: ''}
   endif
-  var commit = trim(system('git -C ' .. shellescape(plugin.dir) .. ' rev-parse HEAD'))
+  var commit = GitInCheckout(plugin.dir, 'rev-parse HEAD')
   return v:shell_error == 0 && IsFullGitOid(commit)
     ? {status: 'ok', oid: tolower(commit)}
     : {status: 'unreadable', oid: ''}
@@ -3495,7 +3626,7 @@ def DoViewPluginDiff(name: string)
   if plug == {} || !isdirectory(plug.dir)
     return
   endif
-  var log_output = system('git -C ' .. shellescape(plug.dir) .. ' log --oneline --graph --decorate -20 2>/dev/null')
+  var log_output = GitInCheckout(plug.dir, 'log --oneline --graph --decorate -20 2>/dev/null')
   if log_output ==# ''
     log_output = '  (no git log available)'
   endif

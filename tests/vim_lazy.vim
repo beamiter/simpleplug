@@ -421,6 +421,79 @@ silent DepUserCommand
 assert_equal(['user'], g:simpleplug_dep_order,
   'an unresolvable dependency stopped its dependant from loading')
 
+# `for` has to load ftplugin/, not just plugin/. Users typically already ran
+# `filetype plugin on` before simpleplug#End(), so filetypeplugin sits in
+# front of SimplePlugLazy and misses the plugin on the waking FileType.
+filetype plugin on
+var for_ft_home = tempname()
+mkdir(for_ft_home .. '/plugin', 'p')
+mkdir(for_ft_home .. '/ftplugin', 'p')
+writefile([
+  'vim9script',
+  'g:simpleplug_for_body = 1',
+], for_ft_home .. '/plugin/body.vim')
+writefile([
+  'vim9script',
+  'g:simpleplug_for_ftplugin = 1',
+], for_ft_home .. '/ftplugin/simpleplugforft.vim')
+simpleplug#Begin(plugdir)
+simpleplug#Plug('local/for-ftplugin', {
+  as: 'for-ftplugin',
+  dir: for_ft_home,
+  for: 'simpleplugforft',
+})
+simpleplug#End()
+new
+setfiletype simpleplugforft
+assert_equal(1, get(g:, 'simpleplug_for_body', 0),
+  'for plugin body did not load on FileType')
+assert_equal(1, get(g:, 'simpleplug_for_ftplugin', 0),
+  'for plugin ftplugin did not run on the waking FileType')
+bwipeout!
+delete(for_ft_home, 'rf')
+
+# An event trigger spent on a missing runtime must still fire after the
+# checkout appears. ++once would retire it on the failed attempt.
+var event_retry = tempname()
+mkdir(event_retry, 'p')
+simpleplug#Begin(plugdir)
+simpleplug#Plug('local/event-retry', {
+  as: 'event-retry',
+  dir: event_retry,
+  event: 'User SimplePlugEventRetry',
+})
+simpleplug#End()
+delete(event_retry, 'rf')
+silent doautocmd User SimplePlugEventRetry
+assert_false(exists('g:simpleplug_event_retry_loaded'),
+  'missing event plugin was marked loaded')
+mkdir(event_retry .. '/plugin', 'p')
+writefile([
+  'vim9script',
+  'g:simpleplug_event_retry_loaded = 1',
+], event_retry .. '/plugin/retry.vim')
+silent doautocmd User SimplePlugEventRetry
+assert_equal(1, get(g:, 'simpleplug_event_retry_loaded', 0),
+  'the event trigger was spent on the failed load')
+delete(event_retry, 'rf')
+
+# A typo in `on` must not abort End() and drop every plugin declared after it.
+var sibling_dir = tempname()
+mkdir(sibling_dir .. '/plugin', 'p')
+writefile(['vim9script', 'g:simpleplug_end_sibling = 1'],
+  sibling_dir .. '/plugin/sib.vim')
+var badlazy_dir = tempname()
+mkdir(badlazy_dir .. '/plugin', 'p')
+writefile(['vim9script'], badlazy_dir .. '/plugin/bad.vim')
+simpleplug#Begin(plugdir)
+simpleplug#Plug('local/end-sibling', {as: 'end-sibling', dir: sibling_dir})
+simpleplug#Plug('local/end-badlazy', {as: 'end-badlazy', dir: badlazy_dir, on: 'fzf'})
+silent simpleplug#End()
+assert_true(index(Rtp(), sibling_dir) >= 0,
+  'End() dropped a later plugin after a bad on: trigger')
+delete(sibling_dir, 'rf')
+delete(badlazy_dir, 'rf')
+
 if !empty(v:errors)
   for error in v:errors
     echom error

@@ -1871,8 +1871,12 @@ async fn handle_status(id: u64, plugins: Vec<PluginSpec>, jobs: usize, tx: &Even
         let semaphore = semaphore.clone();
         handles.push(tokio::spawn(async move {
             let _permit = semaphore.acquire_owned().await.expect("semaphore closed");
-            let dir_path = PathBuf::from(&p.dir);
-            let installed = dir_path.join(".git").exists();
+            let installed = match git_checkout_state(&p.dir).await {
+                CheckoutState::Valid | CheckoutState::EmptyUpstream => true,
+                CheckoutState::Missing
+                | CheckoutState::Interrupted
+                | CheckoutState::Undetermined(_) => false,
+            };
             if !installed {
                 return PluginStatus {
                     name: p.name,
@@ -1890,7 +1894,7 @@ async fn handle_status(id: u64, plugins: Vec<PluginSpec>, jobs: usize, tx: &Even
             let last_commit = run_git(&p.dir, &["log", "-1", "--format=%cs %s"])
                 .await
                 .unwrap_or_default();
-            let size_kb = dir_size_kb(&dir_path, size_timeout()).await;
+            let size_kb = dir_size_kb(Path::new(&p.dir), size_timeout()).await;
             PluginStatus {
                 name: p.name,
                 installed,
@@ -2812,6 +2816,31 @@ mod tests {
         std::fs::create_dir_all(workdir.0.join("plugin/.git/refs/heads")).unwrap();
         std::fs::write(workdir.0.join("plugin/.git/HEAD"), "ref: refs/heads/main\n").unwrap();
         workdir
+    }
+
+    #[tokio::test]
+    async fn status_does_not_treat_an_interrupted_clone_as_installed() {
+        let workdir = make_interrupted_clone("interrupted-status");
+        let dest = workdir.0.join("plugin");
+        assert!(dest.join(".git").exists());
+        assert!(matches!(
+            git_checkout_state(dest.to_str().unwrap()).await,
+            CheckoutState::Interrupted
+        ));
+
+        let plugin = spec("interrupted-status", "unused", dest.to_str().unwrap());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        handle_status(22, vec![plugin], 1, &tx).await;
+        let events = drain_events(&mut rx).await;
+        let items = events
+            .iter()
+            .find(|e| e["type"] == "status_result")
+            .expect("status produced no result")["items"]
+            .clone();
+        assert_eq!(
+            items[0]["installed"], false,
+            "an interrupted clone was reported as installed: {items:?}"
+        );
     }
 
     #[tokio::test]

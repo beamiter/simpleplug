@@ -25,12 +25,27 @@ doautocmd FileType rust
 assert_equal(1, get(g:, 'simpleplug_lazy_fixture_loaded', 0), 'lazy plugin did not load')
 assert_true(index(split(&runtimepath, ','), fixture) >= 0, 'lazy plugin missing from runtimepath')
 
+# The same checkout's ftdetect must not be sourced again when vimrc is
+# re-sourced. Those scripts append to filetypedetect; a second source
+# duplicates the detectors.
+var ftdetect_once = g:simpleplug_lazy_fixture_ftdetect
+unlet g:simpleplug_lazy_fixture_loaded
+simpleplug#Begin('/tmp/simpleplug-vim-smoke')
+simpleplug#Plug('local/lazy-plugin', {
+  as: 'lazy-fixture-ftdetect-again',
+  dir: fixture,
+  for: 'rust',
+})
+simpleplug#End()
+assert_equal(ftdetect_once, g:simpleplug_lazy_fixture_ftdetect,
+  're-sourcing vimrc sourced ftdetect a second time')
+
 # Command-based lazy loading must source the plugin, then replay the command.
 # Each section registers the shared fixture under its own name: a runtime that
 # has already been sourced is treated as loaded for the rest of the session,
 # so re-registering the *same* plugin deliberately arms no new trigger.
 delcommand LazyFixtureCommand
-unlet g:simpleplug_lazy_fixture_loaded
+unlet! g:simpleplug_lazy_fixture_loaded
 simpleplug#Begin('/tmp/simpleplug-vim-smoke')
 simpleplug#Plug('local/lazy-plugin', {
   as: 'lazy-fixture-cmd',
@@ -129,7 +144,6 @@ assert_equal(['rtp-fixture'], simpleplug#CompletePluginNames('rtp-', '', 0))
 # emits FileType.  Help tags under the nested doc/ remain discoverable too.
 unlet! g:simpleplug_rtp_fixture_loaded
 unlet! g:simpleplug_rtp_fixture_after
-unlet! g:simpleplug_rtp_fixture_ftdetect
 set filetype=
 simpleplug#Begin('/tmp/simpleplug-vim-smoke')
 simpleplug#Plug('local/rtp-plugin', {
@@ -141,6 +155,8 @@ simpleplug#Plug('local/rtp-plugin', {
 simpleplug#End()
 assert_true(get(g:, 'simpleplug_rtp_fixture_ftdetect', 0) >= 1,
   'nested ftdetect script was not sourced eagerly')
+assert_true(get(g:, 'simpleplug_rtp_after_ftdetect', 0) >= 1,
+  'nested after/ftdetect script was not sourced eagerly')
 assert_false(exists('g:simpleplug_rtp_fixture_loaded'), 'for plugin loaded eagerly')
 assert_true(index(split(&runtimepath, ','), rtp_runtime) < 0,
   'for plugin runtime was not removed before its trigger')
@@ -312,6 +328,8 @@ option_noise ..= execute("silent call simpleplug#Plug('local/bad-commit', {commi
 option_noise ..= execute("silent call simpleplug#Plug('local/bad-hook', {do: {}})")
 option_noise ..= execute("silent call simpleplug#Plug('local/bad-frozen', {frozen: 'yes'})")
 option_noise ..= execute("silent call simpleplug#Plug('local/bad-dir-comma', {dir: '/tmp/a,b'})")
+option_noise ..= execute("silent call simpleplug#Plug('local/bad-for-type', {for: 1})")
+option_noise ..= execute("silent call simpleplug#Plug('local/bad-for-inject', {for: 'rust | echo'})")
 for bad in ['bad-alias', 'bad-dir', 'bad-branch', 'bad-tag', 'bad-commit',
     'bad-hook', 'bad-frozen', 'bad-dir-comma']
   assert_equal([], simpleplug#CompletePluginNames(bad, '', 0),
@@ -322,6 +340,11 @@ assert_match('`branch` must be a string', option_noise)
 assert_match('`tag` must be a single Git reference', option_noise)
 assert_match('`frozen` must be a number or boolean', option_noise)
 assert_match('`dir` must not contain a comma', option_noise)
+assert_match('`for` must be a filetype name or a list of names', option_noise)
+assert_match('invalid filetype name: rust | echo', option_noise)
+# Invalid `for` is dropped, not turned into a trigger that never fires.
+assert_equal(['bad-for-type'], simpleplug#CompletePluginNames('bad-for-type', '', 0))
+assert_equal(['bad-for-inject'], simpleplug#CompletePluginNames('bad-for-inject', '', 0))
 
 # Containment is rechecked after registration: replacing a valid runtime with
 # a symlink cannot make End() source a directory outside the checkout.
@@ -608,13 +631,13 @@ delete(checkout_home, 'rf')
 # the one thing SimplePlug is always in the middle of, so SourcePluginScripts
 # and the eager ftdetect sourcing are where the numbers come from.
 simpleplug#Begin('/tmp/simpleplug-vim-smoke')
-simpleplug#Plug('local/lazy-plugin', {
+simpleplug#Plug('local/profile-plugin', {
   as: 'profile-fixture',
-  dir: fixture,
-  on: 'ProfileFixtureCommand',
+  dir: root .. '/tests/fixtures/profile-plugin',
+  on: 'ProfileFixtureCmd',
 })
 simpleplug#End()
-silent! call simpleplug#LazyLoad('profile-fixture', ':ProfileFixtureCommand')
+silent! call simpleplug#LazyLoad('profile-fixture', ':ProfileFixtureCmd')
 PlugProfile
 var profile_lines = getline(1, '$')
 assert_match('SimplePlug profile', profile_lines[0])
@@ -625,12 +648,90 @@ var profile_rows = filter(copy(profile_lines), (_, l) => l =~# 'profile-fixture'
 assert_equal(2, len(profile_rows), 'the profile did not attribute the load: ' .. string(profile_lines))
 var profile_row = filter(copy(profile_rows), (_, l) => l =~# '\<lazy\>')
 assert_equal(1, len(profile_row), 'a lazily loaded plugin was not labelled lazy: ' .. string(profile_rows))
-assert_match(':ProfileFixtureCommand', profile_row[0], 'the profile did not record the trigger')
+assert_match(':ProfileFixtureCmd', profile_row[0], 'the profile did not record the trigger')
 assert_match('^\s\+\d\+\.\d', profile_row[0], 'the profile row carries no measurement')
 assert_equal(1, len(filter(copy(profile_rows), (_, l) => l =~# '\<ftdetect\>')),
   'the eager ftdetect cost stopped being reported on its own: ' .. string(profile_rows))
 assert_match('q close', profile_lines[-1])
 bwipeout!
+
+# 'wildignore' must not hide plugin scripts. globpath() applies it unless nosuf
+# is set, and `set wildignore+=*.vim` is a documented (if blunt) way to keep
+# backup copies out of :edit completion.
+var wild_checkout = tempname()
+mkdir(wild_checkout .. '/plugin', 'p')
+writefile([
+  'vim9script',
+  'g:simpleplug_wildignore_loaded = 1',
+  'command! WildignoreFixtureCommand g:simpleplug_wildignore_cmd = 1',
+], wild_checkout .. '/plugin/wild.vim')
+mkdir(wild_checkout .. '/ftdetect', 'p')
+writefile([
+  'vim9script',
+  'g:simpleplug_wildignore_ftdetect = 1',
+], wild_checkout .. '/ftdetect/wild.vim')
+var saved_wildignore = &wildignore
+set wildignore+=*.vim
+simpleplug#Begin('/tmp/simpleplug-vim-smoke')
+simpleplug#Plug('local/wildignore-plugin', {
+  as: 'wildignore-fixture',
+  dir: wild_checkout,
+  on: 'WildignoreFixtureCommand',
+})
+simpleplug#End()
+assert_equal(1, get(g:, 'simpleplug_wildignore_ftdetect', 0),
+  'ftdetect was hidden by wildignore')
+WildignoreFixtureCommand
+assert_equal(1, get(g:, 'simpleplug_wildignore_loaded', 0),
+  'plugin scripts were hidden by wildignore')
+&wildignore = saved_wildignore
+silent! delcommand WildignoreFixtureCommand
+delete(wild_checkout, 'rf')
+
+# An inherited GIT_DIR must not redirect :PlugSnapshot's git at another repo.
+# git -C still honours GIT_DIR, and a hook-launched Vim always has one.
+simpleplug#Begin('/tmp/simpleplug-vim-smoke')
+simpleplug#Plug('local/snapshot-fixture', {
+  as: 'snapshot-fixture',
+  dir: root,
+})
+simpleplug#End()
+var gitdir_lock = tempname() .. '.json'
+simpleplug#Snapshot(gitdir_lock)
+var gitdir_decoy = tempname()
+mkdir(gitdir_decoy, 'p')
+silent call system('git -C ' .. shellescape(gitdir_decoy) .. ' init -q', '')
+silent call system('git -C ' .. shellescape(gitdir_decoy)
+  .. ' -c user.name=t -c user.email=t@t.invalid commit --allow-empty -qm decoy', '')
+var decoy_head = trim(system('git -C ' .. shellescape(gitdir_decoy) .. ' rev-parse HEAD', ''))
+var gitdir_saved = getenv('GIT_DIR')
+setenv('GIT_DIR', gitdir_decoy .. '/.git')
+var gitdir_diff = execute('PlugSnapshotDiff ' .. fnameescape(gitdir_lock))
+if gitdir_saved == v:null
+  setenv('GIT_DIR', v:null)
+else
+  setenv('GIT_DIR', gitdir_saved)
+endif
+assert_match('\[matched\] snapshot-fixture current=', gitdir_diff,
+  'GIT_DIR redirected snapshot diff at another repository: ' .. gitdir_diff)
+assert_notmatch(decoy_head, gitdir_diff,
+  'snapshot diff reported the decoy HEAD')
+delete(gitdir_decoy, 'rf')
+delete(gitdir_lock)
+
+# after/doc is part of the runtime; helptags must cover it, not only doc/.
+mkdir(rtp_runtime .. '/after/doc', 'p')
+var HelptagsFn = function(printf('<SNR>%d_GenerateHelptags', simpleplug_script.sid))
+simpleplug#Begin('/tmp/simpleplug-vim-smoke')
+simpleplug#Plug('local/rtp-plugin', {
+  as: 'rtp-helptags',
+  dir: rtp_fixture,
+  rtp: 'vim',
+})
+simpleplug#End()
+call HelptagsFn()
+assert_true(index(getcompletion('rtp-after-tag', 'help'), 'rtp-after-tag') >= 0,
+  'after/doc tags were not generated')
 
 # Reinitializing must clear generated lazy-load state without errors.
 simpleplug#Begin('/tmp/simpleplug-vim-smoke')

@@ -1,0 +1,3 @@
+*rtp-after-tag*
+
+Nested after/doc help for SimplePlug helptags coverage.
