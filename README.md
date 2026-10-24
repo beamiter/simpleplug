@@ -110,6 +110,16 @@ vim -es -u vimrc +'PlugInstall!' +qall
 `ok` / `frozen` / `errors` / `failed` / `elapsed`）并触发 `User SimplePlugComplete`，
 `simpleplug#Await()` 与 `simpleplug#LastResult()` 提供同样的结果，不必再去正则解析进度窗口。
 
+原生终端工作台和状态栏可读取 `simpleplug#WorkbenchState()`：返回 `known`、`running`、
+`operation`、`total`、`completed`、`installed`、`updated`、`errors`。这些数字属于当前／上次
+操作，不是全部已安装插件的盘点；还没执行过操作时 `operation` 为空。此 API 只读内存，
+不会启动 daemon、访问网络或文件系统、打开窗口、改变焦点。宿主应先用
+`exists('*simpleplug#WorkbenchState')` 检查已加载的提供者，避免为了显示状态触发 autoload。
+
+任务开始、进度推进、完成、失败和取消会触发 `User SimplePlugStateChanged`。宿主按事件
+读取快照即可，不必增加轮询；回调失败也不会中断安装。`:PlugStop`／`:PlugRestart` 取消
+任务时会把未完成项报告为失败并退出运行状态，迟到的旧请求回复会被丢弃。
+
 `:PlugDiff` 展示上一次更新每个插件从哪个 commit 走到哪个 commit、中间带进来了哪些提交
 （最新的在前，最多 50 条，不含 merge）；在插件那一行按 `X` 就把它退回更新前的 commit，
 `:PlugRollback[!] {name}` 是同一件事的命令形式。回滚走的是普通的 commit pin 更新，

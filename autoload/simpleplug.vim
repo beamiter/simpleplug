@@ -110,6 +110,8 @@ var s_ui_mode: string = ''        # 'install' | 'update' | 'status' | 'clean' | 
 var s_ui_start_time: list<any> = []
 var s_ui_total: number = 0
 var s_ui_finished: number = 0
+var s_workbench_state: dict<any> = {known: true, running: false, operation: '',
+  total: 0, completed: 0, installed: 0, updated: 0, errors: 0}
 var s_ui_spinner_idx: number = 0
 var s_ui_spinner_timer: number = 0
 var s_auto_install_checked: bool = false
@@ -1362,25 +1364,37 @@ def OnDaemonExit(code: number, restarting: bool)
     endif
   endfor
   s_ui_mode ..= s_ui_mode =~# '_done$' ? '' : '_done'
+  RecountFinished()
   PublishResult()
+  NotifyWorkbench()
   UIBuildAndRender()
 enddef
 
 export def Stop()
   SetupCore()
+  var active = s_active_id > 0
+  s_active_id = 0
   simpleplug#core#Stop()
   s_stop_pending = true
   s_cbs = {}
-  s_active_id = 0
+  if active
+    OnError({message: 'operation cancelled by :PlugStop'})
+  endif
+  NotifyWorkbench()
 enddef
 
 export def Restart()
   SetupCore()
+  var active = s_active_id > 0
   s_cbs = {}
   s_active_id = 0
+  if active
+    OnError({message: 'operation cancelled by :PlugRestart'})
+  endif
   if simpleplug#core#Restart()
     echom '[SimplePlug] daemon restarted'
   endif
+  NotifyWorkbench()
 enddef
 
 export def ShowLog()
@@ -1410,6 +1424,7 @@ enddef
 
 def Send(req: dict<any>)
   if simpleplug#core#Send(req)
+    NotifyWorkbench()
     return
   endif
   # The daemon can disappear between EnsureBackend() and here. job_stop() only
@@ -1419,10 +1434,12 @@ def Send(req: dict<any>)
   # request and reports "daemon is not running". Start a fresh one and send
   # again before giving up on it.
   if EnsureBackend() && simpleplug#core#Send(req)
+    NotifyWorkbench()
     return
   endif
   s_active_id = 0
   OnError({message: 'daemon is not running'})
+  NotifyWorkbench()
 enddef
 
 def OnDaemonEvent(ev: dict<any>)
@@ -1432,7 +1449,7 @@ def OnDaemonEvent(ev: dict<any>)
 
   var id = get(ev, 'id', 0)
 
-  if id != 0 && s_active_id != 0 && id != s_active_id
+  if id != 0 && id != s_active_id
     Log('Ignoring stale event for request ' .. id)
     return
   endif
@@ -1487,6 +1504,7 @@ def OnDaemonEvent(ev: dict<any>)
   if ev.type ==# 'done' || ev.type ==# 'error' || ev.type ==# 'status_result'
       || ev.type ==# 'check_result' || ev.type ==# 'hook_done' || ev.type ==# 'clean_done'
     s_active_id = 0
+    NotifyWorkbench()
   endif
 enddef
 
@@ -1725,6 +1743,7 @@ def PublishResult()
     failed: failed,
     elapsed: empty(s_ui_start_time) ? 0.0 : reltimefloat(reltime(s_ui_start_time)),
   }
+  RefreshWorkbench()
   if exists('#User#SimplePlugComplete')
     silent doautocmd <nomodeline> User SimplePlugComplete
   endif
@@ -1732,6 +1751,41 @@ enddef
 
 export def LastResult(): dict<any>
   return get(g:, 'simpleplug_last_result', {})
+enddef
+
+# A native host or statusbar can read this without starting the supervisor,
+# scanning a checkout, changing focus, or opening the plugin manager. Counts
+# describe this operation, not the user's complete installed inventory.
+export def WorkbenchState(): dict<any>
+  return copy(s_workbench_state)
+enddef
+
+def RefreshWorkbench()
+  var counts = SummaryCounts()
+  var total = min([1000000, max([0, s_ui_total])])
+  s_workbench_state = {
+    known: true,
+    running: s_active_id > 0,
+    operation: substitute(s_ui_mode, '_done$', '', ''),
+    total: total,
+    completed: min([total, max([0, s_ui_finished])]),
+    installed: min([1000000, counts.installed]),
+    updated: min([1000000, counts.updated]),
+    errors: min([1000000, counts.errors + counts.missing + counts.dirty]),
+  }
+enddef
+
+def NotifyWorkbench()
+  RefreshWorkbench()
+  if !exists('#User#SimplePlugStateChanged')
+    return
+  endif
+  # An observer must never interrupt an install or suppress its completion.
+  try
+    silent doautocmd <nomodeline> User SimplePlugStateChanged
+  catch
+    Log('workbench observer threw: ' .. v:exception, 'WarningMsg')
+  endtry
 enddef
 
 def SyncTimeout(): number
@@ -2824,6 +2878,7 @@ def OnProgress(ev: dict<any>)
 
   s_ui_plug_state[name] = st
   RecountFinished()
+  NotifyWorkbench()
   UIBuildAndRender()
 enddef
 
@@ -2962,6 +3017,7 @@ def OnHookDone(ev: dict<any>)
   st.msg = output
   s_ui_plug_state[name] = st
   s_ui_mode = 'hook_done'
+  RecountFinished()
   PublishResult()
   UIBuildAndRender()
 enddef

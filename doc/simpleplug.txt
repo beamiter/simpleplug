@@ -480,6 +480,32 @@ simpleplug#LastResult()
         The dictionary above, or an empty one if no operation has finished
         yet.
 
+                                             *simpleplug#WorkbenchState()*
+simpleplug#WorkbenchState()
+        Return a fresh, bounded dictionary of cached operation state:
+          known      true for this provider; no operation has to be running
+          running    true while an operation owns the manager
+          operation  current/last mode, or '' before the first operation
+          total      number of plugins in this operation
+          completed  finished entries, including failures and skips
+          installed  entries installed by this operation
+          updated    entries updated by this operation
+          errors     failed, missing or dirty entries
+
+        These counts are not an inventory of all installed plugins. Reading
+        this function does not start the daemon, probe files, access the
+        network, create a window, or change focus. Hosts should check
+        exists('*simpleplug#WorkbenchState') first so a status read does not
+        itself trigger autoload. An older provider means unknown state.
+
+                                                *SimplePlugStateChanged*
+        This |User| event announces operation start, progress, completion,
+        failure and cancellation. Read |simpleplug#WorkbenchState()| from the
+        callback; no polling timer is needed. A throwing observer is logged
+        and cannot interrupt the operation. |:PlugStop| and |:PlugRestart|
+        mark unfinished entries as errors and release the operation; late
+        responses from the cancelled request are ignored.
+
 ==============================================================================
 7. CONFIGURATION                                           *simpleplug-config*
 

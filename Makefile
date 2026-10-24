@@ -1,6 +1,6 @@
-.PHONY: check fmt clippy test vim-test vim-config vim-batch vim-lazy vim-order vim-profile vim-core defcompile core-verify
+.PHONY: check fmt clippy test vim-test vim-config vim-batch vim-lazy vim-order vim-profile vim-workbench vim-core defcompile core-verify
 
-check: core-verify fmt clippy test defcompile vim-core vim-test vim-config vim-batch vim-lazy vim-order vim-profile
+check: core-verify fmt clippy test defcompile vim-core vim-test vim-config vim-batch vim-lazy vim-order vim-profile vim-workbench
 
 fmt:
 	cargo fmt --all -- --check
@@ -43,6 +43,10 @@ vim-order:
 # real vimrc and reads the report back out of it.
 vim-profile:
 	vim -Nu NONE -n -i NONE -es -S tests/vim_profile.vim
+
+# Cached native-host progress, concurrency and stale-response guards.
+vim-workbench:
+	vim -Nu NONE -n -i NONE -es -S tests/vim_workbench.vim
 
 # ---------------------------------------------------------------------------
 # simplecore: the vendored daemon supervisor shared by the simple* suite.
