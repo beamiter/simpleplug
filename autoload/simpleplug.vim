@@ -1775,8 +1775,17 @@ def RefreshWorkbench()
   }
 enddef
 
+var last_notified_workbench: dict<any> = {}
+
 def NotifyWorkbench()
   RefreshWorkbench()
+  # A content-free observer needs actual transitions, not repeated backend
+  # messages with the same bounded counters. Retain the upstream cache and
+  # cancellation lifecycle; reading WorkbenchState() remains side-effect free.
+  if s_workbench_state == last_notified_workbench
+    return
+  endif
+  last_notified_workbench = copy(s_workbench_state)
   if !exists('#User#SimplePlugStateChanged')
     return
   endif

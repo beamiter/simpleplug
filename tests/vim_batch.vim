@@ -94,15 +94,44 @@ def RegisterAll()
   simpleplug#End()
 enddef
 
+g:simpleplug_workbench_events = 0
+autocmd User SimplePlugStateChanged g:simpleplug_workbench_events += 1
+var idle_jobs = len(job_info())
+assert_equal({known: true, running: false, operation: '', total: 0, completed: 0,
+  installed: 0, updated: 0, errors: 0}, simpleplug#WorkbenchState())
+assert_equal(idle_jobs, len(job_info()), 'reading progress started a daemon')
+assert_equal(0, g:simpleplug_workbench_events, 'reading progress emitted an event')
+
 RegisterAll()
 assert_false(exists('g:simpleplug_batch_eager_loaded'), 'plugin loaded before it was installed')
 assert_true(index(split(&runtimepath, ','), eager_dir) < 0,
   'an uninstalled plugin was already on runtimepath')
 
+# Native consumers are observers: even a throwing user subscriber cannot
+# interrupt a real daemon operation or prevent subsequent progress/cleanup.
+g:simpleplug_observed_progress = []
+def ThrowingProgressObserver()
+  add(g:simpleplug_observed_progress, simpleplug#WorkbenchState())
+  throw 'fixture: broken native progress observer'
+enddef
+augroup SimplePlugThrowingProgressFixture
+  autocmd!
+  autocmd User SimplePlugStateChanged ThrowingProgressObserver()
+augroup END
+
 # ── the synchronous bang ────────────────────────────────────────────────────
 # Without it this returns before a single "clone" completes, which is why
 # `vim -es +PlugInstall +qall` never worked as a bootstrap.
 PlugInstall!
+augroup SimplePlugThrowingProgressFixture
+  autocmd!
+augroup END
+assert_true(len(g:simpleplug_observed_progress) > 1)
+assert_true(g:simpleplug_observed_progress[0].running,
+  'the first start event falsely reported idle')
+assert_equal(5, g:simpleplug_observed_progress[0].total)
+assert_false(g:simpleplug_observed_progress[-1].running,
+  'a throwing observer prevented completion publication')
 
 assert_equal(batch_origin_windows + 1, winnr('$'),
   'opening the progress UI did not create exactly one split')
@@ -130,6 +159,23 @@ assert_equal(1, get(result, 'errors', -1))
 assert_equal(['batch-failing'], mapnew(get(result, 'failed', []), (_, f) => f.name))
 assert_match('clone failed', get(result, 'failed', [{}])[0].message)
 assert_true(get(result, 'elapsed', -1.0) >= 0.0, 'result carried no elapsed time')
+
+# Native readers see actual operation results without scraping the UI or
+# sharing a mutable dictionary with the plugin. Repeated reads stay silent.
+var progress = simpleplug#WorkbenchState()
+assert_false(progress.running)
+assert_equal('install', progress.operation)
+assert_equal(5, progress.total)
+assert_equal(5, progress.completed)
+assert_equal(3, progress.installed)
+assert_equal(1, progress.errors)
+assert_true(g:simpleplug_workbench_events > 1, 'no progress transitions were published')
+var events = g:simpleplug_workbench_events
+progress.running = true
+progress.errors = 999
+assert_false(simpleplug#WorkbenchState().running)
+assert_equal(1, simpleplug#WorkbenchState().errors)
+assert_equal(events, g:simpleplug_workbench_events, 'reading progress emitted an event')
 
 # ── activation ──────────────────────────────────────────────────────────────
 assert_equal(1, get(g:, 'simpleplug_batch_eager_loaded', 0),
@@ -452,7 +498,17 @@ var waited_s = reltimefloat(reltime(waited))
 assert_true(waited_s >= 1.0, 'the synchronous bang did not wait at all')
 assert_true(waited_s < 30.0, printf('the synchronous bang ignored its timeout (%.1fs)', waited_s))
 assert_match('stopped waiting after 1s', execute('messages'))
+augroup SimplePlugThrowingProgressFixture
+  autocmd!
+  autocmd User SimplePlugStateChanged ThrowingProgressObserver()
+augroup END
+assert_true(simpleplug#WorkbenchState().running)
 simpleplug#Stop()
+assert_false(simpleplug#WorkbenchState().running,
+  'a throwing observer prevented Stop from retiring progress')
+augroup SimplePlugThrowingProgressFixture
+  autocmd!
+augroup END
 
 delete(home, 'rf')
 
